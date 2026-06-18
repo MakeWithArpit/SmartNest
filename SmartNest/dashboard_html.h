@@ -263,10 +263,10 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     left: 3px;
     transition: transform 0.2s ease;
   }
-  .relay-card.active .toggle-switch {
+  .relay-card.active .toggle-switch, .toggle-switch.active {
     background: var(--primary-light);
   }
-  .relay-card.active .toggle-switch::after {
+  .relay-card.active .toggle-switch::after, .toggle-switch.active::after {
     transform: translateX(16px);
   }
   .lock-btn {
@@ -399,6 +399,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
         <span id="connectionBadgeText">Connecting</span>
       </div>
     </div>
+    <div style="font-size: 11px; color: var(--text-muted); margin-top: -12px; margin-bottom: 16px; font-family: monospace;" id="systemTime">Time: N/A</div>
     
     <div class="stats-grid-3">
       <div class="stat-box-mini">
@@ -443,6 +444,63 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       <div class="details-item">Combined Load: <span id="pzemCurrent">0.00 A</span></div>
       <div class="details-item">Digital Board: <span id="slaveDigitalCurrent">0.00 A</span></div>
     </div>
+  </div>
+
+  <!-- SD Storage System Card -->
+  <div class="card">
+    <p class="section-title">SD Storage System</p>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+      <span style="font-size: 14px; font-weight: 700;">SD Card Status</span>
+      <span class="status-badge" id="sdStatusBadge" style="font-size: 11px; padding: 4px 10px;">Checking...</span>
+    </div>
+    <div style="margin-bottom: 12px;">
+      <div style="display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">
+        <span>Usage Info</span>
+        <span id="sdUsageRatio">0%</span>
+      </div>
+      <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--border);">
+        <div id="sdProgressBar" style="width: 0%; height: 100%; background: var(--primary-gradient); transition: width 0.3s ease;"></div>
+      </div>
+    </div>
+    <div class="details-row">
+      <div class="details-item">Total Space: <span id="sdTotalSpace">0.0 MB</span></div>
+      <div class="details-item">Used Space: <span id="sdUsedSpace">0.0 MB</span></div>
+    </div>
+  </div>
+
+  <!-- SD Log Viewer Card -->
+  <div class="card">
+    <p class="section-title">SD Event Logs</p>
+    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
+      <select id="logFileSelect" style="flex: 1; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px; color: var(--text-light); padding: 8px 12px; font-size: 12px; outline: none;">
+        <option value="">-- Select Log File --</option>
+      </select>
+      <button class="cmd-btn" onclick="refreshLogFiles()" style="padding: 0 16px; font-size: 11px;">Refresh</button>
+    </div>
+    
+    <div id="logViewerContent" style="display: none;">
+      <div style="overflow-x: auto; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 10px; background: rgba(0,0,0,0.2);">
+        <table style="width: 100%; border-collapse: collapse; font-size: 10px; text-align: left; min-width: 320px;">
+          <thead>
+            <tr style="border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text-muted);">
+              <th style="padding: 8px 6px;">Time (Epoch)</th>
+              <th style="padding: 8px 6px; text-align:right;">Mains V</th>
+              <th style="padding: 8px 6px; text-align:right;">Load A</th>
+              <th style="padding: 8px 6px; text-align:right;">PZEM A</th>
+              <th style="padding: 8px 6px; text-align:right;">App Power</th>
+            </tr>
+          </thead>
+          <tbody id="logRecordsTableBody">
+          </tbody>
+        </table>
+      </div>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <button class="cmd-btn" id="prevChunkBtn" onclick="changeChunk(-1)" style="padding: 6px 12px; font-size: 11px;">&larr; Prev</button>
+        <span style="font-size: 11px; color: var(--text-muted);" id="chunkPageIndicator">Page 1 of 1</span>
+        <button class="cmd-btn" id="nextChunkBtn" onclick="changeChunk(1)" style="padding: 6px 12px; font-size: 11px;">Next &rarr;</button>
+      </div>
+    </div>
+    <p id="logViewerMsg" style="font-size: 11px; color: var(--text-muted); text-align: center; margin-top: 10px;">Select a file to load logs</p>
   </div>
 
   <!-- Slave Communication Health Card -->
@@ -492,10 +550,36 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     <div class="shutdown-badge" id="shutdownBadge">Ready</div>
   </div>
 
+  <!-- Master Lock Card -->
+  <div class="card" style="border-color: rgba(245, 158, 11, 0.2); background: linear-gradient(135deg, rgba(245, 158, 11, 0.05) 0%, rgba(245, 158, 11, 0.01) 100%);">
+    <div style="display: flex; justify-content: space-between; align-items: center;">
+      <div style="display: flex; align-items: center; gap: 12px;">
+        <div style="width: 36px; height: 36px; border-radius: 50%; background: rgba(245, 158, 11, 0.1); color: var(--warning); display: flex; align-items: center; justify-content: center;" id="masterLockIcon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 18px; height: 18px;">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+          </svg>
+        </div>
+        <div>
+          <span class="relay-name" style="font-size: 15px;">Global Master Lock</span>
+          <p style="font-size: 11px; color: var(--text-muted);" id="masterLockDesc">System is unlocked</p>
+        </div>
+      </div>
+      <div class="toggle-switch" id="masterLockToggleBtn" onclick="toggleMasterLock()" style="cursor: pointer;"></div>
+    </div>
+  </div>
+
   <!-- System Lights Card -->
   <div class="card">
     <p class="section-title">System Outlets & Lights</p>
     <div class="relay-grid" id="relayContainer"></div>
+  </div>
+
+  <!-- Maintenance Card -->
+  <div class="card" style="border-color: rgba(239, 68, 68, 0.15);">
+    <p class="section-title">System Maintenance</p>
+    <button class="cmd-btn" id="factoryResetBtn" onclick="triggerFactoryReset()" style="width:100%; background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.2); color: var(--danger); font-weight: 800;">
+      FACTORY RESET SYSTEM
+    </button>
   </div>
 
   <p class="footer">SmartNest Premium IoT Control. Firmware v1.0.0</p>
@@ -505,10 +589,15 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   let relayStates = [false, false, false, false, false, false];
   let lockStates = [false, false, false, false, false, false];
   let shutdownState = false;
+  let masterLock = false;
   
   let digitalRelayState = false;
   let digitalRelayLocked = false;
   let digitalSwitchState = false;
+
+  let currentLogFile = "";
+  let currentLogChunk = 0;
+  let totalLogRecords = 0;
 
   const relayNames = ["Light 1", "Light 2", "Light 3", "Light 4", "Light 5", "Power Socket"];
 
@@ -555,14 +644,22 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       let isLocked = (i === 6) ? digitalRelayLocked : lockStates[i];
       let isActive = (i === 6) ? digitalRelayState : relayStates[i];
       
-      if (isLocked) {
+      if (masterLock) {
+        card.classList.add('locked');
+        card.classList.remove('active');
+        lockBtn.innerHTML = lockIcon;
+        statusText.textContent = 'MASTER LOCKED';
+        lockBtn.style.opacity = '0.5';
+      } else if (isLocked) {
         card.classList.add('locked');
         card.classList.remove('active');
         lockBtn.innerHTML = lockIcon;
         statusText.textContent = 'LOCKED OFF';
+        lockBtn.style.opacity = '1';
       } else {
         card.classList.remove('locked');
         lockBtn.innerHTML = unlockIcon;
+        lockBtn.style.opacity = '1';
         if (isActive) {
           card.classList.add('active');
           statusText.textContent = 'Active ON';
@@ -732,10 +829,20 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     digitalRelayLocked = d.d_lock;
     digitalSwitchState = d.d_sw;
     
+    // masterLock
+    masterLock = d.m_lock;
+    updateMasterLockUI();
+
     updateUI();
     
     shutdownState = d.shutdown;
     updateShutdownUI();
+
+    // Time display
+    const timeRow = document.getElementById('systemTime');
+    if (timeRow && d.time) {
+      timeRow.textContent = 'Controller Time: ' + d.time;
+    }
     
     // Combined / Active load displays
     document.getElementById('combinedAcsCurrent').textContent = d.current.toFixed(2) + ' A';
@@ -756,6 +863,41 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('pzemCurrent').textContent = d.load.toFixed(2) + ' A';
     document.getElementById('slaveDigitalCurrent').textContent = d.acs.toFixed(2) + ' A';
     
+    // SD Card Displays
+    const sdBadge = document.getElementById('sdStatusBadge');
+    const sdTotal = document.getElementById('sdTotalSpace');
+    const sdUsed = document.getElementById('sdUsedSpace');
+    const sdProgress = document.getElementById('sdProgressBar');
+    const sdRatio = document.getElementById('sdUsageRatio');
+    
+    if (d.sd_ok) {
+      sdBadge.textContent = 'ONLINE';
+      sdBadge.className = 'status-badge';
+      sdBadge.style.color = 'var(--success)';
+      sdBadge.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+      sdBadge.style.background = 'rgba(16, 185, 129, 0.1)';
+      
+      const totalMB = d.sd_total / (1024 * 1024);
+      const usedMB = d.sd_used / (1024 * 1024);
+      sdTotal.textContent = totalMB.toFixed(1) + ' MB';
+      sdUsed.textContent = usedMB.toFixed(1) + ' MB';
+      
+      const percent = totalMB > 0 ? (usedMB / totalMB) * 100 : 0;
+      sdRatio.textContent = percent.toFixed(1) + '%';
+      sdProgress.style.width = percent.toFixed(1) + '%';
+    } else {
+      sdBadge.textContent = 'OFFLINE';
+      sdBadge.className = 'status-badge offline';
+      sdBadge.style.color = 'var(--danger)';
+      sdBadge.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+      sdBadge.style.background = 'rgba(239, 68, 68, 0.1)';
+      
+      sdTotal.textContent = '---';
+      sdUsed.textContent = '---';
+      sdRatio.textContent = '0%';
+      sdProgress.style.width = '0%';
+    }
+
     // Slaves status network
     const dDot = document.getElementById('digitalSlaveDot');
     const dRSSI = document.getElementById('digitalSlaveRSSI');
@@ -799,8 +941,16 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   
   ws.onmessage = (event) => {
     try {
-      const state = JSON.parse(event.data);
-      applyState(state);
+      const d = JSON.parse(event.data);
+      if (d.t === "files_res") {
+        populateLogFiles(d.files);
+      } else if (d.t === "read_res") {
+        if (d.file === currentLogFile && d.chunk === currentLogChunk) {
+          displayLogRecords(d.recs, d.total);
+        }
+      } else {
+        applyState(d);
+      }
     } catch(err) {
       console.error("Failed to parse WebSocket JSON:", err);
     }
@@ -816,8 +966,199 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     console.error("WebSocket encountered an error:", err);
   };
 
+  function toggleMasterLock() {
+    const nextState = !masterLock;
+    masterLock = nextState;
+    updateMasterLockUI();
+
+    fetch('/api/master-lock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ state: nextState })
+    })
+    .then(r => r.json())
+    .then(d => {
+      if(d.success) {
+        masterLock = d.state;
+        updateMasterLockUI();
+      }
+    })
+    .catch(() => {
+      masterLock = !nextState;
+      updateMasterLockUI();
+    });
+  }
+
+  function updateMasterLockUI() {
+    const btn = document.getElementById('masterLockToggleBtn');
+    const desc = document.getElementById('masterLockDesc');
+    const icon = document.getElementById('masterLockIcon');
+    if (!btn || !desc || !icon) return;
+
+    if (masterLock) {
+      btn.classList.add('active');
+      desc.textContent = 'SYSTEM LOCKED (Outlets locked OFF)';
+      desc.style.color = 'var(--warning)';
+      icon.style.background = 'rgba(245, 158, 11, 0.2)';
+    } else {
+      btn.classList.remove('active');
+      desc.textContent = 'System is unlocked';
+      desc.style.color = 'var(--text-muted)';
+      icon.style.background = 'rgba(245, 158, 11, 0.1)';
+    }
+  }
+
+  function triggerFactoryReset() {
+    document.getElementById('confirmModal').style.display = 'flex';
+  }
+  function closeResetModal() {
+    document.getElementById('confirmModal').style.display = 'none';
+  }
+  function executeFactoryReset() {
+    closeResetModal();
+    const btn = document.getElementById('factoryResetBtn');
+    btn.disabled = true;
+    btn.textContent = 'RESETTING SYSTEM...';
+    
+    fetch('/api/factory-reset', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      alert("Factory reset initiated. The device will reboot into provisioning AP 'SmartNest'. Please wait...");
+      setTimeout(() => { location.reload(); }, 5000);
+    })
+    .catch(() => {
+      alert("Reset request sent. Device is rebooting...");
+      setTimeout(() => { location.reload(); }, 5000);
+    });
+  }
+
+  function refreshLogFiles() {
+    fetch('/api/logs/list')
+    .then(r => r.json())
+    .catch(err => console.error("Error calling list API", err));
+  }
+
+  function populateLogFiles(files) {
+    const select = document.getElementById('logFileSelect');
+    if (!select) return;
+    
+    const currentSel = select.value;
+    
+    select.innerHTML = '<option value="">-- Select Log File --</option>';
+    files.forEach(f => {
+      const opt = document.createElement('option');
+      opt.value = f;
+      opt.textContent = f;
+      select.appendChild(opt);
+    });
+    
+    if (files.includes(currentSel)) {
+      select.value = currentSel;
+    }
+  }
+
+  function fetchLogChunk() {
+    const msg = document.getElementById('logViewerMsg');
+    msg.style.display = 'block';
+    msg.textContent = `Loading chunk ${currentLogChunk + 1}...`;
+    
+    fetch(`/api/logs/view?file=${encodeURIComponent(currentLogFile)}&chunk=${currentLogChunk}`)
+    .then(r => r.json())
+    .catch(err => {
+      msg.textContent = 'Failed to request logs';
+      msg.style.color = 'var(--danger)';
+    });
+  }
+
+  function displayLogRecords(recs, total) {
+    totalLogRecords = total;
+    const msg = document.getElementById('logViewerMsg');
+    const content = document.getElementById('logViewerContent');
+    const tbody = document.getElementById('logRecordsTableBody');
+    const indicator = document.getElementById('chunkPageIndicator');
+    
+    tbody.innerHTML = '';
+    
+    if (!recs || recs.length === 0) {
+      msg.style.display = 'block';
+      msg.textContent = 'No records in this chunk';
+      content.style.display = 'none';
+      return;
+    }
+    
+    msg.style.display = 'none';
+    content.style.display = 'block';
+    
+    recs.forEach(r => {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid rgba(255,255,255,0.03)';
+      
+      let timeStr = new Date(r.epoch * 1000).toLocaleString();
+      if (r.epoch === 0) timeStr = 'N/A';
+      
+      tr.innerHTML = `
+        <td style="padding: 8px 6px; color: var(--text-light);">${timeStr}</td>
+        <td style="padding: 8px 6px; text-align:right; color: #cbd5e1;">${r.v.toFixed(1)} V</td>
+        <td style="padding: 8px 6px; text-align:right; color: #3b82f6;">${r.load.toFixed(2)} A</td>
+        <td style="padding: 8px 6px; text-align:right; color: #10b981;">${r.pi.toFixed(3)} A</td>
+        <td style="padding: 8px 6px; text-align:right; color: #f59e0b;">${r.pva.toFixed(1)} VA</td>
+      `;
+      tbody.appendChild(tr);
+    });
+    
+    const totalChunks = Math.max(1, Math.ceil(total / 10));
+    indicator.textContent = `Page ${currentLogChunk + 1} of ${totalChunks}`;
+    
+    document.getElementById('prevChunkBtn').disabled = (currentLogChunk === 0);
+    document.getElementById('nextChunkBtn').disabled = (currentLogChunk >= totalChunks - 1);
+  }
+
+  function changeChunk(dir) {
+    const totalChunks = Math.ceil(totalLogRecords / 10);
+    const targetChunk = currentLogChunk + dir;
+    if (targetChunk >= 0 && targetChunk < totalChunks) {
+      currentLogChunk = targetChunk;
+      fetchLogChunk();
+    }
+  }
+
+  // Handle select change
+  document.addEventListener('DOMContentLoaded', () => {
+    const select = document.getElementById('logFileSelect');
+    if (select) {
+      select.addEventListener('change', (e) => {
+        const file = e.target.value;
+        if (file) {
+          currentLogFile = file;
+          currentLogChunk = 0;
+          fetchLogChunk();
+        } else {
+          document.getElementById('logViewerContent').style.display = 'none';
+          document.getElementById('logViewerMsg').style.display = 'block';
+          document.getElementById('logViewerMsg').textContent = 'Select a file to load logs';
+        }
+      });
+    }
+    // Auto-refresh file list on page load
+    setTimeout(refreshLogFiles, 1000);
+  });
+
   initUI();
 </script>
+
+<!-- Confirm Modal -->
+<div id="confirmModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 1000; align-items:center; justify-content:center; padding: 20px;">
+  <div class="card" style="max-width: 400px; border-color: var(--danger); background: var(--bg-dark);">
+    <p class="section-title" style="color: var(--danger); font-size:14px; margin-bottom: 12px;">Factory Reset Confirmation</p>
+    <p style="font-size:12px; color: var(--text-light); margin-bottom: 20px; line-height: 1.6;">
+      WARNING: This action will permanently erase all Wi-Fi credentials on the SmartNest controller and delete all binary log records (/state.bin and /sync.bin) from the SD card. Energy accumulation statistics will be reset to zero. This cannot be undone!
+    </p>
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px;">
+      <button class="cmd-btn" onclick="closeResetModal()">Cancel</button>
+      <button class="cmd-btn" onclick="executeFactoryReset()" style="background: var(--danger); border-color: var(--danger); color: white;">Confirm Reset</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 )rawliteral";

@@ -79,6 +79,13 @@ struct SystemData {
     SdCardState       sd;
     float internetAcsCurrentA; // Combined current
     bool  cloudOnline;
+    bool  masterLock;          // Global lock — all relays OFF, ignores commands
+    // SD log access flags (set by uartTask on Core 0, consumed by sdLoggingTask on Core 1)
+    bool  filesRequest;
+    bool  readRequest;
+    char  readFilename[64];
+    int   readChunk;
+    bool  factoryResetRequest;
 };
 
 SemaphoreHandle_t g_stateMutex = NULL;
@@ -316,6 +323,10 @@ void uartTask(void* pvParameters) {
                 char* pAcs = strstr(rxLine, "\"t\":\"acs\"");
                 char* pCloud = strstr(rxLine, "\"t\":\"cloud\"");
                 char* pHistAck = strstr(rxLine, "\"t\":\"hist_ack\"");
+                char* pLock = strstr(rxLine, "\"t\":\"lock\"");
+                char* pFilesReq = strstr(rxLine, "\"t\":\"files_req\"");
+                char* pReadReq = strstr(rxLine, "\"t\":\"read_req\"");
+                char* pFactoryReset = strstr(rxLine, "\"t\":\"factory_reset\"");
                 
                 if (pCmd) {
                     char* tgtPtr = strstr(rxLine, "\"tgt\":\"");
@@ -360,6 +371,7 @@ void uartTask(void* pvParameters) {
                             CmdPacket cp;
                             cp.type = typeVal;
                             esp_now_send(targetMac, (uint8_t*)&cp, sizeof(cp));
+                            Serial.printf("[Master] CMD -> tgt=%s cmd=%s type=0x%02X\n", tgt, cmd, typeVal);
                         }
                     }
                 }
@@ -424,6 +436,56 @@ void uartTask(void* pvParameters) {
                         }
                         xSemaphoreGive(g_histAckSem);
                     }
+                }
+                // Master Lock: {"t":"lock","val":true/false}
+                else if (pLock) {
+                    char* valPtr = strstr(rxLine, "\"val\":");
+                    if (valPtr) {
+                        bool lockVal = (strncmp(valPtr + 5, "true", 4) == 0);
+                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            g_systemState.masterLock = lockVal;
+                            xSemaphoreGive(g_stateMutex);
+                        }
+                        // Forward lock/unlock to Digital Board slave via ESP-NOW
+                        CmdPacket cp;
+                        cp.type = lockVal ? 0x04 : 0x05;
+                        esp_now_send(SLAVE1_MAC, (uint8_t*)&cp, sizeof(cp));
+                        Serial.printf("[Master] Master Lock -> %s (sent 0x%02X to Digital Board)\n", lockVal ? "ON" : "OFF", cp.type);
+                    }
+                }
+                // SD Log file listing: {"t":"files_req"}
+                else if (pFilesReq) {
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        g_systemState.filesRequest = true;
+                        xSemaphoreGive(g_stateMutex);
+                    }
+                    Serial.println("[Master] files_req received — queued for sdLoggingTask");
+                }
+                // SD Log chunk read: {"t":"read_req","file":"...","chunk":N}
+                else if (pReadReq) {
+                    char* filePtr = strstr(rxLine, "\"file\":\"");
+                    char* chunkPtr = strstr(rxLine, "\"chunk\":");
+                    if (filePtr && chunkPtr) {
+                        char fname[64] = {0};
+                        sscanf(filePtr + 8, "%[^\"]", fname);
+                        int chunkVal = (int)strtol(chunkPtr + 8, NULL, 10);
+                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            g_systemState.readRequest = true;
+                            strncpy(g_systemState.readFilename, fname, sizeof(g_systemState.readFilename) - 1);
+                            g_systemState.readFilename[sizeof(g_systemState.readFilename) - 1] = '\0';
+                            g_systemState.readChunk = chunkVal;
+                            xSemaphoreGive(g_stateMutex);
+                        }
+                        Serial.printf("[Master] read_req received — file=%s chunk=%d\n", fname, chunkVal);
+                    }
+                }
+                // Factory Reset: {"t":"factory_reset"}
+                else if (pFactoryReset) {
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        g_systemState.factoryResetRequest = true;
+                        xSemaphoreGive(g_stateMutex);
+                    }
+                    Serial.println("[Master] factory_reset received — queued for sdLoggingTask");
                 }
                 
                 rxIndex = 0;
@@ -506,6 +568,10 @@ void energyTimeTask(void* pvParameters) {
         float pzemPowerVal = 0.0f;
         float pzemVoltageVal = 0.0f;
         float combinedCurrent = 0.0f;
+        bool masterLockVal = false;
+        bool sdOkVal = false;
+        uint64_t sdTotalVal = 0;
+        uint64_t sdUsedVal = 0;
         bool gotMutex = false;
         
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -581,6 +647,10 @@ void energyTimeTask(void* pvParameters) {
             relayStateVal = g_systemState.digital.relayState;
             switchStateVal = g_systemState.digital.switchState;
             lockedVal = g_systemState.digital.locked;
+            masterLockVal = g_systemState.masterLock;
+            sdOkVal = g_systemState.sd.cardPresent;
+            sdTotalVal = g_systemState.sd.totalBytes;
+            sdUsedVal = g_systemState.sd.usedBytes;
             
             gotMutex = true;
             xSemaphoreGive(g_stateMutex);
@@ -624,19 +694,24 @@ void energyTimeTask(void* pvParameters) {
                     }
                 }
                 
-                // Build and send telemetry
-                char tel[512];
+                // Build and send telemetry (with SD stats + master lock)
+                char tel[640];
                 snprintf(tel, sizeof(tel),
                          "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%.1f,\"pi\":%.3f,\"pp\":%.1f,"
                          "\"d_wh\":%.1f,\"m_wh\":%.1f,\"l_wh\":%.1f,"
                          "\"d_on\":%s,\"p_on\":%s,\"d_rssi\":%d,\"p_rssi\":%d,"
-                         "\"d_relay\":%d,\"d_sw\":%d,\"d_lock\":%s}",
+                         "\"d_relay\":%d,\"d_sw\":%d,\"d_lock\":%s,"
+                         "\"sd_ok\":%s,\"sd_total\":%llu,\"sd_used\":%llu,"
+                         "\"m_lock\":%s}",
                          rmsCurrentVal, pzemVoltageVal, pzemCurrentVal, pzemPowerVal,
                          dailyEnergyVal, monthlyEnergyVal, lifetimeEnergyVal,
                          digitalOnlineVal ? "true" : "false", pzemOnlineVal ? "true" : "false",
                          rssiVal, pzemRssiVal,
                          relayStateVal, switchStateVal,
-                         lockedVal ? "true" : "false");
+                         lockedVal ? "true" : "false",
+                         sdOkVal ? "true" : "false",
+                         (unsigned long long)sdTotalVal, (unsigned long long)sdUsedVal,
+                         masterLockVal ? "true" : "false");
                 
                 enqueueUartTx(tel);
             }
@@ -736,6 +811,125 @@ void sdLoggingTask(void* pvParameters) {
                     }
                 }
             }
+        }
+        
+        // --- Handle files_req (scan /logs directory on Core 1) ---
+        bool wantFiles = false;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wantFiles = g_systemState.filesRequest;
+            if (wantFiles) g_systemState.filesRequest = false;
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (wantFiles && sdOk) {
+            Serial.println("[SD] Scanning /logs directory...");
+            File logsDir = SD.open("/logs");
+            char jsonBuf[512];
+            int written = snprintf(jsonBuf, sizeof(jsonBuf), "{\"t\":\"files_res\",\"files\":[");
+            bool first = true;
+            if (logsDir && logsDir.isDirectory()) {
+                File entry = logsDir.openNextFile();
+                while (entry) {
+                    const char* name = entry.name();
+                    if (!entry.isDirectory() && name) {
+                        if (!first && written + 2 < (int)sizeof(jsonBuf)) {
+                            jsonBuf[written++] = ',';
+                        }
+                        int needed = snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "\"%s\"", name);
+                        if (written + needed < (int)sizeof(jsonBuf)) {
+                            written += needed;
+                            first = false;
+                        }
+                    }
+                    entry.close();
+                    entry = logsDir.openNextFile();
+                }
+                logsDir.close();
+            }
+            snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "]}");
+            enqueueUartTx(jsonBuf);
+            Serial.printf("[SD] files_res sent (%d bytes)\n", (int)strlen(jsonBuf));
+        }
+        
+        // --- Handle read_req (read 10 records at chunk offset on Core 1) ---
+        bool wantRead = false;
+        char readFname[64] = {0};
+        int readChunkVal = 0;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wantRead = g_systemState.readRequest;
+            if (wantRead) {
+                g_systemState.readRequest = false;
+                strncpy(readFname, g_systemState.readFilename, sizeof(readFname) - 1);
+                readChunkVal = g_systemState.readChunk;
+            }
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (wantRead && sdOk) {
+            char fullPath[80];
+            snprintf(fullPath, sizeof(fullPath), "/logs/%s", readFname);
+            Serial.printf("[SD] Reading %s chunk %d...\n", fullPath, readChunkVal);
+            
+            File readFile = SD.open(fullPath, FILE_READ);
+            if (readFile) {
+                int totalRecs = readFile.size() / sizeof(SdLogRecord);
+                int startRec = readChunkVal * 10;
+                char jsonBuf[768];
+                int written = snprintf(jsonBuf, sizeof(jsonBuf), 
+                    "{\"t\":\"read_res\",\"file\":\"%s\",\"chunk\":%d,\"total\":%d,\"recs\":[", 
+                    readFname, readChunkVal, totalRecs);
+                
+                if (startRec < totalRecs) {
+                    readFile.seek(startRec * sizeof(SdLogRecord));
+                    bool first = true;
+                    for (int i = 0; i < 10 && (startRec + i) < totalRecs; i++) {
+                        SdLogRecord r;
+                        if (readFile.read((uint8_t*)&r, sizeof(r)) == sizeof(r)) {
+                            char recBuf[128];
+                            int n = snprintf(recBuf, sizeof(recBuf),
+                                "%s{\"epoch\":%u,\"v\":%.1f,\"load\":%.2f,\"pi\":%.3f,\"pva\":%.1f}",
+                                first ? "" : ",",
+                                r.epoch, r.voltage, r.acsCurrent, r.pzemCurrent, r.powerVA);
+                            if (written + n + 5 < (int)sizeof(jsonBuf)) {
+                                strcpy(jsonBuf + written, recBuf);
+                                written += n;
+                                first = false;
+                            }
+                        }
+                    }
+                }
+                snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "]}");
+                readFile.close();
+                enqueueUartTx(jsonBuf);
+                Serial.printf("[SD] read_res sent for %s chunk %d\n", readFname, readChunkVal);
+            } else {
+                char errBuf[128];
+                snprintf(errBuf, sizeof(errBuf), "{\"t\":\"read_res\",\"file\":\"%s\",\"chunk\":%d,\"total\":0,\"recs\":[]}", readFname, readChunkVal);
+                enqueueUartTx(errBuf);
+                Serial.printf("[SD] read_req FAIL — file %s not found\n", fullPath);
+            }
+        }
+        
+        // --- Handle factory_reset (delete state files, reset counters on Core 1) ---
+        bool wantReset = false;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wantReset = g_systemState.factoryResetRequest;
+            if (wantReset) g_systemState.factoryResetRequest = false;
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (wantReset && sdOk) {
+            Serial.println("[SD] FACTORY RESET — deleting /state.bin and /sync.bin...");
+            SD.remove("/state.bin");
+            SD.remove("/sync.bin");
+            if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                g_systemState.energy.dailyEnergy = 0.0;
+                g_systemState.energy.monthlyEnergy = 0.0;
+                g_systemState.energy.lifetimeEnergy = 0.0;
+                g_systemState.energy.lastSavedLifetime = 0.0;
+                g_systemState.energy.lastCalcTime = 0;
+                g_systemState.energy.pendingSave = false;
+                g_systemState.sd.lastSyncedEpoch = 0;
+                xSemaphoreGive(g_stateMutex);
+            }
+            Serial.println("[SD] Factory reset complete. Energy counters zeroed.");
         }
         
         // Check for state save triggers

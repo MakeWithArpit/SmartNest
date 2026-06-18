@@ -87,6 +87,14 @@ struct SystemState {
   bool   digitalRelayState;
   bool   digitalRelayLocked;
   bool   digitalSwitchState;
+
+  // Master Lock (global system lock)
+  bool   masterLock;
+
+  // SD Card stats from Master
+  bool   sdOk;
+  uint64_t sdTotal;
+  uint64_t sdUsed;
 };
 
 const int RELAY_PINS[NUM_RELAYS] = {
@@ -211,7 +219,7 @@ void updateRelayHardware() {
       bool D = sysState.dashboardStates[i];
       bool R = false;
 
-      if (sysState.masterShutdown || sysState.lockedStates[i]) {
+      if (sysState.masterShutdown || sysState.masterLock || sysState.lockedStates[i]) {
         R = false;
       } else {
         R = D;
@@ -236,11 +244,10 @@ void updateRelayHardware() {
 void relaySwitchTask(void *pvParameters) {
   relaySwitchInit();
   updateRelayHardware();
-
-  while (true) {
-    updateRelayHardware();
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
+  Serial.println("[SmartNest] Relay hardware initialized. Task suspending (event-driven mode).");
+  // No polling loop — relay changes are applied immediately via setRelayState()/updateRelayHardware()
+  // from HTTP API handlers, MQTT callbacks, and UART telemetry processing.
+  vTaskSuspend(NULL); // Suspend forever; task handle kept for potential future use
 }
 
 void currentSensorInit() {
@@ -804,8 +811,24 @@ void uartCommTask(void *pvParameters) {
                 sysState.digitalRelayState = doc["d_relay"];
                 sysState.digitalSwitchState = doc["d_sw"];
                 sysState.digitalRelayLocked = doc["d_lock"];
+
+                // Parse SD card stats + masterLock from Master
+                sysState.sdOk = doc["sd_ok"];
+                sysState.sdTotal = doc["sd_total"];
+                sysState.sdUsed = doc["sd_used"];
+                sysState.masterLock = doc["m_lock"];
                 xSemaphoreGive(stateMutex);
               }
+
+              // Non-spamming periodic 5s log prefix [SmartNest]
+              static uint32_t lastTelLogTime = 0;
+              if (millis() - lastTelLogTime >= 5000) {
+                lastTelLogTime = millis();
+                Serial.printf("[SmartNest] Telemetry update — V: %.1fV, Load: %.2fA, SD: %s, MasterLock: %s\n",
+                              sysState.pzemVoltage, sysState.currentAmps,
+                              sysState.sdOk ? "OK" : "ERROR", sysState.masterLock ? "LOCKED" : "UNLOCKED");
+              }
+
               pushWsUpdate();
               #if MQTT_ENABLED
               if (mqttClient.connected()) {
@@ -885,6 +908,10 @@ void uartCommTask(void *pvParameters) {
                 enqueueUartCmd("{\"t\":\"hist_ack\",\"batch\":" + String(batch) + ",\"upto\":" + String(lastEpoch) + "}");
               }
             }
+            else if (type == "files_res" || type == "read_res") {
+              Serial.printf("[SmartNest] Proxy-broadcasting %s WebSocket update (%d bytes)\n", type.c_str(), rxBuffer.length());
+              ws.textAll(rxBuffer);
+            }
           }
         }
         rxBuffer = "";
@@ -929,6 +956,20 @@ static AsyncWebServer dashServer(80);
 
 #include "dashboard_html.h"
 
+String getFormattedTime() {
+  time_t nowSecs;
+  if (time(&nowSecs) < 1000) {
+    return "N/A";
+  }
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) {
+    return "N/A";
+  }
+  char timeBuf[32];
+  strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(timeBuf);
+}
+
 static String buildStatusJSON() {
   String json = "{";
   json += "\"relays\":[";
@@ -963,14 +1004,22 @@ static String buildStatusJSON() {
     json += "\"p_rssi\":"    + String(sysState.pzemSlaveRSSI) + ",";
     json += "\"d_relay\":"   + String(sysState.digitalRelayState ? "true" : "false") + ",";
     json += "\"d_lock\":"    + String(sysState.digitalRelayLocked ? "true" : "false") + ",";
-    json += "\"d_sw\":"      + String(sysState.digitalSwitchState ? "true" : "false");
+    json += "\"d_sw\":"      + String(sysState.digitalSwitchState ? "true" : "false") + ",";
+    
+    // masterLock + SD stats
+    json += "\"m_lock\":"    + String(sysState.masterLock ? "true" : "false") + ",";
+    json += "\"sd_ok\":"     + String(sysState.sdOk ? "true" : "false") + ",";
+    json += "\"sd_total\":"  + String((unsigned long long)sysState.sdTotal) + ",";
+    json += "\"sd_used\":"   + String((unsigned long long)sysState.sdUsed);
     
     xSemaphoreGive(stateMutex);
   } else {
     json += "],\"locks\":[false,false,false,false,false,false],\"shutdown\":false,\"current\":0,\"rssi\":0,\"ssid\":\"\",";
-    json += "\"acs\":0.00,\"load\":0.00,\"v\":0.0,\"pw\":0.0,\"daily\":0.000,\"monthly\":0.000,\"lifetime\":0.000,\"d_on\":false,\"p_on\":false,\"d_rssi\":0,\"p_rssi\":0,\"d_relay\":false,\"d_lock\":false,\"d_sw\":false";
+    json += "\"acs\":0.00,\"load\":0.00,\"v\":0.0,\"pw\":0.0,\"daily\":0.000,\"monthly\":0.000,\"lifetime\":0.000,\"d_on\":false,\"p_on\":false,\"d_rssi\":0,\"p_rssi\":0,\"d_relay\":false,\"d_lock\":false,\"d_sw\":false,";
+    json += "\"m_lock\":false,\"sd_ok\":false,\"sd_total\":0,\"sd_used\":0";
   }
   json += ",\"uptime\":" + String(millis());
+  json += ",\"time\":\"" + getFormattedTime() + "\"";
   json += "}";
   return json;
 }
@@ -1004,6 +1053,7 @@ void dashboardInit() {
 
       if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
         setRelayState(relayIdx, state);
+        pushWsUpdate();
         req->send(200, "application/json",
                   "{\"success\":true,\"relay\":" + String(relayIdx) + ",\"state\":" + (state ? "true" : "false") + "}");
       } else if (relayIdx == 6) {
@@ -1040,6 +1090,7 @@ void dashboardInit() {
           xSemaphoreGive(stateMutex);
         }
         updateRelayHardware();
+        pushWsUpdate();
         req->send(200, "application/json",
                   "{\"success\":true,\"relay\":" + String(relayIdx) + ",\"locked\":" + (state ? "true" : "false") + "}");
       } else if (relayIdx == 6) {
@@ -1074,9 +1125,90 @@ void dashboardInit() {
         xSemaphoreGive(stateMutex);
       }
       updateRelayHardware();
+      if (state) {
+        enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
+        Serial.println("[SmartNest] Shutdown ON — sending relay_off command to Digital Board");
+      }
+      pushWsUpdate();
       req->send(200, "application/json",
                 "{\"success\":true,\"shutdown\":" + String(state ? "true" : "false") + "}");
     });
+
+  // Post handler for master lock setting
+  dashServer.on(
+    "/api/master-lock", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
+      StaticJsonDocument<128> doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) {
+        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+      if (!doc.containsKey("state")) {
+        req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
+        return;
+      }
+      bool state = doc["state"];
+
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        sysState.masterLock = state;
+        xSemaphoreGive(stateMutex);
+      }
+      updateRelayHardware();
+
+      // Send master lock status change command to Master
+      enqueueUartCmd("{\"t\":\"lock\",\"val\":" + String(state ? "true" : "false") + "}");
+      Serial.printf("[SmartNest] Master Lock set to %s, command sent to Master\n", state ? "ON" : "OFF");
+
+      pushWsUpdate();
+      req->send(200, "application/json",
+                "{\"success\":true,\"state\":" + String(state ? "true" : "false") + "}");
+    });
+
+  // Post handler for factory reset
+  dashServer.on(
+    "/api/factory-reset", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
+      Serial.println("[SmartNest] FACTORY RESET requested — wiping WiFi credentials and notifying Master...");
+      // Send reset command to Master
+      enqueueUartCmd("{\"t\":\"factory_reset\"}");
+      
+      req->send(200, "application/json", "{\"success\":true,\"msg\":\"Factory reset initiated. Device is resetting...\"}");
+      
+      // Wipe NVS WiFi credentials and reboot
+      delay(1000);
+      Preferences prefs;
+      prefs.begin(NVS_NAMESPACE, false);
+      prefs.clear();
+      prefs.end();
+      delay(1000);
+      ESP.restart();
+    });
+
+  // GET handler to request directory listing of SD card logs
+  dashServer.on("/api/logs/list", HTTP_GET, [](AsyncWebServerRequest *req) {
+    Serial.println("[SmartNest] GET /api/logs/list — requesting directory from Master");
+    enqueueUartCmd("{\"t\":\"files_req\"}");
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"Log list requested\"}");
+  });
+
+  // GET handler to request chunk contents of a specific log file
+  dashServer.on("/api/logs/view", HTTP_GET, [](AsyncWebServerRequest *req) {
+    if (req->hasParam("file") && req->hasParam("chunk")) {
+      String fileVal = req->getParam("file")->value();
+      int chunkVal = req->getParam("chunk")->value().toInt();
+      Serial.printf("[SmartNest] GET /api/logs/view — requesting file: %s chunk: %d\n", fileVal.c_str(), chunkVal);
+      
+      enqueueUartCmd("{\"t\":\"read_req\",\"file\":\"" + fileVal + "\",\"chunk\":" + String(chunkVal) + "}");
+      req->send(200, "application/json", "{\"success\":true,\"msg\":\"Log chunk requested\"}");
+    } else {
+      req->send(400, "application/json", "{\"error\":\"Missing file or chunk parameter\"}");
+    }
+  });
 
   // Post handler for slave commands from the web UI
   dashServer.on(

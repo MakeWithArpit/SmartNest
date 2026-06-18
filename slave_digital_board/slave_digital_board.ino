@@ -55,14 +55,19 @@ void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 
 // Relay Control
 void relayOn() {
-    if (masterLock || overcurrentLock) return;
+    if (masterLock || overcurrentLock) {
+        Serial.printf("[DigitalBoard] relayOn() blocked — masterLock=%d overcurrentLock=%d\n", masterLock, overcurrentLock);
+        return;
+    }
     digitalWrite(RELAY_PIN, LOW);
     relayCondition = true;
+    Serial.println("[DigitalBoard] Relay -> ON");
 }
 
 void relayOff() {
     digitalWrite(RELAY_PIN, HIGH);
     relayCondition = false;
+    Serial.println("[DigitalBoard] Relay -> OFF");
 }
 
 // 1 kHz non-blocking current sampler
@@ -145,11 +150,13 @@ void checkManualSwitch() {
             
             if (rawState == HIGH) {
                 if (masterLock || overcurrentLock) {
-                    Serial.println("Switch turned ON, but ignored due to lock");
+                    Serial.println("[DigitalBoard] Switch ON ignored — locked");
                 } else {
+                    Serial.println("[DigitalBoard] Switch toggled ON");
                     relayOn();
                 }
             } else {
+                Serial.println("[DigitalBoard] Switch toggled OFF");
                 relayOff();
             }
         }
@@ -290,11 +297,11 @@ void loop() {
                     lastAcknowledgementTime = millis();
                     sendAckReply();
                     break;
-                case 0x02: relayOn();  break;
-                case 0x03: relayOff(); break;
-                case 0x04: masterLock = true;  relayOff(); break;
-                case 0x05: masterLock = false; break;
-                case 0x06: delay(100); ESP.restart(); break;
+                case 0x02: Serial.println("[DigitalBoard] CMD: relay_on"); relayOn();  break;
+                case 0x03: Serial.println("[DigitalBoard] CMD: relay_off"); relayOff(); break;
+                case 0x04: Serial.println("[DigitalBoard] CMD: masterLock ON"); masterLock = true;  relayOff(); break;
+                case 0x05: Serial.println("[DigitalBoard] CMD: masterLock OFF"); masterLock = false; break;
+                case 0x06: Serial.println("[DigitalBoard] CMD: reboot"); delay(100); ESP.restart(); break;
             }
         }
     }
@@ -311,6 +318,15 @@ void loop() {
     if (millis() - lastSwitchCheckTime >= 50) {
         lastSwitchCheckTime = millis();
         checkManualSwitch();
+    }
+    
+    // 5-second periodic status log
+    static unsigned long lastStatusLogTime = 0;
+    if (millis() - lastStatusLogTime >= 5000) {
+        lastStatusLogTime = millis();
+        Serial.printf("[DigitalBoard] RMS: %.2fA | Relay: %s | MasterLock: %s | OC-Lock: %s\n",
+                      currentAmperes, relayCondition ? "ON" : "OFF",
+                      masterLock ? "YES" : "NO", overcurrentLock ? "YES" : "NO");
     }
     
     static bool lastRelayCondition = false;

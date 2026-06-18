@@ -109,6 +109,8 @@ void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 }
 
 // Read PZEM and send binary packet
+// If PZEM returns NaN (AC mains disconnected), falls back to 0.0f and still transmits
+// as an online heartbeat so the Master does not timeout and mark the node offline.
 void sendPzemPacket(uint8_t pktType) {
     float v = pzem.voltage();
     float i = pzem.current();
@@ -117,11 +119,13 @@ void sendPzemPacket(uint8_t pktType) {
     
     if (isnan(v) || isnan(i) || isnan(p) || isnan(e)) {
         pzemHealthy = false;
-        Serial.println("[PZEM ERROR] Failed to read sensor values (returned NAN)");
-        return;
+        Serial.println("[PZEM] WARNING: Sensor returned NAN — AC mains may be disconnected. Sending 0.0f heartbeat.");
+        // Fallback to zero — do NOT return, still send the packet so Master stays online
+        v = 0.0f; i = 0.0f; p = 0.0f; e = 0.0f;
+    } else {
+        pzemHealthy = true;
     }
-    
-    pzemHealthy = true;
+
     PzemSlavePacket pkt;
     pkt.type    = pktType;
     pkt.voltage = v;
@@ -132,10 +136,10 @@ void sendPzemPacket(uint8_t pktType) {
     if (espNowInitialized) {
         esp_err_t result = esp_now_send(masterMAC, (uint8_t*)&pkt, sizeof(pkt));
         if (result == ESP_OK) {
-            Serial.printf("[TX OK] Type: 0x%02X | V: %.1fV | I: %.3fA | P: %.1fW | E: %.1fWh\n", 
-                          pktType, v, i, p, e);
+            Serial.printf("[PZEM] TX OK — Type: 0x%02X | V: %.1fV | I: %.3fA | P: %.1fW | E: %.1fWh | Healthy: %s\n", 
+                          pktType, v, i, p, e, pzemHealthy ? "YES" : "NO");
         } else {
-            Serial.println("[TX FAIL] ESP-NOW transmission failed");
+            Serial.println("[PZEM] TX FAIL — ESP-NOW send error");
         }
     }
 }
@@ -233,12 +237,26 @@ void setup() {
 void loop() {
     handleIncomingPackets();
 
-    if (millis() - lastTelemetrySentTime >= TELEMETRY_INTERVAL_MS) {
-        lastTelemetrySentTime = millis();
+    uint32_t now = millis();
+
+    if (now - lastTelemetrySentTime >= TELEMETRY_INTERVAL_MS) {
+        lastTelemetrySentTime = now;
         sendPzemPacket(0x20);
     }
 
-    if (rebootRequested && (millis() >= rebootTime)) {
+    // Periodic 5s status log (non-spamming)
+    static uint32_t lastStatusLog = 0;
+    if (now - lastStatusLog >= 5000) {
+        lastStatusLog = now;
+        bool contacted = firstContactMade;
+        bool timeout = (now - lastMasterContactTime > MASTER_TIMEOUT_MS);
+        Serial.printf("[PZEM] Status — Master: %s | PZEM Healthy: %s | ESP-NOW: %s\n",
+                      contacted ? (timeout ? "TIMEOUT" : "ONLINE") : "WAITING",
+                      pzemHealthy ? "YES" : "NO",
+                      espNowInitialized ? "OK" : "ERROR");
+    }
+
+    if (rebootRequested && (now >= rebootTime)) {
         ESP.restart();
     }
 
