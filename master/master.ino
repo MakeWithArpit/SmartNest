@@ -14,7 +14,7 @@
 const uint8_t SLAVE1_MAC[] = {0x14, 0x08, 0x08, 0xA4, 0x94, 0x1C}; // Digital Slave
 const uint8_t SLAVE2_MAC[] = {0x78, 0x21, 0x84, 0x9C, 0x98, 0x4C}; // PZEM Slave
 
-const int SWITCH_PINS[6] = {33, 32, 26, 27, 4, 13};
+const int SWITCH_PINS[6] = {33, 32, 26, 27, 14, 13};
 
 // SD SPI Pins
 #define SD_CS   5
@@ -446,15 +446,24 @@ void uartTask(void* pvParameters) {
                     char* valPtr = strstr(rxLine, "\"val\":");
                     if (valPtr) {
                         bool lockVal = (strncmp(valPtr + 5, "true", 4) == 0);
+                        Serial.printf("[LOCK] Lock command received from SmartNest: %s\n", lockVal ? "ON" : "OFF");
                         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                             g_systemState.masterLock = lockVal;
                             xSemaphoreGive(g_stateMutex);
                         }
+                        Serial.printf("[LOCK] g_systemState.masterLock stored: %s\n", lockVal ? "ON" : "OFF");
+                        
                         // Forward lock/unlock to Digital Board slave via ESP-NOW
                         CmdPacket cp;
                         cp.type = lockVal ? 0x04 : 0x05;
                         esp_now_send(SLAVE1_MAC, (uint8_t*)&cp, sizeof(cp));
-                        Serial.printf("[Master] Master Lock -> %s (sent 0x%02X to Digital Board)\n", lockVal ? "ON" : "OFF", cp.type);
+                        Serial.println("[LOCK] Digital Board lock command forwarded");
+                        
+                        // Send lock_ack back to SmartNest
+                        char ackBuf[64];
+                        snprintf(ackBuf, sizeof(ackBuf), "{\"t\":\"lock_ack\",\"val\":%s}", lockVal ? "true" : "false");
+                        enqueueUartTx(ackBuf);
+                        Serial.println("[LOCK] lock_ack sent to SmartNest");
                     }
                 }
                 // SD Log file listing: {"t":"files_req"}

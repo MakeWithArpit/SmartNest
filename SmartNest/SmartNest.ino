@@ -199,6 +199,7 @@ SemaphoreHandle_t stateMutex = NULL;
 SystemState sysState;
 String wifiPassword = "";
 volatile bool isProvisioningMode = false;
+volatile bool pendingMasterLockSync = false;
 
 // UART command items queue
 struct UartCmdItem {
@@ -312,6 +313,7 @@ void toggleRelay(int index) {
 }
 
 void updateRelayHardware() {
+  bool stateChanged = false;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     for (int i = 0; i < NUM_RELAYS; i++) {
       bool D = sysState.dashboardStates[i];
@@ -330,6 +332,7 @@ void updateRelayHardware() {
         Serial.printf("[TIMING] SmartNest local relay GPIO written at: %lu\n",
                       millis());
         sysState.lastChangeMs = millis();
+        stateChanged = true;
 
         RelayEvent evt;
         evt.index = i;
@@ -339,6 +342,10 @@ void updateRelayHardware() {
       }
     }
     xSemaphoreGive(stateMutex);
+  }
+  
+  if (stateChanged) {
+    pushWsUpdate();
   }
 }
 
@@ -376,11 +383,59 @@ void currentSensorTask(void *pvParameters) {
 
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t lastProcessTime = millis();
+  uint32_t lastWsPushTime = 0;
+  
+  static float lastSentAmps = 0.0f;
+  static uint32_t lastSentTime = 0;
+  static bool prevRelayStates[NUM_RELAYS] = {false};
 
   static double sqSum = 0.0;
   static uint32_t sampleCount = 0;
 
   while (true) {
+    // Check if any local relays are ON and check for changes
+    bool anyRelayOn = false;
+    bool relayStateChanged = false;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      for (int i = 0; i < NUM_RELAYS; i++) {
+        if (sysState.relayStates[i]) {
+          anyRelayOn = true;
+        }
+        if (sysState.relayStates[i] != prevRelayStates[i]) {
+          relayStateChanged = true;
+          prevRelayStates[i] = sysState.relayStates[i];
+        }
+      }
+      xSemaphoreGive(stateMutex);
+    }
+
+    if (!anyRelayOn) {
+      // Force current to 0.00A and clear accumulators
+      float oldAmps = 0.0f;
+      bool changed = false;
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        oldAmps = sysState.currentAmps;
+        sysState.currentAmps = 0.0f;
+        changed = (oldAmps != 0.0f);
+        xSemaphoreGive(stateMutex);
+      }
+      sqSum = 0.0;
+      sampleCount = 0;
+
+      if (changed || relayStateChanged) {
+        pushWsUpdate();
+        
+        // Immediately send 0.00A to Master
+        uint32_t now = millis();
+        lastSentTime = now;
+        lastSentAmps = 0.0f;
+        enqueueUartCmd("{\"t\":\"acs\",\"i\":0.00}");
+      }
+      // Sleep a bit longer when idle
+      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
+      continue;
+    }
+
     // 1 kHz non-blocking sample
     float milliVolts = analogReadMilliVolts(ACS712_PIN);
     float deltaMv = (milliVolts - acs712ZeroMv) * ACS712_DIVIDER_RATIO;
@@ -400,13 +455,35 @@ void currentSensorTask(void *pvParameters) {
           finalAmps = rmsCurrent;
         }
 
-        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        bool changedSignificantly = false;
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          float diff = fabs(sysState.currentAmps - finalAmps);
+          changedSignificantly = (diff >= 0.05f) || (sysState.currentAmps == 0.0f && finalAmps > 0.0f);
           sysState.currentAmps = finalAmps;
           xSemaphoreGive(stateMutex);
         }
 
         sqSum = 0.0;
         sampleCount = 0;
+
+        // Push WebSocket update if changed significantly or at 1s interval
+        if (changedSignificantly || (now - lastWsPushTime >= 1000)) {
+          lastWsPushTime = now;
+          pushWsUpdate();
+        }
+
+        // Send immediately to Master if force conditions met, or if changed significantly and rate-limited
+        bool forceSend = relayStateChanged || 
+                         (lastSentAmps == 0.0f && finalAmps > 0.0f) || 
+                         (lastSentAmps > 0.0f && finalAmps == 0.0f);
+        
+        bool valueChanged = (fabs(finalAmps - lastSentAmps) >= 0.05f);
+        
+        if (forceSend || (valueChanged && (now - lastSentTime >= 500))) {
+          lastSentTime = now;
+          lastSentAmps = finalAmps;
+          enqueueUartCmd("{\"t\":\"acs\",\"i\":" + String(finalAmps, 2) + "}");
+        }
       }
     }
 
@@ -1009,7 +1086,20 @@ void uartCommTask(void *pvParameters) {
                 sysState.sdOk = doc["sd_ok"];
                 sysState.sdTotal = doc["sd_total"];
                 sysState.sdUsed = doc["sd_used"];
-                sysState.masterLock = doc["m_lock"];
+                
+                if (doc.containsKey("m_lock")) {
+                  bool newMLock = doc["m_lock"];
+                  bool currentMLock = sysState.masterLock;
+                  Serial.printf("[LOCK] Telemetry m_lock received: %s\n", newMLock ? "ON" : "OFF");
+                  if (newMLock != currentMLock) {
+                    if (pendingMasterLockSync) {
+                      Serial.println("[LOCK] Ignored stale/unexpected lock overwrite");
+                    } else {
+                      sysState.masterLock = newMLock;
+                    }
+                  }
+                }
+                
                 sysState.pzemSensorHealthy = doc["p_health"] | false;
                 xSemaphoreGive(stateMutex);
               }
@@ -1034,9 +1124,21 @@ void uartCommTask(void *pvParameters) {
             } else if (type == "sw") {
               int idx = doc["idx"];
               int s = doc["s"];
+              Serial.printf("[SmartNest][SW] Manual switch event received: idx=%d, state=%d, dashboard updated\n", idx, s);
               if (idx >= 0 && idx < NUM_RELAYS) {
                 setRelayState(idx, s == 1);
+                pushWsUpdate();
               }
+            } else if (type == "lock_ack") {
+              bool val = doc["val"];
+              Serial.printf("[LOCK] Master lock ACK received: %s\n", val ? "ON" : "OFF");
+              if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                sysState.masterLock = val;
+                pendingMasterLockSync = false;
+                xSemaphoreGive(stateMutex);
+              }
+              updateRelayHardware();
+              pushWsUpdate();
             } else if (type == "off") {
               String dev = doc["dev"];
               if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1388,18 +1490,19 @@ void dashboardInit() {
         }
         bool state = doc["state"];
 
+        Serial.printf("[LOCK] Dashboard requested Global Master Lock: %s\n", state ? "ON" : "OFF");
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           sysState.masterLock = state;
+          pendingMasterLockSync = true;
           xSemaphoreGive(stateMutex);
         }
+        Serial.printf("[LOCK] Local masterLock set: %s\n", state ? "ON" : "OFF");
         updateRelayHardware();
 
         // Send master lock status change command to Master
         enqueueUartCmd("{\"t\":\"lock\",\"val\":" +
                        String(state ? "true" : "false") + "}");
-        Serial.printf(
-            "[SmartNest] Master Lock set to %s, command sent to Master\n",
-            state ? "ON" : "OFF");
+        Serial.println("[LOCK] UART lock command sent to Master");
 
         pushWsUpdate();
         req->send(200, "application/json",

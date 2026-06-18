@@ -468,40 +468,26 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
-  <!-- SD Log Viewer Card -->
-  <div class="card">
+  <!-- SD Log CSV Download Card -->
+  <div class="card" id="logDownloadCard">
     <p class="section-title">SD Event Logs</p>
-    <div style="display: flex; gap: 8px; margin-bottom: 12px;">
-      <select id="logFileSelect" style="flex: 1; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 10px; color: var(--text-light); padding: 8px 12px; font-size: 12px; outline: none;">
-        <option value="">-- Select Log File --</option>
-      </select>
-      <button class="cmd-btn" onclick="refreshLogFiles()" style="padding: 0 16px; font-size: 11px;">Refresh</button>
-    </div>
-    
-    <div id="logViewerContent" style="display: none;">
-      <div style="overflow-x: auto; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 10px; background: rgba(0,0,0,0.2);">
-        <table style="width: 100%; border-collapse: collapse; font-size: 10px; text-align: left; min-width: 320px;">
-          <thead>
-            <tr style="border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text-muted);">
-              <th style="padding: 8px 6px;">Time (Epoch)</th>
-              <th style="padding: 8px 6px; text-align:right;">Mains V</th>
-              <th style="padding: 8px 6px; text-align:right;">Load A</th>
-              <th style="padding: 8px 6px; text-align:right;">PZEM A</th>
-              <th style="padding: 8px 6px; text-align:right;">App Power</th>
-            </tr>
-          </thead>
-          <tbody id="logRecordsTableBody">
-          </tbody>
-        </table>
+    <div style="display: flex; flex-direction: column; gap: 12px; align-items: center;">
+      <button class="cmd-btn" id="downloadCsvBtn" onclick="startCsvDownload()" style="width:100%; font-size:12px; font-weight:800; background:rgba(59,130,246,0.08); border-color:rgba(59,130,246,0.3); color:var(--primary-light); display:flex; align-items:center; justify-content:center; gap:8px; padding: 12px; outline: none;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px; height:16px; display:inline-block; vertical-align:middle;">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+        </svg>
+        Download Logs as CSV
+      </button>
+      <div id="logDownloadProgress" style="display:none; width:100%;">
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-muted); margin-bottom:4px;">
+          <span id="logDownloadStatus">Preparing download...</span>
+          <span id="logDownloadPercent">0%</span>
+        </div>
+        <div style="width: 100%; height: 6px; background: rgba(255,255,255,0.05); border-radius: 3px; overflow: hidden; border: 1px solid var(--border);">
+          <div id="logDownloadProgressBar" style="width: 0%; height: 100%; background: var(--primary-gradient); transition: width 0.2s ease;"></div>
+        </div>
       </div>
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <button class="cmd-btn" id="prevChunkBtn" onclick="changeChunk(-1)" style="padding: 6px 12px; font-size: 11px;">&larr; Prev</button>
-        <span style="font-size: 11px; color: var(--text-muted);" id="chunkPageIndicator">Page 1 of 1</span>
-        <button class="cmd-btn" id="nextChunkBtn" onclick="changeChunk(1)" style="padding: 6px 12px; font-size: 11px;">Next &rarr;</button>
-      </div>
-      <button class="cmd-btn" onclick="exportLogCSV()" style="width:100%;margin-top:10px;font-size:11px;background:rgba(59,130,246,0.08);border-color:rgba(59,130,246,0.3);color:var(--primary-light);">Export Page as CSV</button>
     </div>
-    <p id="logViewerMsg" style="font-size: 11px; color: var(--text-muted); text-align: center; margin-top: 10px;">Select a file to load logs</p>
   </div>
 
   <!-- Slave Communication Health Card -->
@@ -661,9 +647,6 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   let digitalRelayLocked = false;
   let digitalSwitchState = false;
 
-  let currentLogFile = "";
-  let currentLogChunk = 0;
-  let totalLogRecords = 0;
 
   const relayNames = ["Light 1", "Light 2", "Light 3", "Light 4", "Light 5", "Power Socket"];
 
@@ -886,23 +869,29 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   }
 
   function applyState(d) {
+    if (!d) return;
+
     // 0-5 relays
-    relayStates = d.relays;
-    lockStates = d.locks || [false, false, false, false, false, false];
+    if (Array.isArray(d.relays)) relayStates = d.relays;
+    if (Array.isArray(d.locks)) lockStates = d.locks;
     
     // 6th relay
-    digitalRelayState = d.d_relay;
-    digitalRelayLocked = d.d_lock;
-    digitalSwitchState = d.d_sw;
+    if (typeof d.d_relay === "boolean") digitalRelayState = d.d_relay;
+    if (typeof d.d_lock === "boolean") digitalRelayLocked = d.d_lock;
+    if (typeof d.d_sw === "boolean") digitalSwitchState = d.d_sw;
     
     // masterLock
-    masterLock = d.m_lock;
-    updateMasterLockUI();
+    if (typeof d.m_lock === "boolean") {
+      masterLock = d.m_lock;
+      updateMasterLockUI();
+    }
 
     updateUI();
     
-    shutdownState = d.shutdown;
-    updateShutdownUI();
+    if (typeof d.shutdown === "boolean") {
+      shutdownState = d.shutdown;
+      updateShutdownUI();
+    }
 
     // Time display
     const timeRow = document.getElementById('systemTime');
@@ -911,23 +900,25 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     }
     
     // Combined / Active load displays
-    document.getElementById('combinedAcsCurrent').textContent = d.current.toFixed(2) + ' A';
-    document.getElementById('combinedAcsPower').textContent = Math.round(d.current * (d.v || 230)) + ' W';
+    if (typeof d.current === "number") {
+      document.getElementById('combinedAcsCurrent').textContent = d.current.toFixed(2) + ' A';
+      document.getElementById('combinedAcsPower').textContent = Math.round(d.current * (d.v || 230)) + ' W';
+    }
     
     // WiFi Signal Displays
-    document.getElementById('wifiSignalSSID').textContent = d.ssid || 'Unknown';
-    document.getElementById('wifiSignalRSSI').textContent = 'RSSI: ' + d.rssi + ' dBm';
+    if (d.ssid !== undefined) document.getElementById('wifiSignalSSID').textContent = d.ssid || 'Unknown';
+    if (typeof d.rssi === "number") document.getElementById('wifiSignalRSSI').textContent = 'RSSI: ' + d.rssi + ' dBm';
     
     // Energy accumulation displays
-    document.getElementById('energyDaily').textContent = d.daily.toFixed(3) + ' kWh';
-    document.getElementById('energyMonthly').textContent = d.monthly.toFixed(3) + ' kWh';
-    document.getElementById('energyLifetime').textContent = d.lifetime.toFixed(2) + ' kWh';
+    if (typeof d.daily === "number") document.getElementById('energyDaily').textContent = d.daily.toFixed(3) + ' kWh';
+    if (typeof d.monthly === "number") document.getElementById('energyMonthly').textContent = d.monthly.toFixed(3) + ' kWh';
+    if (typeof d.lifetime === "number") document.getElementById('energyLifetime').textContent = d.lifetime.toFixed(2) + ' kWh';
     
     // Energy detailed sensor parameters
-    document.getElementById('pzemVoltage').textContent = d.v.toFixed(1) + ' V';
-    document.getElementById('pzemPower').textContent = d.pw.toFixed(1) + ' W';
-    document.getElementById('pzemCurrent').textContent = d.load.toFixed(2) + ' A';
-    document.getElementById('slaveDigitalCurrent').textContent = d.acs.toFixed(2) + ' A';
+    if (typeof d.v === "number") document.getElementById('pzemVoltage').textContent = d.v.toFixed(1) + ' V';
+    if (typeof d.pw === "number") document.getElementById('pzemPower').textContent = d.pw.toFixed(1) + ' W';
+    if (typeof d.load === "number") document.getElementById('pzemCurrent').textContent = d.load.toFixed(2) + ' A';
+    if (typeof d.acs === "number") document.getElementById('slaveDigitalCurrent').textContent = d.acs.toFixed(2) + ' A';
     
     // SD Card Displays
     const sdBadge = document.getElementById('sdStatusBadge');
@@ -936,71 +927,77 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     const sdProgress = document.getElementById('sdProgressBar');
     const sdRatio = document.getElementById('sdUsageRatio');
     
-    if (d.sd_ok) {
-      sdBadge.textContent = 'ONLINE';
-      sdBadge.className = 'status-badge';
-      sdBadge.style.color = 'var(--success)';
-      sdBadge.style.borderColor = 'rgba(16, 185, 129, 0.2)';
-      sdBadge.style.background = 'rgba(16, 185, 129, 0.1)';
-      
-      const totalMB = d.sd_total / (1024 * 1024);
-      const usedMB = d.sd_used / (1024 * 1024);
-      sdTotal.textContent = totalMB.toFixed(1) + ' MB';
-      sdUsed.textContent = usedMB.toFixed(1) + ' MB';
-      
-      const percent = totalMB > 0 ? (usedMB / totalMB) * 100 : 0;
-      sdRatio.textContent = percent.toFixed(1) + '%';
-      sdProgress.style.width = percent.toFixed(1) + '%';
-    } else {
-      sdBadge.textContent = 'OFFLINE';
-      sdBadge.className = 'status-badge offline';
-      sdBadge.style.color = 'var(--danger)';
-      sdBadge.style.borderColor = 'rgba(239, 68, 68, 0.2)';
-      sdBadge.style.background = 'rgba(239, 68, 68, 0.1)';
-      
-      sdTotal.textContent = '---';
-      sdUsed.textContent = '---';
-      sdRatio.textContent = '0%';
-      sdProgress.style.width = '0%';
+    if (sdBadge && sdTotal && sdUsed && sdProgress && sdRatio && typeof d.sd_ok === "boolean") {
+      if (d.sd_ok) {
+        sdBadge.textContent = 'ONLINE';
+        sdBadge.className = 'status-badge';
+        sdBadge.style.color = 'var(--success)';
+        sdBadge.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+        sdBadge.style.background = 'rgba(16, 185, 129, 0.1)';
+        
+        const totalMB = d.sd_total / (1024 * 1024);
+        const usedMB = d.sd_used / (1024 * 1024);
+        sdTotal.textContent = totalMB.toFixed(1) + ' MB';
+        sdUsed.textContent = usedMB.toFixed(1) + ' MB';
+        
+        const percent = totalMB > 0 ? (usedMB / totalMB) * 100 : 0;
+        sdRatio.textContent = percent.toFixed(1) + '%';
+        sdProgress.style.width = percent.toFixed(1) + '%';
+      } else {
+        sdBadge.textContent = 'OFFLINE';
+        sdBadge.className = 'status-badge offline';
+        sdBadge.style.color = 'var(--danger)';
+        sdBadge.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+        sdBadge.style.background = 'rgba(239, 68, 68, 0.1)';
+        
+        sdTotal.textContent = '---';
+        sdUsed.textContent = '---';
+        sdRatio.textContent = '0%';
+        sdProgress.style.width = '0%';
+      }
     }
 
     // Slaves status network
     const dDot = document.getElementById('digitalSlaveDot');
     const dRSSI = document.getElementById('digitalSlaveRSSI');
-    if (d.d_on) {
-      dDot.className = 'slave-dot online';
-      dRSSI.textContent = d.d_rssi + ' dBm';
-    } else {
-      dDot.className = 'slave-dot';
-      dRSSI.textContent = 'OFFLINE';
+    if (dDot && dRSSI && typeof d.d_on === "boolean") {
+      if (d.d_on) {
+        dDot.className = 'slave-dot online';
+        dRSSI.textContent = d.d_rssi + ' dBm';
+      } else {
+        dDot.className = 'slave-dot';
+        dRSSI.textContent = 'OFFLINE';
+      }
     }
     
     const pDot = document.getElementById('pzemSlaveDot');
     const pRSSI = document.getElementById('pzemSlaveRSSI');
     const pHealth = document.getElementById('pzemHealthLabel');
-    if (d.p_on) {
-      pDot.className = 'slave-dot online';
-      pRSSI.textContent = d.p_rssi + ' dBm';
-      if (d.p_health) {
-        pHealth.textContent = 'HEALTHY';
-        pHealth.style.color = 'var(--success)';
+    if (pDot && pRSSI && pHealth && typeof d.p_on === "boolean") {
+      if (d.p_on) {
+        pDot.className = 'slave-dot online';
+        pRSSI.textContent = d.p_rssi + ' dBm';
+        if (d.p_health) {
+          pHealth.textContent = 'HEALTHY';
+          pHealth.style.color = 'var(--success)';
+        } else {
+          pHealth.textContent = 'SENSOR ERROR';
+          pHealth.style.color = 'var(--warning)';
+        }
       } else {
-        pHealth.textContent = 'SENSOR ERROR';
-        pHealth.style.color = 'var(--warning)';
+        pDot.className = 'slave-dot';
+        pRSSI.textContent = 'OFFLINE';
+        pHealth.textContent = 'OFFLINE';
+        pHealth.style.color = 'var(--danger)';
       }
-    } else {
-      pDot.className = 'slave-dot';
-      pRSSI.textContent = 'OFFLINE';
-      pHealth.textContent = 'OFFLINE';
-      pHealth.style.color = 'var(--danger)';
     }
     
     // MQTT Cloud status
     const mqttDot = document.getElementById('mqttStatusDot');
     const mqttLabel = document.getElementById('mqttStatusLabel');
-    if (mqttDot && mqttLabel) {
+    if (mqttDot && mqttLabel && typeof d.mqtt_status === "number") {
       const mqttStNames = ['DISABLED','CONNECTING','CONNECTED','ERROR'];
-      const mqttSt = d.mqtt_status || 0;
+      const mqttSt = d.mqtt_status;
       mqttLabel.textContent = mqttStNames[mqttSt] || 'UNKNOWN';
       if (mqttSt === 2) {
         mqttDot.className = 'slave-dot online';
@@ -1016,18 +1013,179 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     }
     
     // Uptime display formatting
-    let sec = Math.floor(d.uptime / 1000);
-    let min = Math.floor(sec / 60);
-    let hr = Math.floor(min / 60);
-    sec %= 60; min %= 60;
-    let uptimeStr = "";
-    if(hr > 0) uptimeStr += hr + "h ";
-    if(min > 0) uptimeStr += min + "m ";
-    uptimeStr += sec + "s";
-    document.getElementById('systemUptime').textContent = uptimeStr;
+    if (typeof d.uptime === "number") {
+      let sec = Math.floor(d.uptime / 1000);
+      let min = Math.floor(sec / 60);
+      let hr = Math.floor(min / 60);
+      sec %= 60; min %= 60;
+      let uptimeStr = "";
+      if(hr > 0) uptimeStr += hr + "h ";
+      if(min > 0) uptimeStr += min + "m ";
+      uptimeStr += sec + "s";
+      document.getElementById('systemUptime').textContent = uptimeStr;
+    }
   }
 
-  // WebSocket initialization
+  // ─── CSV Download State ───
+  let csvDownloading = false;
+  let csvFileToDownload = "";
+  let csvChunkIndex = 0;
+  let csvTotalRecords = 0;
+  let csvCollectedRows = [];
+
+  // ─── Fetch initial state on page load ───
+  function fetchInitialState() {
+    fetch('/api/status')
+      .then(r => r.json())
+      .then(d => { applyState(d); })
+      .catch(err => console.error("Initial status fetch failed:", err));
+  }
+
+  // ─── CSV Download Functions ───
+  function startCsvDownload() {
+    if (csvDownloading) return;
+    const btn = document.getElementById('downloadCsvBtn');
+    const progress = document.getElementById('logDownloadProgress');
+    const status = document.getElementById('logDownloadStatus');
+    const percent = document.getElementById('logDownloadPercent');
+    const bar = document.getElementById('logDownloadProgressBar');
+
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    progress.style.display = 'block';
+    status.textContent = 'Requesting file list...';
+    percent.textContent = '0%';
+    bar.style.width = '0%';
+    csvDownloading = true;
+    csvCollectedRows = [];
+    csvChunkIndex = 0;
+    csvTotalRecords = 0;
+    csvFileToDownload = "";
+
+    fetch('/api/logs/list')
+      .then(r => r.json())
+      .catch(err => {
+        status.textContent = 'Failed to request file list';
+        status.style.color = 'var(--danger)';
+        resetCsvDownloadUI();
+      });
+  }
+
+  function handleCsvFileList(files) {
+    const status = document.getElementById('logDownloadStatus');
+    if (!csvDownloading) return;
+    if (!files || files.length === 0) {
+      status.textContent = 'No log files found on SD card';
+      status.style.color = 'var(--warning)';
+      resetCsvDownloadUI();
+      return;
+    }
+    // Pick the latest .dat file (last in sorted list)
+    const datFiles = files.filter(f => f.endsWith('.dat'));
+    if (datFiles.length === 0) {
+      status.textContent = 'No .dat log files found';
+      status.style.color = 'var(--warning)';
+      resetCsvDownloadUI();
+      return;
+    }
+    csvFileToDownload = datFiles[datFiles.length - 1];
+    csvChunkIndex = 0;
+    status.textContent = 'Downloading ' + csvFileToDownload + '...';
+    requestDownloadChunk();
+  }
+
+  function requestDownloadChunk() {
+    fetch('/api/logs/view?file=' + encodeURIComponent(csvFileToDownload) + '&chunk=' + csvChunkIndex)
+      .then(r => r.json())
+      .catch(err => {
+        const status = document.getElementById('logDownloadStatus');
+        status.textContent = 'Chunk request failed';
+        status.style.color = 'var(--danger)';
+        resetCsvDownloadUI();
+      });
+  }
+
+  function handleCsvChunkReceived(d) {
+    if (!csvDownloading) return;
+    if (d.file !== csvFileToDownload) return;
+
+    const status = document.getElementById('logDownloadStatus');
+    const percent = document.getElementById('logDownloadPercent');
+    const bar = document.getElementById('logDownloadProgressBar');
+
+    const recs = d.recs || [];
+    const total = d.total || 0;
+    csvTotalRecords = total;
+
+    recs.forEach(r => {
+      csvCollectedRows.push(r);
+    });
+
+    const totalChunks = Math.max(1, Math.ceil(total / 10));
+    const pct = Math.min(100, Math.round(((csvChunkIndex + 1) / totalChunks) * 100));
+    percent.textContent = pct + '%';
+    bar.style.width = pct + '%';
+    status.textContent = 'Chunk ' + (csvChunkIndex + 1) + ' of ' + totalChunks + '...';
+
+    if (recs.length > 0 && (csvChunkIndex + 1) < totalChunks) {
+      csvChunkIndex++;
+      setTimeout(requestDownloadChunk, 100);
+    } else {
+      generateAndDownloadCsv();
+    }
+  }
+
+  function generateAndDownloadCsv() {
+    const status = document.getElementById('logDownloadStatus');
+    const percent = document.getElementById('logDownloadPercent');
+    const bar = document.getElementById('logDownloadProgressBar');
+
+    if (csvCollectedRows.length === 0) {
+      status.textContent = 'No records to export';
+      status.style.color = 'var(--warning)';
+      resetCsvDownloadUI();
+      return;
+    }
+
+    status.textContent = 'Generating CSV...';
+    percent.textContent = '100%';
+    bar.style.width = '100%';
+
+    let csv = 'Timestamp,Voltage (V),Load Current (A),PZEM Current (A),Power (VA)\n';
+    csvCollectedRows.forEach(r => {
+      let ts = r.epoch ? new Date(r.epoch * 1000).toISOString() : 'N/A';
+      csv += ts + ',' + (r.v||0).toFixed(1) + ',' + (r.load||0).toFixed(2) + ',' + (r.pi||0).toFixed(3) + ',' + (r.pva||0).toFixed(1) + '\n';
+    });
+
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = csvFileToDownload.replace('.dat', '') + '_log.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    status.textContent = 'Download complete! (' + csvCollectedRows.length + ' records)';
+    status.style.color = 'var(--success)';
+    resetCsvDownloadUI();
+  }
+
+  function resetCsvDownloadUI() {
+    csvDownloading = false;
+    const btn = document.getElementById('downloadCsvBtn');
+    if (btn) {
+      btn.disabled = false;
+      btn.style.opacity = '1';
+    }
+    setTimeout(() => {
+      const progress = document.getElementById('logDownloadProgress');
+      if (progress) progress.style.display = 'none';
+    }, 5000);
+  }
+
+  // ─── WebSocket initialization ───
   const ws = new WebSocket(`ws://${location.hostname}/ws`);
   
   ws.onopen = () => {
@@ -1039,11 +1197,9 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     try {
       const d = JSON.parse(event.data);
       if (d.t === "files_res") {
-        populateLogFiles(d.files);
+        handleCsvFileList(d.files);
       } else if (d.t === "read_res") {
-        if (d.file === currentLogFile && d.chunk === currentLogChunk) {
-          displayLogRecords(d.recs, d.total);
-        }
+        handleCsvChunkReceived(d);
       } else {
         applyState(d);
       }
@@ -1126,12 +1282,6 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       alert("Reset request sent. Device is rebooting...");
       setTimeout(() => { location.reload(); }, 5000);
     });
-  }
-
-  function refreshLogFiles() {
-    fetch('/api/logs/list')
-    .then(r => r.json())
-    .catch(err => console.error("Error calling list API", err));
   }
 
   function loadMqttConfigUI() {
@@ -1260,109 +1410,9 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     });
   }
 
-  function populateLogFiles(files) {
-    const select = document.getElementById('logFileSelect');
-    if (!select) return;
-    
-    const currentSel = select.value;
-    
-    select.innerHTML = '<option value="">-- Select Log File --</option>';
-    files.forEach(f => {
-      const opt = document.createElement('option');
-      opt.value = f;
-      opt.textContent = f;
-      select.appendChild(opt);
-    });
-    
-    if (files.includes(currentSel)) {
-      select.value = currentSel;
-    }
-  }
-
-  function fetchLogChunk() {
-    const msg = document.getElementById('logViewerMsg');
-    msg.style.display = 'block';
-    msg.textContent = `Loading chunk ${currentLogChunk + 1}...`;
-    
-    fetch(`/api/logs/view?file=${encodeURIComponent(currentLogFile)}&chunk=${currentLogChunk}`)
-    .then(r => r.json())
-    .catch(err => {
-      msg.textContent = 'Failed to request logs';
-      msg.style.color = 'var(--danger)';
-    });
-  }
-
-  function displayLogRecords(recs, total) {
-    totalLogRecords = total;
-    const msg = document.getElementById('logViewerMsg');
-    const content = document.getElementById('logViewerContent');
-    const tbody = document.getElementById('logRecordsTableBody');
-    const indicator = document.getElementById('chunkPageIndicator');
-    
-    tbody.innerHTML = '';
-    
-    if (!recs || recs.length === 0) {
-      msg.style.display = 'block';
-      msg.textContent = 'No records in this chunk';
-      content.style.display = 'none';
-      return;
-    }
-    
-    msg.style.display = 'none';
-    content.style.display = 'block';
-    
-    recs.forEach(r => {
-      const tr = document.createElement('tr');
-      tr.style.borderBottom = '1px solid rgba(255,255,255,0.03)';
-      
-      let timeStr = new Date(r.epoch * 1000).toLocaleString();
-      if (r.epoch === 0) timeStr = 'N/A';
-      
-      tr.innerHTML = `
-        <td style="padding: 8px 6px; color: var(--text-light);">${timeStr}</td>
-        <td style="padding: 8px 6px; text-align:right; color: #cbd5e1;">${r.v.toFixed(1)} V</td>
-        <td style="padding: 8px 6px; text-align:right; color: #3b82f6;">${r.load.toFixed(2)} A</td>
-        <td style="padding: 8px 6px; text-align:right; color: #10b981;">${r.pi.toFixed(3)} A</td>
-        <td style="padding: 8px 6px; text-align:right; color: #f59e0b;">${r.pva.toFixed(1)} VA</td>
-      `;
-      tbody.appendChild(tr);
-    });
-    
-    const totalChunks = Math.max(1, Math.ceil(total / 10));
-    indicator.textContent = `Page ${currentLogChunk + 1} of ${totalChunks}`;
-    
-    document.getElementById('prevChunkBtn').disabled = (currentLogChunk === 0);
-    document.getElementById('nextChunkBtn').disabled = (currentLogChunk >= totalChunks - 1);
-  }
-
-  function changeChunk(dir) {
-    const totalChunks = Math.ceil(totalLogRecords / 10);
-    const targetChunk = currentLogChunk + dir;
-    if (targetChunk >= 0 && targetChunk < totalChunks) {
-      currentLogChunk = targetChunk;
-      fetchLogChunk();
-    }
-  }
-
-  // Handle select change
+  // ─── Initialization ───
   document.addEventListener('DOMContentLoaded', () => {
-    const select = document.getElementById('logFileSelect');
-    if (select) {
-      select.addEventListener('change', (e) => {
-        const file = e.target.value;
-        if (file) {
-          currentLogFile = file;
-          currentLogChunk = 0;
-          fetchLogChunk();
-        } else {
-          document.getElementById('logViewerContent').style.display = 'none';
-          document.getElementById('logViewerMsg').style.display = 'block';
-          document.getElementById('logViewerMsg').textContent = 'Select a file to load logs';
-        }
-      });
-    }
-    // Auto-refresh file list on page load
-    setTimeout(refreshLogFiles, 1000);
+    setTimeout(fetchInitialState, 500);
     setTimeout(loadMqttConfigUI, 1500);
   });
 
