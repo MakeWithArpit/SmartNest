@@ -14,7 +14,7 @@
 const uint8_t SLAVE1_MAC[] = {0x14, 0x08, 0x08, 0xA4, 0x94, 0x1C}; // Digital Slave
 const uint8_t SLAVE2_MAC[] = {0x78, 0x21, 0x84, 0x9C, 0x98, 0x4C}; // PZEM Slave
 
-const int SWITCH_PINS[6] = {13, 15, 19, 4, 32, 18};
+const int SWITCH_PINS[6] = {33, 32, 26, 27, 4, 13};
 
 // SD SPI Pins
 #define SD_CS   5
