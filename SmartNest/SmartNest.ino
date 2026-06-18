@@ -25,12 +25,7 @@
 #define ACS712_PIN            34
 #define ACS712_SENSITIVITY    0.066f
 #define ACS712_DIVIDER_RATIO  1.5f
-#define ACS712_RMS_SAMPLES    500
-#define ACS712_READ_INTERVAL_MS 500
-#define ACS712_DEADBAND_A     0.3f
-#define ACS712_AUTO_CALIBRATE false
-#define ACS712_ZERO_POINT_MV  2569.3f
-static float acs712ZeroMv = ACS712_ZERO_POINT_MV;
+static float acs712ZeroMv = 2500.0f;
 
 #define RESET_BTN_PIN 0
 #define RESET_HOLD_MS 3000
@@ -139,7 +134,6 @@ void toggleRelay(int index);
 void updateRelayHardware();
 void relaySwitchInit();
 void currentSensorInit();
-float readCurrent();
 bool wifiManagerInit();
 void wifiManagerLoop();
 void resetWiFiCredentials();
@@ -253,32 +247,59 @@ void currentSensorInit() {
   pinMode(ACS712_PIN, INPUT);
   analogSetAttenuation(ADC_11db);
   analogReadResolution(12);
-  delay(300);
-  acs712ZeroMv = ACS712_ZERO_POINT_MV;
-}
-
-float readCurrent() {
-  float sumSq = 0.0f;
-  for (int i = 0; i < ACS712_RMS_SAMPLES; i++) {
-    float mv       = analogReadMilliVolts(ACS712_PIN);
-    float deltaMv  = (mv - acs712ZeroMv) * ACS712_DIVIDER_RATIO;
-    float iSample  = (deltaMv / 1000.0f) / ACS712_SENSITIVITY;
-    sumSq         += iSample * iSample;
-    delayMicroseconds(100);
+  
+  Serial.println("[SYSTEM] Calibrating ACS712 zero offset...");
+  long sumMilliVolts = 0;
+  for (int i = 0; i < 1000; i++) {
+    sumMilliVolts += analogReadMilliVolts(ACS712_PIN);
+    delay(2);
   }
-  float rms = sqrtf(sumSq / ACS712_RMS_SAMPLES);
-  return (rms < ACS712_DEADBAND_A) ? 0.0f : rms;
+  acs712ZeroMv = (float)sumMilliVolts / 1000.0f;
+  Serial.print("[SYSTEM] Calibration completed. Zero-Offset: ");
+  Serial.print(acs712ZeroMv);
+  Serial.println(" mV");
 }
 
 void currentSensorTask(void *pvParameters) {
   currentSensorInit();
+  
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  uint32_t lastProcessTime = millis();
+  
+  static double sqSum = 0.0;
+  static uint32_t sampleCount = 0;
+  
   while (true) {
-    float amps = readCurrent();
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      sysState.currentAmps = amps;
-      xSemaphoreGive(stateMutex);
+    // 1 kHz non-blocking sample
+    float milliVolts = analogReadMilliVolts(ACS712_PIN);
+    float deltaMv = (milliVolts - acs712ZeroMv) * ACS712_DIVIDER_RATIO;
+    float instCurrent = deltaMv / 66.0f; // 66 mV/A sensitivity
+    
+    sqSum += (double)(instCurrent * instCurrent);
+    sampleCount++;
+    
+    uint32_t now = millis();
+    if (now - lastProcessTime >= 200) {
+      lastProcessTime = now;
+      if (sampleCount > 0) {
+        float meanSquare = (float)(sqSum / (double)sampleCount);
+        float rmsCurrent = sqrtf(meanSquare);
+        float finalAmps = 0.0f;
+        if (rmsCurrent >= 0.15f) { // 0.15A deadband filter
+          finalAmps = rmsCurrent;
+        }
+        
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sysState.currentAmps = finalAmps;
+          xSemaphoreGive(stateMutex);
+        }
+        
+        sqSum = 0.0;
+        sampleCount = 0;
+      }
     }
-    vTaskDelay(pdMS_TO_TICKS(ACS712_READ_INTERVAL_MS));
+    
+    vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1));
   }
 }
 
