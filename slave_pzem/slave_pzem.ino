@@ -119,13 +119,15 @@ void sendPzemPacket(uint8_t pktType) {
     
     if (isnan(v) || isnan(i) || isnan(p) || isnan(e)) {
         pzemHealthy = false;
-        Serial.println("[PZEM] WARNING: Sensor returned NAN — AC mains may be disconnected. Sending 0.0f heartbeat.");
-        // Fallback to zero — do NOT return, still send the packet so Master stays online
-        v = 0.0f; i = 0.0f; p = 0.0f; e = 0.0f;
+        Serial.println("[PZEM] WARNING: Sensor returned NAN — AC mains may be disconnected.");
+        if (isnan(v)) v = 0.0f;
+        if (isnan(i)) i = 0.0f;
+        if (isnan(p)) p = 0.0f;
+        if (isnan(e)) e = 0.0f;
     } else {
         pzemHealthy = true;
     }
-
+    
     PzemSlavePacket pkt;
     pkt.type    = pktType;
     pkt.voltage = v;
@@ -196,6 +198,10 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n[SYSTEM START] PZEM Slave Initializing...");
 
+    // Initialize Serial2 for PZEM-004T connection with pins 16 (RX) and 17 (TX)
+    Serial2.begin(9600, SERIAL_8N1, 16, 17);
+    Serial.println("[PZEM] Hardware Serial2 (Baud: 9600, RX: 16, TX: 17) initialized.");
+
     pinMode(PIN_LED_R, OUTPUT);
     pinMode(PIN_LED_G, OUTPUT);
     pinMode(PIN_LED_B, OUTPUT);
@@ -254,6 +260,16 @@ void loop() {
                       contacted ? (timeout ? "TIMEOUT" : "ONLINE") : "WAITING",
                       pzemHealthy ? "YES" : "NO",
                       espNowInitialized ? "OK" : "ERROR");
+        
+        if (!pzemHealthy) {
+            Serial.println("[PZEM DIAGNOSTIC] Warning: PZEM sensor is returning NAN.");
+            Serial.println("  Possible Cause 1: AC mains input is NOT connected to the PZEM module (no line voltage).");
+            Serial.println("  Possible Cause 2: RX/TX wiring between ESP32 and PZEM is incorrect/swapped.");
+            Serial.println("  Possible Cause 3: Ground (GND) is not common between ESP32 and PZEM.");
+        }
+        if (timeout || !espNowInitialized) {
+            Serial.println("[PZEM DIAGNOSTIC] ESP-NOW Error: Master heartbeat timeout. Check Master power, MAC, or channel settings.");
+        }
     }
 
     if (rebootRequested && (now >= rebootTime)) {

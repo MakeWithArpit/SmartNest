@@ -499,6 +499,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
         <span style="font-size: 11px; color: var(--text-muted);" id="chunkPageIndicator">Page 1 of 1</span>
         <button class="cmd-btn" id="nextChunkBtn" onclick="changeChunk(1)" style="padding: 6px 12px; font-size: 11px;">Next &rarr;</button>
       </div>
+      <button class="cmd-btn" onclick="exportLogCSV()" style="width:100%;margin-top:10px;font-size:11px;background:rgba(59,130,246,0.08);border-color:rgba(59,130,246,0.3);color:var(--primary-light);">Export Page as CSV</button>
     </div>
     <p id="logViewerMsg" style="font-size: 11px; color: var(--text-muted); text-align: center; margin-top: 10px;">Select a file to load logs</p>
   </div>
@@ -518,9 +519,20 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     <div class="slave-row">
       <div class="slave-info-box">
         <span class="slave-dot" id="pzemSlaveDot"></span>
-        <span>PZEM Energy Slave</span>
+        <div style="display:flex;flex-direction:column;">
+          <span>PZEM Energy Slave</span>
+          <span style="font-size:9px;font-weight:700;" id="pzemHealthLabel">---</span>
+        </div>
       </div>
       <span class="slave-rssi" id="pzemSlaveRSSI">OFFLINE</span>
+    </div>
+    
+    <div class="slave-row">
+      <div class="slave-info-box">
+        <span class="slave-dot" id="mqttStatusDot"></span>
+        <span>MQTT Cloud</span>
+      </div>
+      <span class="slave-rssi" id="mqttStatusLabel">DISABLED</span>
     </div>
   </div>
 
@@ -574,12 +586,66 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     <div class="relay-grid" id="relayContainer"></div>
   </div>
 
-  <!-- Maintenance Card -->
+  <!-- MQTT Configuration Card -->
+  <div class="card" id="mqttConfigCard">
+    <p class="section-title">MQTT Configuration</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Broker Host</label>
+        <input type="text" id="mqttBroker" placeholder="broker.hivemq.com" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Port</label>
+        <input type="number" id="mqttPort" placeholder="1883" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Client ID</label>
+        <input type="text" id="mqttClientId" placeholder="SmartNest_001" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Base Topic</label>
+        <input type="text" id="mqttBaseTopic" placeholder="smartnest" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Username</label>
+        <input type="text" id="mqttUsername" placeholder="(optional)" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Password</label>
+        <input type="password" id="mqttPassword" placeholder="(optional)" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div>
+        <label style="font-size:10px;color:var(--text-muted);display:block;margin-bottom:2px;">Keep Alive (s)</label>
+        <input type="number" id="mqttKeepAlive" placeholder="60" style="width:100%;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:var(--text-light);padding:8px;font-size:12px;outline:none;">
+      </div>
+      <div style="display:flex;align-items:flex-end;">
+        <label style="font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="mqttEnabled" style="accent-color:var(--primary-light);">
+          MQTT Enabled
+        </label>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+      <button class="cmd-btn" onclick="saveMqttConfig()" style="font-size:11px;background:rgba(16,185,129,0.1);border-color:rgba(16,185,129,0.3);color:var(--success);">Save Config</button>
+      <button class="cmd-btn" onclick="testMqttConnection()" style="font-size:11px;">Test Connect</button>
+      <button class="cmd-btn" onclick="resetMqttDefaults()" style="font-size:11px;color:var(--warning);border-color:rgba(245,158,11,0.3);">Reset Defaults</button>
+    </div>
+    <p id="mqttConfigMsg" style="color:var(--text-muted);font-size:11px;margin-top:8px;text-align:center;min-height:16px;"></p>
+  </div>
+
+  <!-- System Maintenance Card -->
   <div class="card" style="border-color: rgba(239, 68, 68, 0.15);">
     <p class="section-title">System Maintenance</p>
+    <div class="btn-group" style="margin-bottom:8px;">
+      <button class="cmd-btn" onclick="modularReset('wifi')" style="font-size:11px;">Reset WiFi</button>
+      <button class="cmd-btn" onclick="modularReset('mqtt')" style="font-size:11px;">Reset MQTT</button>
+      <button class="cmd-btn" onclick="modularReset('energy')" style="font-size:11px;">Reset Energy</button>
+      <button class="cmd-btn" onclick="modularReset('logs')" style="font-size:11px;">Clear SD Logs</button>
+    </div>
     <button class="cmd-btn" id="factoryResetBtn" onclick="triggerFactoryReset()" style="width:100%; background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.2); color: var(--danger); font-weight: 800;">
-      FACTORY RESET SYSTEM
+      FULL FACTORY RESET
     </button>
+    <p id="resetMsg" style="color:var(--text-muted);font-size:11px;margin-top:8px;text-align:center;min-height:16px;"></p>
   </div>
 
   <p class="footer">SmartNest Premium IoT Control. Firmware v1.0.0</p>
@@ -911,12 +977,42 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     
     const pDot = document.getElementById('pzemSlaveDot');
     const pRSSI = document.getElementById('pzemSlaveRSSI');
+    const pHealth = document.getElementById('pzemHealthLabel');
     if (d.p_on) {
       pDot.className = 'slave-dot online';
       pRSSI.textContent = d.p_rssi + ' dBm';
+      if (d.p_health) {
+        pHealth.textContent = 'HEALTHY';
+        pHealth.style.color = 'var(--success)';
+      } else {
+        pHealth.textContent = 'SENSOR ERROR';
+        pHealth.style.color = 'var(--warning)';
+      }
     } else {
       pDot.className = 'slave-dot';
       pRSSI.textContent = 'OFFLINE';
+      pHealth.textContent = 'OFFLINE';
+      pHealth.style.color = 'var(--danger)';
+    }
+    
+    // MQTT Cloud status
+    const mqttDot = document.getElementById('mqttStatusDot');
+    const mqttLabel = document.getElementById('mqttStatusLabel');
+    if (mqttDot && mqttLabel) {
+      const mqttStNames = ['DISABLED','CONNECTING','CONNECTED','ERROR'];
+      const mqttSt = d.mqtt_status || 0;
+      mqttLabel.textContent = mqttStNames[mqttSt] || 'UNKNOWN';
+      if (mqttSt === 2) {
+        mqttDot.className = 'slave-dot online';
+        mqttLabel.style.color = 'var(--success)';
+      } else if (mqttSt === 1) {
+        mqttDot.className = 'slave-dot';
+        mqttDot.style.background = 'var(--warning)';
+        mqttLabel.style.color = 'var(--warning)';
+      } else {
+        mqttDot.className = 'slave-dot';
+        mqttLabel.style.color = 'var(--text-muted)';
+      }
     }
     
     // Uptime display formatting
@@ -1038,6 +1134,132 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     .catch(err => console.error("Error calling list API", err));
   }
 
+  function loadMqttConfigUI() {
+    const msg = document.getElementById('mqttConfigMsg');
+    fetch('/api/mqtt/config')
+      .then(r => r.json())
+      .then(d => {
+        document.getElementById('mqttBroker').value = d.broker || '';
+        document.getElementById('mqttPort').value = d.port || 1883;
+        document.getElementById('mqttClientId').value = d.clientId || '';
+        document.getElementById('mqttBaseTopic').value = d.baseTopic || '';
+        document.getElementById('mqttUsername').value = d.username || '';
+        document.getElementById('mqttPassword').value = d.password || '';
+        document.getElementById('mqttKeepAlive').value = d.keepAlive || 60;
+        document.getElementById('mqttEnabled').checked = d.enabled;
+      })
+      .catch(err => {
+        msg.textContent = 'Failed to load MQTT configuration';
+        msg.style.color = 'var(--danger)';
+      });
+  }
+
+  function saveMqttConfig() {
+    const msg = document.getElementById('mqttConfigMsg');
+    msg.textContent = 'Saving configuration...';
+    msg.style.color = 'var(--text-light)';
+    
+    const body = {
+      enabled: document.getElementById('mqttEnabled').checked,
+      broker: document.getElementById('mqttBroker').value,
+      port: parseInt(document.getElementById('mqttPort').value) || 1883,
+      clientId: document.getElementById('mqttClientId').value,
+      baseTopic: document.getElementById('mqttBaseTopic').value,
+      username: document.getElementById('mqttUsername').value,
+      password: document.getElementById('mqttPassword').value,
+      keepAlive: parseInt(document.getElementById('mqttKeepAlive').value) || 60
+    };
+
+    fetch('/api/mqtt/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    .then(r => r.json())
+    .then(d => {
+      if (d.success) {
+        msg.textContent = d.msg || 'Configuration saved successfully!';
+        msg.style.color = 'var(--success)';
+      } else {
+        msg.textContent = 'Save failed: ' + (d.error || 'unknown error');
+        msg.style.color = 'var(--danger)';
+      }
+      setTimeout(() => { msg.textContent = ''; }, 4000);
+    })
+    .catch(err => {
+      msg.textContent = 'Failed to save configuration';
+      msg.style.color = 'var(--danger)';
+      setTimeout(() => { msg.textContent = ''; }, 4000);
+    });
+  }
+
+  function testMqttConnection() {
+    const msg = document.getElementById('mqttConfigMsg');
+    msg.textContent = 'Testing connection...';
+    msg.style.color = 'var(--text-light)';
+    
+    fetch('/api/mqtt/test', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      msg.textContent = d.msg;
+      msg.style.color = d.success ? 'var(--success)' : 'var(--danger)';
+      setTimeout(() => { msg.textContent = ''; }, 5000);
+    })
+    .catch(err => {
+      msg.textContent = 'Test connection request failed';
+      msg.style.color = 'var(--danger)';
+      setTimeout(() => { msg.textContent = ''; }, 5000);
+    });
+  }
+
+  function resetMqttDefaults() {
+    const msg = document.getElementById('mqttConfigMsg');
+    msg.textContent = 'Resetting defaults...';
+    msg.style.color = 'var(--warning)';
+    
+    fetch('/api/mqtt/reset-default', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      msg.textContent = d.msg;
+      msg.style.color = 'var(--success)';
+      loadMqttConfigUI();
+      setTimeout(() => { msg.textContent = ''; }, 4000);
+    })
+    .catch(err => {
+      msg.textContent = 'Reset request failed';
+      msg.style.color = 'var(--danger)';
+      setTimeout(() => { msg.textContent = ''; }, 4000);
+    });
+  }
+
+  function modularReset(type) {
+    const msg = document.getElementById('resetMsg');
+    const actions = {
+      wifi: 'WiFi credentials clearing...',
+      mqtt: 'MQTT config resetting...',
+      energy: 'Energy counter resetting...',
+      logs: 'SD logs clearing...'
+    };
+    msg.textContent = actions[type] || 'Resetting...';
+    msg.style.color = 'var(--warning)';
+    
+    fetch(`/api/reset/${type}`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      msg.textContent = d.msg;
+      msg.style.color = 'var(--success)';
+      if (type === 'mqtt') {
+        loadMqttConfigUI();
+      }
+      setTimeout(() => { msg.textContent = ''; }, 5000);
+    })
+    .catch(err => {
+      msg.textContent = 'Reset request failed';
+      msg.style.color = 'var(--danger)';
+      setTimeout(() => { msg.textContent = ''; }, 5000);
+    });
+  }
+
   function populateLogFiles(files) {
     const select = document.getElementById('logFileSelect');
     if (!select) return;
@@ -1141,6 +1363,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     }
     // Auto-refresh file list on page load
     setTimeout(refreshLogFiles, 1000);
+    setTimeout(loadMqttConfigUI, 1500);
   });
 
   initUI();

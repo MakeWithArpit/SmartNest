@@ -52,6 +52,84 @@ static float acs712ZeroMv = 2500.0f;
 #define MQTT_KEEPALIVE_S   60
 #define MQTT_BASE_TOPIC    "smartnest"
 
+struct MqttConfig {
+  bool   enabled;
+  char   broker[64];
+  int    port;
+  char   clientId[64];
+  char   username[64];
+  char   password[64];
+  char   baseTopic[64];
+  int    keepAlive;
+};
+
+MqttConfig g_mqttConfig;
+volatile bool g_mqttConfigChanged = false;
+
+void saveMqttConfig() {
+  Preferences prefs;
+  prefs.begin("mqtt_cfg", false);
+  prefs.putBool("enabled", g_mqttConfig.enabled);
+  prefs.putString("broker", String(g_mqttConfig.broker));
+  prefs.putInt("port", g_mqttConfig.port);
+  prefs.putString("clientId", String(g_mqttConfig.clientId));
+  prefs.putString("username", String(g_mqttConfig.username));
+  prefs.putString("password", String(g_mqttConfig.password));
+  prefs.putString("baseTopic", String(g_mqttConfig.baseTopic));
+  prefs.putInt("keepAlive", g_mqttConfig.keepAlive);
+  prefs.end();
+  Serial.println("[MQTT] Configuration saved to NVS Preferences");
+}
+
+void loadMqttConfig() {
+  Preferences prefs;
+  prefs.begin("mqtt_cfg", true);
+  g_mqttConfig.enabled = prefs.getBool("enabled", MQTT_ENABLED);
+  
+  String broker = prefs.getString("broker", MQTT_BROKER_HOST);
+  strncpy(g_mqttConfig.broker, broker.c_str(), sizeof(g_mqttConfig.broker) - 1);
+  g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
+  
+  g_mqttConfig.port = prefs.getInt("port", MQTT_BROKER_PORT);
+  
+  String clientId = prefs.getString("clientId", MQTT_CLIENT_ID);
+  strncpy(g_mqttConfig.clientId, clientId.c_str(), sizeof(g_mqttConfig.clientId) - 1);
+  g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
+  
+  String username = prefs.getString("username", MQTT_USERNAME);
+  strncpy(g_mqttConfig.username, username.c_str(), sizeof(g_mqttConfig.username) - 1);
+  g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
+  
+  String password = prefs.getString("password", MQTT_PASSWORD);
+  strncpy(g_mqttConfig.password, password.c_str(), sizeof(g_mqttConfig.password) - 1);
+  g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
+  
+  String baseTopic = prefs.getString("baseTopic", MQTT_BASE_TOPIC);
+  strncpy(g_mqttConfig.baseTopic, baseTopic.c_str(), sizeof(g_mqttConfig.baseTopic) - 1);
+  g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
+  
+  g_mqttConfig.keepAlive = prefs.getInt("keepAlive", MQTT_KEEPALIVE_S);
+  prefs.end();
+}
+
+void resetMqttConfigToDefault() {
+  g_mqttConfig.enabled = MQTT_ENABLED;
+  strncpy(g_mqttConfig.broker, MQTT_BROKER_HOST, sizeof(g_mqttConfig.broker) - 1);
+  g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
+  g_mqttConfig.port = MQTT_BROKER_PORT;
+  strncpy(g_mqttConfig.clientId, MQTT_CLIENT_ID, sizeof(g_mqttConfig.clientId) - 1);
+  g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
+  strncpy(g_mqttConfig.username, MQTT_USERNAME, sizeof(g_mqttConfig.username) - 1);
+  g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
+  strncpy(g_mqttConfig.password, MQTT_PASSWORD, sizeof(g_mqttConfig.password) - 1);
+  g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
+  strncpy(g_mqttConfig.baseTopic, MQTT_BASE_TOPIC, sizeof(g_mqttConfig.baseTopic) - 1);
+  g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
+  g_mqttConfig.keepAlive = MQTT_KEEPALIVE_S;
+  saveMqttConfig();
+  Serial.println("[MQTT] Configuration reset to defaults");
+}
+
 struct RelayEvent {
   int index;
   bool state;
@@ -95,6 +173,10 @@ struct SystemState {
   bool   sdOk;
   uint64_t sdTotal;
   uint64_t sdUsed;
+
+  // New fields
+  bool   pzemSensorHealthy;
+  int    mqttStatus;
 };
 
 const int RELAY_PINS[NUM_RELAYS] = {
@@ -168,7 +250,7 @@ void enqueueUartCmd(const String &cmd) {
 void relaySwitchInit() {
   for (int i = 0; i < NUM_RELAYS; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
-    digitalWrite(RELAY_PINS[i], LOW);
+    digitalWrite(RELAY_PINS[i], HIGH); // Starts OFF (Active LOW)
   }
 
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -178,6 +260,7 @@ void relaySwitchInit() {
       sysState.lockedStates[i] = false;
     }
     sysState.masterShutdown = false;
+    sysState.masterLock = false;
     xSemaphoreGive(stateMutex);
   }
 }
@@ -186,7 +269,11 @@ void setRelayState(int index, bool state) {
   if (index < 0 || index >= NUM_RELAYS) return;
 
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    sysState.dashboardStates[index] = state;
+    if (state && (sysState.masterLock || sysState.masterShutdown || sysState.lockedStates[index])) {
+      Serial.printf("[LOCK] setRelayState(%d, ON) blocked due to active lock or shutdown\n", index);
+    } else {
+      sysState.dashboardStates[index] = state;
+    }
     xSemaphoreGive(stateMutex);
   }
 
@@ -227,7 +314,8 @@ void updateRelayHardware() {
 
       if (sysState.relayStates[i] != R) {
         sysState.relayStates[i] = R;
-        digitalWrite(RELAY_PINS[i], R ? HIGH : LOW);
+        digitalWrite(RELAY_PINS[i], R ? LOW : HIGH); // LOW = ON, HIGH = OFF
+        Serial.printf("[TIMING] SmartNest local relay GPIO written at: %lu\n", millis());
         sysState.lastChangeMs = millis();
 
         RelayEvent evt;
@@ -552,8 +640,9 @@ void pushWsUpdate() {
 // MQTT Callback and publishing helpers
 #if MQTT_ENABLED
 int getRelayIndexFromTopic(const String &topic) {
-  int prefixLen = strlen(MQTT_BASE_TOPIC) + 7; // "smartnest/relay/"
-  if (!topic.startsWith(MQTT_BASE_TOPIC "/relay/")) return -1;
+  String prefix = String(g_mqttConfig.baseTopic) + "/relay/";
+  int prefixLen = prefix.length();
+  if (!topic.startsWith(prefix)) return -1;
   int nextSlash = topic.indexOf('/', prefixLen);
   if (nextSlash < 0) return -1;
   String idxStr = topic.substring(prefixLen, nextSlash);
@@ -565,8 +654,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String p = String((char*)payload, length);
   p.trim();
 
-  // Relay set: smartnest/relay/N/set
-  if (t.startsWith(MQTT_BASE_TOPIC "/relay/") && t.endsWith("/set")) {
+  String base = String(g_mqttConfig.baseTopic);
+  String relayPrefix = base + "/relay/";
+
+  // Relay set: {baseTopic}/relay/N/set
+  if (t.startsWith(relayPrefix) && t.endsWith("/set")) {
     int idx = getRelayIndexFromTopic(t);
     if (idx >= 0 && idx < NUM_RELAYS) {
       setRelayState(idx, p == "true");
@@ -575,8 +667,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                      (p == "true" ? "relay_on" : "relay_off") + "\"}");
     }
   }
-  // Relay lock: smartnest/relay/N/lock
-  else if (t.startsWith(MQTT_BASE_TOPIC "/relay/") && t.endsWith("/lock")) {
+  // Relay lock: {baseTopic}/relay/N/lock
+  else if (t.startsWith(relayPrefix) && t.endsWith("/lock")) {
     int idx = getRelayIndexFromTopic(t);
     if (idx >= 0 && idx < NUM_RELAYS) {
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -590,7 +682,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
   }
   // Master shutdown
-  else if (t == MQTT_BASE_TOPIC "/cmd/shutdown") {
+  else if (t == base + "/cmd/shutdown") {
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       sysState.masterShutdown = (p == "true");
       xSemaphoreGive(stateMutex);
@@ -598,17 +690,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     updateRelayHardware();
   }
   // Slave commands
-  else if (t == MQTT_BASE_TOPIC "/cmd/slave/d1") {
+  else if (t == base + "/cmd/slave/d1") {
     enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + p + "\"}");
   }
-  else if (t == MQTT_BASE_TOPIC "/cmd/slave/pzem") {
+  else if (t == base + "/cmd/slave/pzem") {
     enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"" + p + "\"}");
   }
 
   pushWsUpdate();
   
   // Republish changed retained state
-  if (t.startsWith(MQTT_BASE_TOPIC "/relay/")) {
+  if (t.startsWith(relayPrefix)) {
     int idx = getRelayIndexFromTopic(t);
     bool stateVal = false;
     bool lockedVal = false;
@@ -626,16 +718,16 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
     if (gotMutex) {
       if (idx >= 0 && idx < NUM_RELAYS) {
-        mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/state").c_str(),
+        mqttClient.publish((relayPrefix + String(idx) + "/state").c_str(),
                            stateVal ? "true" : "false", true);
-        mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/locked").c_str(),
+        mqttClient.publish((relayPrefix + String(idx) + "/locked").c_str(),
                            lockedVal ? "true" : "false", true);
       } else if (idx == 6) {
-        mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", stateVal ? "true" : "false", true);
-        mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", lockedVal ? "true" : "false", true);
+        mqttClient.publish((relayPrefix + "6/state").c_str(), stateVal ? "true" : "false", true);
+        mqttClient.publish((relayPrefix + "6/locked").c_str(), lockedVal ? "true" : "false", true);
       }
     }
-  } else if (t == MQTT_BASE_TOPIC "/cmd/shutdown") {
+  } else if (t == base + "/cmd/shutdown") {
     bool shutdownVal = false;
     bool gotMutex = false;
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -644,12 +736,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       xSemaphoreGive(stateMutex);
     }
     if (gotMutex) {
-      mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", shutdownVal ? "true" : "false", true);
+      mqttClient.publish((base + "/shutdown").c_str(), shutdownVal ? "true" : "false", true);
     }
   }
 }
 
 void publishAllRetainedStates() {
+  String base = String(g_mqttConfig.baseTopic);
   bool localRelays[NUM_RELAYS];
   bool localLocks[NUM_RELAYS];
   bool localDigitalRelay = false;
@@ -671,74 +764,122 @@ void publishAllRetainedStates() {
   
   if (gotMutex) {
     for (int i = 0; i < NUM_RELAYS; i++) {
-      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/state").c_str(),
+      mqttClient.publish((base + "/relay/" + String(i) + "/state").c_str(),
                          localRelays[i] ? "true" : "false", true);
-      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/locked").c_str(),
+      mqttClient.publish((base + "/relay/" + String(i) + "/locked").c_str(),
                          localLocks[i] ? "true" : "false", true);
     }
-    mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", localDigitalRelay ? "true" : "false", true);
-    mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", localDigitalLocked ? "true" : "false", true);
-    mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", localShutdown ? "true" : "false", true);
+    mqttClient.publish((base + "/relay/6/state").c_str(), localDigitalRelay ? "true" : "false", true);
+    mqttClient.publish((base + "/relay/6/locked").c_str(), localDigitalLocked ? "true" : "false", true);
+    mqttClient.publish((base + "/shutdown").c_str(), localShutdown ? "true" : "false", true);
   }
 }
 
 void publishTelemetry() {
+  String base = String(g_mqttConfig.baseTopic);
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/voltage", String(sysState.pzemVoltage, 1).c_str(), false);
-    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/acs", String(sysState.acsCurrentA, 2).c_str(), false);
-    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/load", String(sysState.currentAmps, 2).c_str(), false);
-    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/power", String(sysState.pzemPowerW, 1).c_str(), false);
+    mqttClient.publish((base + "/sensor/voltage").c_str(), String(sysState.pzemVoltage, 1).c_str(), false);
+    mqttClient.publish((base + "/sensor/acs").c_str(), String(sysState.acsCurrentA, 2).c_str(), false);
+    mqttClient.publish((base + "/sensor/load").c_str(), String(sysState.currentAmps, 2).c_str(), false);
+    mqttClient.publish((base + "/sensor/power").c_str(), String(sysState.pzemPowerW, 1).c_str(), false);
     
-    mqttClient.publish(MQTT_BASE_TOPIC "/energy/daily", String(sysState.energyDailyWh / 1000.0, 3).c_str(), false);
-    mqttClient.publish(MQTT_BASE_TOPIC "/energy/monthly", String(sysState.energyMonthlyWh / 1000.0, 3).c_str(), false);
-    mqttClient.publish(MQTT_BASE_TOPIC "/energy/lifetime", String(sysState.energyLifetimeWh / 1000.0, 3).c_str(), false);
+    mqttClient.publish((base + "/energy/daily").c_str(), String(sysState.energyDailyWh / 1000.0, 3).c_str(), false);
+    mqttClient.publish((base + "/energy/monthly").c_str(), String(sysState.energyMonthlyWh / 1000.0, 3).c_str(), false);
+    mqttClient.publish((base + "/energy/lifetime").c_str(), String(sysState.energyLifetimeWh / 1000.0, 3).c_str(), false);
     
-    mqttClient.publish(MQTT_BASE_TOPIC "/slave/d1/online", sysState.digitalSlaveOnline ? "true" : "false", true);
-    mqttClient.publish(MQTT_BASE_TOPIC "/slave/pzem/online", sysState.pzemSlaveOnline ? "true" : "false", true);
+    mqttClient.publish((base + "/slave/d1/online").c_str(), sysState.digitalSlaveOnline ? "true" : "false", true);
+    mqttClient.publish((base + "/slave/pzem/online").c_str(), sysState.pzemSlaveOnline ? "true" : "false", true);
     
-    mqttClient.publish(MQTT_BASE_TOPIC "/switch/6/state", sysState.digitalSwitchState ? "true" : "false", false);
+    mqttClient.publish((base + "/switch/6/state").c_str(), sysState.digitalSwitchState ? "true" : "false", false);
     
     // Heartbeat payload
     String heartbeat = "{\"uptime\":" + String(millis()) + ",\"ssid\":\"" + String(sysState.wifiSSID) + "\",\"rssi\":" + String(sysState.wifiRSSI) + "}";
-    mqttClient.publish(MQTT_BASE_TOPIC "/status", heartbeat.c_str(), false);
+    mqttClient.publish((base + "/status").c_str(), heartbeat.c_str(), false);
     
     xSemaphoreGive(stateMutex);
   }
 }
 
 void mqttTask(void* pvParameters) {
-  mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  mqttClient.setServer(g_mqttConfig.broker, g_mqttConfig.port);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
+  mqttClient.setKeepAlive(g_mqttConfig.keepAlive);
 
   uint32_t lastReconnectAttempt = 0;
   uint32_t lastHeartbeat = 0;
   bool wasMqttConnected = false;
 
   while (true) {
+    // Detect dynamic config changes and re-initialize
+    if (g_mqttConfigChanged) {
+      g_mqttConfigChanged = false;
+      Serial.println("[MQTT] Config changed — disconnecting for re-init");
+      if (mqttClient.connected()) {
+        mqttClient.disconnect();
+      }
+      mqttClient.setServer(g_mqttConfig.broker, g_mqttConfig.port);
+      mqttClient.setKeepAlive(g_mqttConfig.keepAlive);
+      wasMqttConnected = false;
+      lastReconnectAttempt = 0;
+    }
+
+    // Skip MQTT processing if disabled
+    if (!g_mqttConfig.enabled) {
+      if (wasMqttConnected) {
+        mqttClient.disconnect();
+        enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
+        wasMqttConnected = false;
+      }
+      // Update MQTT status
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        sysState.mqttStatus = 0; // 0 = Disabled
+        xSemaphoreGive(stateMutex);
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
+
     if (WiFi.status() == WL_CONNECTED) {
       if (!mqttClient.connected()) {
         if (wasMqttConnected) {
           enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
           wasMqttConnected = false;
         }
+        // Update MQTT status
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sysState.mqttStatus = 1; // 1 = Connecting
+          xSemaphoreGive(stateMutex);
+        }
         if (millis() - lastReconnectAttempt > 5000) {
           lastReconnectAttempt = millis();
           bool ok;
-          if (strlen(MQTT_USERNAME) > 0)
-            ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+          if (strlen(g_mqttConfig.username) > 0)
+            ok = mqttClient.connect(g_mqttConfig.clientId, g_mqttConfig.username, g_mqttConfig.password);
           else
-            ok = mqttClient.connect(MQTT_CLIENT_ID);
+            ok = mqttClient.connect(g_mqttConfig.clientId);
           if (ok) {
-            mqttClient.subscribe(MQTT_BASE_TOPIC "/relay/+/set");
-            mqttClient.subscribe(MQTT_BASE_TOPIC "/relay/+/lock");
-            mqttClient.subscribe(MQTT_BASE_TOPIC "/cmd/shutdown");
-            mqttClient.subscribe(MQTT_BASE_TOPIC "/cmd/slave/d1");
-            mqttClient.subscribe(MQTT_BASE_TOPIC "/cmd/slave/pzem");
+            String base = String(g_mqttConfig.baseTopic);
+            mqttClient.subscribe((base + "/relay/+/set").c_str());
+            mqttClient.subscribe((base + "/relay/+/lock").c_str());
+            mqttClient.subscribe((base + "/cmd/shutdown").c_str());
+            mqttClient.subscribe((base + "/cmd/slave/d1").c_str());
+            mqttClient.subscribe((base + "/cmd/slave/pzem").c_str());
             
             publishAllRetainedStates();
             enqueueUartCmd("{\"t\":\"cloud\",\"up\":true}");
             wasMqttConnected = true;
+            Serial.printf("[MQTT] Connected to %s:%d (topic: %s)\n", g_mqttConfig.broker, g_mqttConfig.port, g_mqttConfig.baseTopic);
+            // Update MQTT status
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+              sysState.mqttStatus = 2; // 2 = Connected
+              xSemaphoreGive(stateMutex);
+            }
+          } else {
+            // Update MQTT status
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+              sysState.mqttStatus = 3; // 3 = Error
+              xSemaphoreGive(stateMutex);
+            }
           }
         }
       } else {
@@ -817,6 +958,7 @@ void uartCommTask(void *pvParameters) {
                 sysState.sdTotal = doc["sd_total"];
                 sysState.sdUsed = doc["sd_used"];
                 sysState.masterLock = doc["m_lock"];
+                sysState.pzemSensorHealthy = doc["p_health"] | false;
                 xSemaphoreGive(stateMutex);
               }
 
@@ -1010,13 +1152,15 @@ static String buildStatusJSON() {
     json += "\"m_lock\":"    + String(sysState.masterLock ? "true" : "false") + ",";
     json += "\"sd_ok\":"     + String(sysState.sdOk ? "true" : "false") + ",";
     json += "\"sd_total\":"  + String((unsigned long long)sysState.sdTotal) + ",";
-    json += "\"sd_used\":"   + String((unsigned long long)sysState.sdUsed);
+    json += "\"sd_used\":"   + String((unsigned long long)sysState.sdUsed) + ",";
+    json += "\"p_health\":"  + String(sysState.pzemSensorHealthy ? "true" : "false") + ",";
+    json += "\"mqtt_status\":" + String(sysState.mqttStatus);
     
     xSemaphoreGive(stateMutex);
   } else {
     json += "],\"locks\":[false,false,false,false,false,false],\"shutdown\":false,\"current\":0,\"rssi\":0,\"ssid\":\"\",";
     json += "\"acs\":0.00,\"load\":0.00,\"v\":0.0,\"pw\":0.0,\"daily\":0.000,\"monthly\":0.000,\"lifetime\":0.000,\"d_on\":false,\"p_on\":false,\"d_rssi\":0,\"p_rssi\":0,\"d_relay\":false,\"d_lock\":false,\"d_sw\":false,";
-    json += "\"m_lock\":false,\"sd_ok\":false,\"sd_total\":0,\"sd_used\":0";
+    json += "\"m_lock\":false,\"sd_ok\":false,\"sd_total\":0,\"sd_used\":0,\"p_health\":false,\"mqtt_status\":0";
   }
   json += ",\"uptime\":" + String(millis());
   json += ",\"time\":\"" + getFormattedTime() + "\"";
@@ -1234,6 +1378,133 @@ void dashboardInit() {
       }
     });
 
+  // --- MQTT Configuration API Endpoints ---
+  dashServer.on("/api/mqtt/config", HTTP_GET, [](AsyncWebServerRequest *req) {
+    StaticJsonDocument<512> doc;
+    doc["enabled"] = g_mqttConfig.enabled;
+    doc["broker"] = g_mqttConfig.broker;
+    doc["port"] = g_mqttConfig.port;
+    doc["clientId"] = g_mqttConfig.clientId;
+    doc["username"] = g_mqttConfig.username;
+    doc["password"] = strlen(g_mqttConfig.password) > 0 ? "********" : "";
+    doc["baseTopic"] = g_mqttConfig.baseTopic;
+    doc["keepAlive"] = g_mqttConfig.keepAlive;
+    String output;
+    serializeJson(doc, output);
+    req->send(200, "application/json", output);
+  });
+
+  dashServer.on(
+    "/api/mqtt/config", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
+      StaticJsonDocument<512> doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) { req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}"); return; }
+      if (doc.containsKey("enabled")) g_mqttConfig.enabled = doc["enabled"];
+      if (doc.containsKey("broker")) {
+        strncpy(g_mqttConfig.broker, doc["broker"] | "", sizeof(g_mqttConfig.broker) - 1);
+        g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
+      }
+      if (doc.containsKey("port")) g_mqttConfig.port = doc["port"];
+      if (doc.containsKey("clientId")) {
+        strncpy(g_mqttConfig.clientId, doc["clientId"] | "", sizeof(g_mqttConfig.clientId) - 1);
+        g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
+      }
+      if (doc.containsKey("username")) {
+        strncpy(g_mqttConfig.username, doc["username"] | "", sizeof(g_mqttConfig.username) - 1);
+        g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
+      }
+      if (doc.containsKey("password") && String(doc["password"] | "") != "********") {
+        strncpy(g_mqttConfig.password, doc["password"] | "", sizeof(g_mqttConfig.password) - 1);
+        g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
+      }
+      if (doc.containsKey("baseTopic")) {
+        strncpy(g_mqttConfig.baseTopic, doc["baseTopic"] | "", sizeof(g_mqttConfig.baseTopic) - 1);
+        g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
+      }
+      if (doc.containsKey("keepAlive")) g_mqttConfig.keepAlive = doc["keepAlive"];
+      saveMqttConfig();
+      g_mqttConfigChanged = true;
+      Serial.println("[MQTT] Config updated via API");
+      req->send(200, "application/json", "{\"success\":true,\"msg\":\"MQTT config saved. Reconnecting...\"}");
+    });
+
+  dashServer.on(
+    "/api/mqtt/test", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
+      WiFiClient testClient;
+      PubSubClient testMqtt(testClient);
+      testMqtt.setServer(g_mqttConfig.broker, g_mqttConfig.port);
+      bool ok;
+      if (strlen(g_mqttConfig.username) > 0)
+        ok = testMqtt.connect("SmartNest_test", g_mqttConfig.username, g_mqttConfig.password);
+      else
+        ok = testMqtt.connect("SmartNest_test");
+      if (ok) {
+        testMqtt.disconnect();
+        req->send(200, "application/json", "{\"success\":true,\"msg\":\"Connection test passed!\"}");
+      } else {
+        req->send(200, "application/json", "{\"success\":false,\"msg\":\"Connection failed. Check broker/credentials.\"}");
+      }
+    });
+
+  dashServer.on("/api/mqtt/reset-default", HTTP_POST, [](AsyncWebServerRequest *req) {
+    resetMqttConfigToDefault();
+    g_mqttConfigChanged = true;
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"MQTT config reset to defaults\"}");
+  });
+
+  // --- Modular Reset API Endpoints ---
+  dashServer.on("/api/reset/wifi", HTTP_POST, [](AsyncWebServerRequest *req) {
+    Serial.println("[SmartNest] WiFi reset requested");
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"WiFi credentials cleared. Rebooting...\"}");
+    delay(500);
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.clear();
+    prefs.end();
+    delay(500);
+    ESP.restart();
+  });
+
+  dashServer.on("/api/reset/mqtt", HTTP_POST, [](AsyncWebServerRequest *req) {
+    Serial.println("[SmartNest] MQTT config reset requested");
+    resetMqttConfigToDefault();
+    g_mqttConfigChanged = true;
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"MQTT config reset to defaults\"}");
+  });
+
+  dashServer.on("/api/reset/energy", HTTP_POST, [](AsyncWebServerRequest *req) {
+    Serial.println("[SmartNest] Energy counter reset requested");
+    enqueueUartCmd("{\"t\":\"factory_reset\"}");
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"Energy counters reset sent to Master\"}");
+  });
+
+  dashServer.on("/api/reset/logs", HTTP_POST, [](AsyncWebServerRequest *req) {
+    Serial.println("[SmartNest] SD log clear requested");
+    enqueueUartCmd("{\"t\":\"clear_logs\"}");
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"SD log clear sent to Master\"}");
+  });
+
+  dashServer.on("/api/reset/full", HTTP_POST, [](AsyncWebServerRequest *req) {
+    Serial.println("[SmartNest] FULL factory reset requested");
+    enqueueUartCmd("{\"t\":\"factory_reset\"}");
+    enqueueUartCmd("{\"t\":\"clear_logs\"}");
+    resetMqttConfigToDefault();
+    req->send(200, "application/json", "{\"success\":true,\"msg\":\"Full reset initiated. Rebooting...\"}");
+    delay(1000);
+    Preferences prefs;
+    prefs.begin(NVS_NAMESPACE, false);
+    prefs.clear();
+    prefs.end();
+    delay(500);
+    ESP.restart();
+  });
+
   dashServer.onNotFound([](AsyncWebServerRequest *req) {
     req->redirect("/");
   });
@@ -1250,6 +1521,7 @@ void setup() {
   delay(500);
 
   memset(&sysState, 0, sizeof(SystemState));
+  loadMqttConfig();  // Load MQTT config from NVS Preferences
 
   relayEventQueue = xQueueCreate(10, sizeof(RelayEvent));
   stateMutex = xSemaphoreCreateMutex();

@@ -41,6 +41,7 @@ struct PzemBoardState {
     int      rssi;
     uint32_t lastSeenTime;
     bool     online;
+    bool     sensorHealthy;  // true if PZEM sensor returned valid (non-NaN) readings
 };
 
 struct EnergyState {
@@ -86,6 +87,7 @@ struct SystemData {
     char  readFilename[64];
     int   readChunk;
     bool  factoryResetRequest;
+    bool  clearLogsRequest;
 };
 
 SemaphoreHandle_t g_stateMutex = NULL;
@@ -278,6 +280,7 @@ void espNowTask(void* pvParameters) {
                             g_systemState.pzem.current = p->current;
                             g_systemState.pzem.power = p->power;
                             g_systemState.pzem.energy = p->energy;
+                            g_systemState.pzem.sensorHealthy = !isnan(p->voltage) && !isnan(p->current) && !isnan(p->power);
                             g_systemState.pzem.rssi = pkt.rssi;
                             g_systemState.pzem.lastSeenTime = millis();
                             g_systemState.pzem.online = true;
@@ -327,6 +330,7 @@ void uartTask(void* pvParameters) {
                 char* pFilesReq = strstr(rxLine, "\"t\":\"files_req\"");
                 char* pReadReq = strstr(rxLine, "\"t\":\"read_req\"");
                 char* pFactoryReset = strstr(rxLine, "\"t\":\"factory_reset\"");
+                char* pClearLogs = strstr(rxLine, "\"t\":\"clear_logs\"");
                 
                 if (pCmd) {
                     char* tgtPtr = strstr(rxLine, "\"tgt\":\"");
@@ -487,6 +491,14 @@ void uartTask(void* pvParameters) {
                     }
                     Serial.println("[Master] factory_reset received — queued for sdLoggingTask");
                 }
+                // Clear SD Logs: {"t":"clear_logs"}
+                else if (pClearLogs) {
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        g_systemState.clearLogsRequest = true;
+                        xSemaphoreGive(g_stateMutex);
+                    }
+                    Serial.println("[Master] clear_logs received — queued for sdLoggingTask");
+                }
                 
                 rxIndex = 0;
             } else if (c != '\r') {
@@ -564,6 +576,7 @@ void energyTimeTask(void* pvParameters) {
         bool lockedVal = false;
         bool digitalOnlineVal = false;
         bool pzemOnlineVal = false;
+        bool pzemHealthyVal = false;
         float pzemCurrentVal = 0.0f;
         float pzemPowerVal = 0.0f;
         float pzemVoltageVal = 0.0f;
@@ -580,11 +593,18 @@ void energyTimeTask(void* pvParameters) {
             apparentPower = (double)pzemVoltageVal * (double)combinedCurrent;
             g_systemState.energy.activePowerVA = apparentPower;
             
-            double deltaWh = (apparentPower * (double)deltaMs) / 3600000.0;
-            g_systemState.energy.dailyEnergy += deltaWh;
-            g_systemState.energy.monthlyEnergy += deltaWh;
-            g_systemState.energy.lifetimeEnergy += deltaWh;
-            g_systemState.energy.pendingSave = true;
+            // Only update energy if time is synchronized and PZEM readings are healthy
+            bool timeValid = g_systemState.time.timeValid;
+            bool pzemHealthy = g_systemState.pzem.sensorHealthy && g_systemState.pzem.online;
+            if (timeValid && pzemHealthy && !isnan(apparentPower)) {
+                double deltaWh = (apparentPower * (double)deltaMs) / 3600000.0;
+                g_systemState.energy.dailyEnergy += deltaWh;
+                g_systemState.energy.monthlyEnergy += deltaWh;
+                g_systemState.energy.lifetimeEnergy += deltaWh;
+                g_systemState.energy.pendingSave = true;
+            } else {
+                g_systemState.energy.activePowerVA = 0.0;
+            }
             
             dailyEnergyVal = g_systemState.energy.dailyEnergy;
             monthlyEnergyVal = g_systemState.energy.monthlyEnergy;
@@ -642,6 +662,7 @@ void energyTimeTask(void* pvParameters) {
             rmsCurrentVal = g_systemState.digital.rmsCurrent;
             digitalOnlineVal = g_systemState.digital.online;
             pzemOnlineVal = g_systemState.pzem.online;
+            pzemHealthyVal = g_systemState.pzem.sensorHealthy;
             rssiVal = g_systemState.digital.rssi;
             pzemRssiVal = g_systemState.pzem.rssi;
             relayStateVal = g_systemState.digital.relayState;
@@ -694,18 +715,29 @@ void energyTimeTask(void* pvParameters) {
                     }
                 }
                 
-                // Build and send telemetry (with SD stats + master lock)
+                // Format sensor readings as null if unhealthy/offline
+                char vStr[16] = "null";
+                char piStr[16] = "null";
+                char ppStr[16] = "null";
+                if (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal) && !isnan(pzemCurrentVal) && !isnan(pzemPowerVal)) {
+                    snprintf(vStr, sizeof(vStr), "%.1f", pzemVoltageVal);
+                    snprintf(piStr, sizeof(piStr), "%.3f", pzemCurrentVal);
+                    snprintf(ppStr, sizeof(ppStr), "%.1f", pzemPowerVal);
+                }
+                
+                // Build and send telemetry (with SD stats + master lock + pzem health)
                 char tel[640];
                 snprintf(tel, sizeof(tel),
-                         "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%.1f,\"pi\":%.3f,\"pp\":%.1f,"
+                         "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%s,\"pi\":%s,\"pp\":%s,"
                          "\"d_wh\":%.1f,\"m_wh\":%.1f,\"l_wh\":%.1f,"
-                         "\"d_on\":%s,\"p_on\":%s,\"d_rssi\":%d,\"p_rssi\":%d,"
+                         "\"d_on\":%s,\"p_on\":%s,\"p_health\":%s,\"d_rssi\":%d,\"p_rssi\":%d,"
                          "\"d_relay\":%d,\"d_sw\":%d,\"d_lock\":%s,"
                          "\"sd_ok\":%s,\"sd_total\":%llu,\"sd_used\":%llu,"
                          "\"m_lock\":%s}",
-                         rmsCurrentVal, pzemVoltageVal, pzemCurrentVal, pzemPowerVal,
+                         rmsCurrentVal, vStr, piStr, ppStr,
                          dailyEnergyVal, monthlyEnergyVal, lifetimeEnergyVal,
                          digitalOnlineVal ? "true" : "false", pzemOnlineVal ? "true" : "false",
+                         pzemHealthyVal ? "true" : "false",
                          rssiVal, pzemRssiVal,
                          relayStateVal, switchStateVal,
                          lockedVal ? "true" : "false",
@@ -930,6 +962,31 @@ void sdLoggingTask(void* pvParameters) {
                 xSemaphoreGive(g_stateMutex);
             }
             Serial.println("[SD] Factory reset complete. Energy counters zeroed.");
+        }
+        
+        // --- Handle clear_logs (delete all files in /logs on Core 1) ---
+        bool wantClearLogs = false;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wantClearLogs = g_systemState.clearLogsRequest;
+            if (wantClearLogs) g_systemState.clearLogsRequest = false;
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (wantClearLogs && sdOk) {
+            Serial.println("[SD] CLEAR LOGS — deleting all files in /logs...");
+            File logsDir = SD.open("/logs");
+            if (logsDir && logsDir.isDirectory()) {
+                File entry = logsDir.openNextFile();
+                while (entry) {
+                    char path[80];
+                    snprintf(path, sizeof(path), "/logs/%s", entry.name());
+                    entry.close();
+                    SD.remove(path);
+                    Serial.printf("[SD] Deleted: %s\n", path);
+                    entry = logsDir.openNextFile();
+                }
+                logsDir.close();
+            }
+            Serial.println("[SD] All log files cleared.");
         }
         
         // Check for state save triggers

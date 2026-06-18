@@ -297,8 +297,16 @@ void loop() {
                     lastAcknowledgementTime = millis();
                     sendAckReply();
                     break;
-                case 0x02: Serial.println("[DigitalBoard] CMD: relay_on"); relayOn();  break;
-                case 0x03: Serial.println("[DigitalBoard] CMD: relay_off"); relayOff(); break;
+                case 0x02:
+                    Serial.printf("[TIMING] Digital Board relay toggled at: %lu\n", millis());
+                    Serial.println("[DigitalBoard] CMD: relay_on");
+                    relayOn();
+                    break;
+                case 0x03:
+                    Serial.printf("[TIMING] Digital Board relay toggled at: %lu\n", millis());
+                    Serial.println("[DigitalBoard] CMD: relay_off");
+                    relayOff();
+                    break;
                 case 0x04: Serial.println("[DigitalBoard] CMD: masterLock ON"); masterLock = true;  relayOff(); break;
                 case 0x05: Serial.println("[DigitalBoard] CMD: masterLock OFF"); masterLock = false; break;
                 case 0x06: Serial.println("[DigitalBoard] CMD: reboot"); delay(100); ESP.restart(); break;
