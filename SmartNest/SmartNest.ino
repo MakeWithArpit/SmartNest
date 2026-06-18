@@ -39,7 +39,7 @@ static float acs712ZeroMv = ACS712_ZERO_POINT_MV;
 #define UART2_TX_PIN 17
 #define UART2_BAUD 115200
 
-#define HEARTBEAT_MS          30000
+#define HEARTBEAT_MS   30000
 #define MDNS_HOSTNAME "smart-nest"
 #define PROV_AP_SSID "SmartNest"
 #define NVS_NAMESPACE "smartnest"

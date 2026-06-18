@@ -56,12 +56,12 @@ void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 // Relay Control
 void relayOn() {
     if (masterLock || overcurrentLock) return;
-    digitalWrite(RELAY_PIN, HIGH);
+    digitalWrite(RELAY_PIN, LOW);
     relayCondition = true;
 }
 
 void relayOff() {
-    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(RELAY_PIN, HIGH);
     relayCondition = false;
 }
 
@@ -230,7 +230,7 @@ void setup() {
     pinMode(BLUE_LED_PIN, OUTPUT);
     
     pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, LOW); // Start with Relay OFF (Active HIGH)
+    digitalWrite(RELAY_PIN, HIGH); // Start with Relay OFF (Active HIGH)
     
     pinMode(MANUAL_SWITCH_PIN, INPUT_PULLUP);
     pinMode(CURRENT_SENSOR_PIN, INPUT);
