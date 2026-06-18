@@ -200,6 +200,7 @@ SystemState sysState;
 String wifiPassword = "";
 volatile bool isProvisioningMode = false;
 volatile bool pendingMasterLockSync = false;
+volatile unsigned long pendingMasterLockSyncTime = 0;
 
 // UART command items queue
 struct UartCmdItem {
@@ -236,6 +237,7 @@ void resetWiFiCredentials();
 void uartCommInit();
 void dashboardInit();
 void pushWsUpdate();
+void setShutdownState(bool state);
 
 void relaySwitchTask(void *pvParameters);
 void currentSensorTask(void *pvParameters);
@@ -289,6 +291,19 @@ void setRelayState(int index, bool state) {
   }
 
   updateRelayHardware();
+}
+
+void setShutdownState(bool state) {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    sysState.masterShutdown = state;
+    xSemaphoreGive(stateMutex);
+  }
+  updateRelayHardware();
+  if (state) {
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
+    Serial.println("[SmartNest] Shutdown ON — sending relay_off command to Digital Board");
+  }
+  pushWsUpdate();
 }
 
 bool getRelayState(int index) {
@@ -788,11 +803,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
   }
   // Master shutdown
   else if (t == base + "/cmd/shutdown") {
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      sysState.masterShutdown = (p == "true");
-      xSemaphoreGive(stateMutex);
-    }
-    updateRelayHardware();
+    setShutdownState(p == "true");
   }
   // Slave commands
   else if (t == base + "/cmd/slave/d1") {
@@ -1036,6 +1047,11 @@ void uartCommTask(void *pvParameters) {
   uint32_t lastAcsSentTime = 0;
 
   while (true) {
+    if (pendingMasterLockSync && (millis() - pendingMasterLockSyncTime > 3000)) {
+      Serial.println("[LOCK] pendingMasterLockSync timed out. Resetting flag.");
+      pendingMasterLockSync = false;
+    }
+
     // TX: Send pending slave command or combined current telemetry
     UartCmdItem txItem;
     if (xQueueReceive(UartCmdQueue, &txItem, 0) == pdTRUE) {
@@ -1386,16 +1402,28 @@ void dashboardInit() {
         if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
           setRelayState(relayIdx, state);
           pushWsUpdate();
+          bool actualState = getRelayState(relayIdx);
           req->send(200, "application/json",
                     "{\"success\":true,\"relay\":" + String(relayIdx) +
-                        ",\"state\":" + (state ? "true" : "false") + "}");
+                        ",\"state\":" + (actualState ? "true" : "false") + "}");
         } else if (relayIdx == 6) {
-          String cmd = state ? "relay_on" : "relay_off";
-          enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + cmd +
-                         "\"}");
-          req->send(200, "application/json",
-                    "{\"success\":true,\"relay\":6,\"state\":" +
-                        String(state ? "true" : "false") + "}");
+          bool actualState = false;
+          bool lockActive = false;
+          if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            lockActive = sysState.masterLock || sysState.digitalRelayLocked || sysState.masterShutdown;
+            actualState = sysState.digitalRelayState;
+            xSemaphoreGive(stateMutex);
+          }
+          if (state && lockActive) {
+            Serial.println("[LOCK] /api/relay (6, ON) blocked locally");
+            req->send(200, "application/json", "{\"success\":true,\"relay\":6,\"state\":" + String(actualState ? "true" : "false") + "}");
+          } else {
+            String cmd = state ? "relay_on" : "relay_off";
+            enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + cmd + "\"}");
+            req->send(200, "application/json",
+                      "{\"success\":true,\"relay\":6,\"state\":" +
+                          String(state ? "true" : "false") + "}");
+          }
         } else {
           req->send(400, "application/json", "{\"error\":\"Invalid index\"}");
         }
@@ -1456,18 +1484,7 @@ void dashboardInit() {
         }
         bool state = doc["state"];
 
-        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          sysState.masterShutdown = state;
-          xSemaphoreGive(stateMutex);
-        }
-        updateRelayHardware();
-        if (state) {
-          enqueueUartCmd(
-              "{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
-          Serial.println("[SmartNest] Shutdown ON — sending relay_off command "
-                         "to Digital Board");
-        }
-        pushWsUpdate();
+        setShutdownState(state);
         req->send(200, "application/json",
                   "{\"success\":true,\"shutdown\":" +
                       String(state ? "true" : "false") + "}");
@@ -1494,6 +1511,7 @@ void dashboardInit() {
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           sysState.masterLock = state;
           pendingMasterLockSync = true;
+          pendingMasterLockSyncTime = millis();
           xSemaphoreGive(stateMutex);
         }
         Serial.printf("[LOCK] Local masterLock set: %s\n", state ? "ON" : "OFF");

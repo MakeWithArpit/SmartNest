@@ -735,6 +735,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   }
 
   function toggleRelay(index) {
+    if (masterLock) return;
     let isLocked = (index === 6) ? digitalRelayLocked : lockStates[index];
     if (isLocked) return;
     
@@ -770,6 +771,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 
   function toggleLock(event, index) {
     event.stopPropagation();
+    if (masterLock) return;
     let currentLocked = (index === 6) ? digitalRelayLocked : lockStates[index];
     const nextState = !currentLocked;
     
@@ -1042,6 +1044,24 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   }
 
   // ─── CSV Download Functions ───
+  let csvTimeoutTimer = null;
+  function startCsvTimeout() {
+    clearTimeout(csvTimeoutTimer);
+    csvTimeoutTimer = setTimeout(() => {
+      if (csvDownloading) {
+        const status = document.getElementById('logDownloadStatus');
+        if (status) {
+          status.textContent = 'Download timed out (no response from device)';
+          status.style.color = 'var(--danger)';
+        }
+        resetCsvDownloadUI();
+      }
+    }, 8000);
+  }
+  function clearCsvTimeout() {
+    clearTimeout(csvTimeoutTimer);
+  }
+
   function startCsvDownload() {
     if (csvDownloading) return;
     const btn = document.getElementById('downloadCsvBtn');
@@ -1061,6 +1081,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     csvChunkIndex = 0;
     csvTotalRecords = 0;
     csvFileToDownload = "";
+    startCsvTimeout();
 
     fetch('/api/logs/list')
       .then(r => r.json())
@@ -1072,6 +1093,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   }
 
   function handleCsvFileList(files) {
+    clearCsvTimeout();
     const status = document.getElementById('logDownloadStatus');
     if (!csvDownloading) return;
     if (!files || files.length === 0) {
@@ -1091,10 +1113,12 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     csvFileToDownload = datFiles[datFiles.length - 1];
     csvChunkIndex = 0;
     status.textContent = 'Downloading ' + csvFileToDownload + '...';
+    startCsvTimeout();
     requestDownloadChunk();
   }
 
   function requestDownloadChunk() {
+    startCsvTimeout();
     fetch('/api/logs/view?file=' + encodeURIComponent(csvFileToDownload) + '&chunk=' + csvChunkIndex)
       .then(r => r.json())
       .catch(err => {
@@ -1108,6 +1132,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   function handleCsvChunkReceived(d) {
     if (!csvDownloading) return;
     if (d.file !== csvFileToDownload) return;
+    clearCsvTimeout();
 
     const status = document.getElementById('logDownloadStatus');
     const percent = document.getElementById('logDownloadPercent');
@@ -1173,6 +1198,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   }
 
   function resetCsvDownloadUI() {
+    clearCsvTimeout();
     csvDownloading = false;
     const btn = document.getElementById('downloadCsvBtn');
     if (btn) {
