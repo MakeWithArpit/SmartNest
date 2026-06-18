@@ -1,6 +1,17 @@
 #include <WiFi.h>
 #include <esp_now.h>
-#include <ArduinoJson.h>
+
+struct __attribute__((packed)) CmdPacket {
+    uint8_t type;
+};
+
+struct __attribute__((packed)) DigitalSlavePacket {
+    uint8_t type;
+    float   rmsCurrent;
+    uint8_t relayState;
+    uint8_t switchState;
+};
+
 
 // Pins
 #define RELAY_PIN            15   
@@ -32,19 +43,11 @@ int receiveLength = 0;
 uint32_t lastAcknowledgementTime = 0;
 
 // ESP-NOW Receive Callback
-#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
-void onReceive(const esp_now_recv_info_t* receiveInfo, const uint8_t* data, int len) {
+void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     memcpy(receiveBuffer, data, len);
     receiveLength = len;
     messageReceived = true;
 }
-#else
-void onReceive(const uint8_t* macAddress, const uint8_t* data, int len) {
-    memcpy(receiveBuffer, data, len);
-    receiveLength = len;
-    messageReceived = true;
-}
-#endif
 
 // Relay Control
 void relayOn() {
@@ -196,37 +199,23 @@ void updateLEDState() {
 
 // Transmissions
 void sendSlaveData() {
-    #if ARDUINOJSON_VERSION_MAJOR >= 7
-    JsonDocument doc;
-    #else
-    StaticJsonDocument<256> doc;
-    #endif
-
-    doc["type"] = "data";
-    doc["current"] = (relayCondition == true) ? currentAmperes : 0.00;
-    doc["relay"] = relayCondition ? 1 : 0;
-    doc["switch"] = (digitalRead(MANUAL_SWITCH_PIN) == HIGH) ? 1 : 0;
-
-    char buffer[256];
-    size_t len = serializeJson(doc, buffer);
-    esp_now_send(masterMacAddress, (uint8_t*)buffer, len);
+    DigitalSlavePacket pkt;
+    pkt.type        = 0x10;
+    pkt.rmsCurrent  = relayCondition ? currentAmperes : 0.0f;
+    pkt.relayState  = relayCondition ? 1 : 0;
+    pkt.switchState = (digitalRead(MANUAL_SWITCH_PIN) == LOW) ? 1 : 0;
+    esp_now_send(masterMacAddress, (uint8_t*)&pkt, sizeof(pkt));
 }
 
 void sendAckReply() {
-    #if ARDUINOJSON_VERSION_MAJOR >= 7
-    JsonDocument doc;
-    #else
-    StaticJsonDocument<256> doc;
-    #endif
-
-    doc["type"] = "ack_ok";
-    doc["current"] = currentAmperes;
-    doc["relay"] = relayCondition ? 1 : 0;
-
-    char buffer[256];
-    size_t len = serializeJson(doc, buffer);
-    esp_now_send(masterMacAddress, (uint8_t*)buffer, len);
+    DigitalSlavePacket pkt;
+    pkt.type        = 0x11;
+    pkt.rmsCurrent  = currentAmperes;
+    pkt.relayState  = relayCondition ? 1 : 0;
+    pkt.switchState = 0;
+    esp_now_send(masterMacAddress, (uint8_t*)&pkt, sizeof(pkt));
 }
+
 
 // Setup
 void setup() {
@@ -284,35 +273,18 @@ void loop() {
     if (messageReceived) {
         messageReceived = false;
         
-        #if ARDUINOJSON_VERSION_MAJOR >= 7
-        JsonDocument doc;
-        #else
-        StaticJsonDocument<256> doc;
-        #endif
-        
-        DeserializationError error = deserializeJson(doc, receiveBuffer, receiveLength);
-        if (!error) {
-            if (doc.containsKey("cmd")) {
-                const char* cmd = doc["cmd"];
-                if (strcmp(cmd, "relay_on") == 0) {
-                    relayOn();
-                } else if (strcmp(cmd, "relay_off") == 0) {
-                    relayOff();
-                } else if (strcmp(cmd, "relay_lock") == 0) {
-                    masterLock = true;
-                    relayOff();
-                } else if (strcmp(cmd, "relay_unlock") == 0) {
-                    masterLock = false;
-                } else if (strcmp(cmd, "reboot") == 0) {
-                    delay(100);
-                    ESP.restart();
-                }
-            } else if (doc.containsKey("type")) {
-                const char* type = doc["type"];
-                if (strcmp(type, "ack") == 0) {
+        if (receiveLength >= 1) {
+            CmdPacket* cmd = (CmdPacket*)receiveBuffer;
+            switch (cmd->type) {
+                case 0x01:  // ACK ping
                     lastAcknowledgementTime = millis();
                     sendAckReply();
-                }
+                    break;
+                case 0x02: relayOn();  break;
+                case 0x03: relayOff(); break;
+                case 0x04: masterLock = true;  relayOff(); break;
+                case 0x05: masterLock = false; break;
+                case 0x06: delay(100); ESP.restart(); break;
             }
         }
     }

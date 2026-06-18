@@ -4,12 +4,13 @@
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <HardwareSerial.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <AsyncWebSocket.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 #define NUM_RELAYS 6
 #define FIRMWARE_VERSION "1.0.0"
@@ -20,13 +21,6 @@
 #define RELAY_4_PIN 23
 #define RELAY_5_PIN 25
 #define RELAY_6_PIN 33
-
-#define SWITCH_1_PIN 13
-#define SWITCH_2_PIN 15
-#define SWITCH_3_PIN 19
-#define SWITCH_4_PIN 4
-#define SWITCH_5_PIN 32
-#define SWITCH_6_PIN 18
 
 #define ACS712_PIN            34
 #define ACS712_SENSITIVITY    0.066f
@@ -45,11 +39,7 @@ static float acs712ZeroMv = ACS712_ZERO_POINT_MV;
 #define UART2_TX_PIN 17
 #define UART2_BAUD 115200
 
-#define CLOUD_ENABLED         false
-#define CLOUD_URL             "https://your-server.com/api/relay-status"
 #define HEARTBEAT_MS          30000
-#define HTTP_TIMEOUT_MS       5000
-
 #define MDNS_HOSTNAME "smart-nest"
 #define PROV_AP_SSID "SmartNest"
 #define NVS_NAMESPACE "smartnest"
@@ -57,40 +47,56 @@ static float acs712ZeroMv = ACS712_ZERO_POINT_MV;
 #define NVS_PASS_KEY "wifi_pass"
 #define NVS_PROV_KEY "provisioned"
 
+// MQTT Configuration
+#define MQTT_ENABLED       true
+#define MQTT_BROKER_HOST   "broker.hivemq.com"
+#define MQTT_BROKER_PORT   1883
+#define MQTT_CLIENT_ID     "SmartNest_001"
+#define MQTT_USERNAME      ""
+#define MQTT_PASSWORD      ""
+#define MQTT_KEEPALIVE_S   60
+#define MQTT_BASE_TOPIC    "smartnest"
+
 struct RelayEvent {
   int index;
   bool state;
   unsigned long timestamp;
 };
 
-struct UartData {
-  float deviceCurrent;
-  bool errors[4];
-  char errorMsg[64];
-  bool hasNewData;
-};
-
 struct SystemState {
-  bool relayStates[NUM_RELAYS];
-  bool dashboardStates[NUM_RELAYS];
-  bool masterShutdown;
-  bool lockedStates[NUM_RELAYS];
-  float currentAmps;
-  UartData uartData;
-  bool wifiConnected;
-  int wifiRSSI;
-  char wifiSSID[33];
+  // Direct GPIO Relays (0-5)
+  bool  relayStates[NUM_RELAYS];
+  bool  dashboardStates[NUM_RELAYS];
+  bool  masterShutdown;
+  bool  lockedStates[NUM_RELAYS];
+  bool  wifiConnected;
+  int   wifiRSSI;
+  char  wifiSSID[33];
   unsigned long lastChangeMs;
+  float currentAmps; // Internet Board's own combined ACS712 current
+
+  // Telemetry from Master via UART
+  float  acsCurrentA;        // Digital Slave's ACS712 current
+  float  pzemVoltage;        // PZEM voltage (V)
+  float  pzemCurrentA;       // PZEM current (A)
+  float  pzemPowerW;         // PZEM apparent power (W)
+  double energyDailyWh;      // Daily energy (Wh)
+  double energyMonthlyWh;    // Monthly energy (Wh)
+  double energyLifetimeWh;   // Lifetime energy (Wh)
+  bool   digitalSlaveOnline;
+  bool   pzemSlaveOnline;
+  int    digitalSlaveRSSI;
+  int    pzemSlaveRSSI;
+
+  // 7th Relay (Digital Board Slave)
+  bool   digitalRelayState;
+  bool   digitalRelayLocked;
+  bool   digitalSwitchState;
 };
 
 const int RELAY_PINS[NUM_RELAYS] = {
   RELAY_1_PIN, RELAY_2_PIN, RELAY_3_PIN,
   RELAY_4_PIN, RELAY_5_PIN, RELAY_6_PIN
-};
-
-const int SWITCH_PINS[NUM_RELAYS] = {
-  SWITCH_1_PIN, SWITCH_2_PIN, SWITCH_3_PIN,
-  SWITCH_4_PIN, SWITCH_5_PIN, SWITCH_6_PIN
 };
 
 const char *const RELAY_NAMES[NUM_RELAYS] = {
@@ -104,12 +110,28 @@ SystemState sysState;
 String wifiPassword = "";
 volatile bool isProvisioningMode = false;
 
+// UART command items queue
+struct UartCmdItem {
+  char text[256];
+};
+QueueHandle_t UartCmdQueue = NULL;
+
 static TaskHandle_t hRelaySwitch = NULL;
 static TaskHandle_t hCurrentSensor = NULL;
-static TaskHandle_t hCloudClient = NULL;
 static TaskHandle_t hUartComm = NULL;
 static TaskHandle_t hWifiReconnect = NULL;
 static TaskHandle_t hResetButton = NULL;
+static TaskHandle_t hNtpSync = NULL;
+static TaskHandle_t hMqttTask = NULL;
+
+// WebSocket
+AsyncWebSocket ws("/ws");
+
+// MQTT objects
+#if MQTT_ENABLED
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+#endif
 
 void setRelayState(int index, bool state);
 bool getRelayState(int index);
@@ -122,24 +144,29 @@ bool wifiManagerInit();
 void wifiManagerLoop();
 void resetWiFiCredentials();
 void uartCommInit();
-void uartSendRelayCommand(int relayIndex, bool state);
 void dashboardInit();
+void pushWsUpdate();
 
 void relaySwitchTask(void *pvParameters);
 void currentSensorTask(void *pvParameters);
 void resetButtonTask(void *pvParameters);
 void wifiReconnectTask(void *pvParameters);
-void cloudClientTask(void *pvParameters);
 void uartCommTask(void *pvParameters);
+void ntpSyncTask(void *pvParameters);
+void mqttTask(void *pvParameters);
 
-static bool lastSwitchState[NUM_RELAYS] = { false };
+void enqueueUartCmd(const String &cmd) {
+  if (UartCmdQueue == NULL) return;
+  UartCmdItem item;
+  strncpy(item.text, cmd.c_str(), sizeof(item.text) - 1);
+  item.text[sizeof(item.text) - 1] = '\0';
+  xQueueSend(UartCmdQueue, &item, 0);
+}
 
 void relaySwitchInit() {
   for (int i = 0; i < NUM_RELAYS; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], LOW);
-    pinMode(SWITCH_PINS[i], INPUT_PULLDOWN);
-    lastSwitchState[i] = (digitalRead(SWITCH_PINS[i]) == HIGH);
   }
 
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -188,13 +215,12 @@ void updateRelayHardware() {
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     for (int i = 0; i < NUM_RELAYS; i++) {
       bool D = sysState.dashboardStates[i];
-      bool S = (digitalRead(SWITCH_PINS[i]) == HIGH);
       bool R = false;
 
       if (sysState.masterShutdown || sysState.lockedStates[i]) {
         R = false;
       } else {
-        R = D || S;
+        R = D;
       }
 
       if (sysState.relayStates[i] != R) {
@@ -218,20 +244,7 @@ void relaySwitchTask(void *pvParameters) {
   updateRelayHardware();
 
   while (true) {
-    bool changed = false;
-    for (int i = 0; i < NUM_RELAYS; i++) {
-      bool currentSwitch = (digitalRead(SWITCH_PINS[i]) == HIGH);
-
-      if (currentSwitch != lastSwitchState[i]) {
-        lastSwitchState[i] = currentSwitch;
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      updateRelayHardware();
-    }
-
+    updateRelayHardware();
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
@@ -240,24 +253,12 @@ void currentSensorInit() {
   pinMode(ACS712_PIN, INPUT);
   analogSetAttenuation(ADC_11db);
   analogReadResolution(12);
-
   delay(300);
-
-#if ACS712_AUTO_CALIBRATE
-  long sum = 0;
-  for (int i = 0; i < 1000; i++) {
-    sum += analogReadMilliVolts(ACS712_PIN);
-    delayMicroseconds(100);
-  }
-  acs712ZeroMv = sum / 1000.0f;
-#else
   acs712ZeroMv = ACS712_ZERO_POINT_MV;
-#endif
 }
 
 float readCurrent() {
   float sumSq = 0.0f;
-
   for (int i = 0; i < ACS712_RMS_SAMPLES; i++) {
     float mv       = analogReadMilliVolts(ACS712_PIN);
     float deltaMv  = (mv - acs712ZeroMv) * ACS712_DIVIDER_RATIO;
@@ -265,30 +266,24 @@ float readCurrent() {
     sumSq         += iSample * iSample;
     delayMicroseconds(100);
   }
-
   float rms = sqrtf(sumSq / ACS712_RMS_SAMPLES);
-
   return (rms < ACS712_DEADBAND_A) ? 0.0f : rms;
 }
 
 void currentSensorTask(void *pvParameters) {
   currentSensorInit();
-
   while (true) {
     float amps = readCurrent();
-
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       sysState.currentAmps = amps;
       xSemaphoreGive(stateMutex);
     }
-
     vTaskDelay(pdMS_TO_TICKS(ACS712_READ_INTERVAL_MS));
   }
 }
 
 static DNSServer *pDnsServer = nullptr;
 static AsyncWebServer *pProvServer = nullptr;
-
 static volatile int connectStatus = 0;
 static String pendingSSID = "";
 static String pendingPass = "";
@@ -306,15 +301,12 @@ static String scanNetworks() {
   }
   json += "]";
   WiFi.scanDelete();
-
   return json;
 }
 
 static void wifiConnectAttemptTask(void *pvParams) {
   connectStatus = 1;
-
   WiFi.begin(pendingSSID.c_str(), pendingPass.c_str());
-
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 20) {
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -331,14 +323,12 @@ static void wifiConnectAttemptTask(void *pvParams) {
 
     wifiPassword = pendingPass;
     connectStatus = 2;
-
     vTaskDelay(pdMS_TO_TICKS(3000));
     ESP.restart();
   } else {
     connectStatus = 3;
     WiFi.disconnect();
   }
-
   vTaskDelete(NULL);
 }
 
@@ -433,13 +423,11 @@ bool wifiManagerInit() {
       if (MDNS.begin(MDNS_HOSTNAME)) {
         MDNS.addService("http", "tcp", 80);
       }
-
       return true;
     }
   }
 
   isProvisioningMode = true;
-
   WiFi.mode(WIFI_AP_STA);
   scanNetworks();
 
@@ -467,7 +455,6 @@ void resetWiFiCredentials() {
   prefs.begin(NVS_NAMESPACE, false);
   prefs.clear();
   prefs.end();
-
   delay(1000);
   ESP.restart();
 }
@@ -475,11 +462,9 @@ void resetWiFiCredentials() {
 void wifiReconnectTask(void *pvParameters) {
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(15000));
-
     if (isProvisioningMode) continue;
 
     bool connected = (WiFi.status() == WL_CONNECTED);
-
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
       sysState.wifiConnected = connected;
       if (connected) {
@@ -490,7 +475,6 @@ void wifiReconnectTask(void *pvParameters) {
 
     if (!connected) {
       WiFi.reconnect();
-
       int retries = 0;
       while (WiFi.status() != WL_CONNECTED && retries < 20) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -515,288 +499,362 @@ void wifiReconnectTask(void *pvParameters) {
 
 void resetButtonTask(void *pvParameters) {
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
-
   while (true) {
     if (digitalRead(RESET_BTN_PIN) == LOW) {
       unsigned long pressStart = millis();
-
       while (digitalRead(RESET_BTN_PIN) == LOW) {
         vTaskDelay(pdMS_TO_TICKS(100));
-
         unsigned long held = millis() - pressStart;
-
         if (held >= RESET_HOLD_MS) {
           resetWiFiCredentials();
         }
       }
     }
-
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
-static HardwareSerial UartSerial(2);
-
-static bool lastSentRelayStates[NUM_RELAYS] = { false };
-static UartData lastReceivedData;
-static bool uartInitialized = false;
-
-void uartCommInit() {
-  UartSerial.begin(UART2_BAUD, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
-  memset(&lastReceivedData, 0, sizeof(lastReceivedData));
-  uartInitialized = true;
+// WebSocket publisher helper
+void pushWsUpdate() {
+  if (ws.count() == 0) return;
+  String payload = buildStatusJSON();
+  ws.textAll(payload);
 }
 
-void uartSendRelayCommand(int relayIndex, bool state) {
-  if (!uartInitialized) return;
-  if (relayIndex < 0 || relayIndex >= NUM_RELAYS) return;
-
-  String msg = "{\"type\":\"relay\",\"index\":";
-  msg += String(relayIndex);
-  msg += ",\"state\":";
-  msg += state ? "true" : "false";
-  msg += "}";
-
-  UartSerial.println(msg);
+// MQTT Callback and publishing helpers
+#if MQTT_ENABLED
+int getRelayIndexFromTopic(const String &topic) {
+  int prefixLen = strlen(MQTT_BASE_TOPIC) + 7; // "smartnest/relay/"
+  if (!topic.startsWith(MQTT_BASE_TOPIC "/relay/")) return -1;
+  int nextSlash = topic.indexOf('/', prefixLen);
+  if (nextSlash < 0) return -1;
+  String idxStr = topic.substring(prefixLen, nextSlash);
+  return idxStr.toInt();
 }
 
-static void checkAndSendRelayUpdates() {
-  for (int i = 0; i < NUM_RELAYS; i++) {
-    bool current = getRelayState(i);
-    if (current != lastSentRelayStates[i]) {
-      lastSentRelayStates[i] = current;
-      uartSendRelayCommand(i, current);
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String p = String((char*)payload, length);
+  p.trim();
+
+  // Relay set: smartnest/relay/N/set
+  if (t.startsWith(MQTT_BASE_TOPIC "/relay/") && t.endsWith("/set")) {
+    int idx = getRelayIndexFromTopic(t);
+    if (idx >= 0 && idx < NUM_RELAYS) {
+      setRelayState(idx, p == "true");
+    } else if (idx == 6) {
+      enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
+                     (p == "true" ? "relay_on" : "relay_off") + "\"}");
     }
+  }
+  // Relay lock: smartnest/relay/N/lock
+  else if (t.startsWith(MQTT_BASE_TOPIC "/relay/") && t.endsWith("/lock")) {
+    int idx = getRelayIndexFromTopic(t);
+    if (idx >= 0 && idx < NUM_RELAYS) {
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        sysState.lockedStates[idx] = (p == "true");
+        xSemaphoreGive(stateMutex);
+      }
+      updateRelayHardware();
+    } else if (idx == 6) {
+      enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
+                     (p == "true" ? "relay_lock" : "relay_unlock") + "\"}");
+    }
+  }
+  // Master shutdown
+  else if (t == MQTT_BASE_TOPIC "/cmd/shutdown") {
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      sysState.masterShutdown = (p == "true");
+      xSemaphoreGive(stateMutex);
+    }
+    updateRelayHardware();
+  }
+  // Slave commands
+  else if (t == MQTT_BASE_TOPIC "/cmd/slave/d1") {
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + p + "\"}");
+  }
+  else if (t == MQTT_BASE_TOPIC "/cmd/slave/pzem") {
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"" + p + "\"}");
+  }
+
+  pushWsUpdate();
+  
+  // Republish changed retained state
+  if (t.startsWith(MQTT_BASE_TOPIC "/relay/")) {
+    int idx = getRelayIndexFromTopic(t);
+    if (idx >= 0 && idx < NUM_RELAYS) {
+      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/state").c_str(),
+                         getRelayState(idx) ? "true" : "false", true);
+      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/locked").c_str(),
+                         sysState.lockedStates[idx] ? "true" : "false", true);
+    } else if (idx == 6) {
+      mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", sysState.digitalRelayState ? "true" : "false", true);
+      mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", sysState.digitalRelayLocked ? "true" : "false", true);
+    }
+  } else if (t == MQTT_BASE_TOPIC "/cmd/shutdown") {
+    mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", sysState.masterShutdown ? "true" : "false", true);
   }
 }
 
-static bool parseIncomingData(const String &msg) {
-  if (msg.indexOf("\"type\":\"status\"") < 0) {
-    if (msg.indexOf("\"type\":\"cmd\"") >= 0) {
-      int idxPos = msg.indexOf("\"index\":");
-      int stPos = msg.indexOf("\"state\":");
-      if (idxPos >= 0 && stPos >= 0) {
-        int idx = msg.substring(idxPos + 8, msg.indexOf(",", idxPos + 8)).toInt();
-        String stStr = msg.substring(stPos + 8, stPos + 13);
-        stStr.trim();
-        bool st = stStr.startsWith("true");
-        if (idx >= 0 && idx < NUM_RELAYS) {
-          setRelayState(idx, st);
+void publishAllRetainedStates() {
+  for (int i = 0; i < NUM_RELAYS; i++) {
+    mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/state").c_str(),
+                       getRelayState(i) ? "true" : "false", true);
+    mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/locked").c_str(),
+                       sysState.lockedStates[i] ? "true" : "false", true);
+  }
+  mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", sysState.digitalRelayState ? "true" : "false", true);
+  mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", sysState.digitalRelayLocked ? "true" : "false", true);
+  mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", sysState.masterShutdown ? "true" : "false", true);
+}
+
+void publishTelemetry() {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/voltage", String(sysState.pzemVoltage, 1).c_str(), false);
+    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/acs", String(sysState.acsCurrentA, 2).c_str(), false);
+    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/load", String(sysState.currentAmps, 2).c_str(), false);
+    mqttClient.publish(MQTT_BASE_TOPIC "/sensor/power", String(sysState.pzemPowerW, 1).c_str(), false);
+    
+    mqttClient.publish(MQTT_BASE_TOPIC "/energy/daily", String(sysState.energyDailyWh / 1000.0, 3).c_str(), false);
+    mqttClient.publish(MQTT_BASE_TOPIC "/energy/monthly", String(sysState.energyMonthlyWh / 1000.0, 3).c_str(), false);
+    mqttClient.publish(MQTT_BASE_TOPIC "/energy/lifetime", String(sysState.energyLifetimeWh / 1000.0, 3).c_str(), false);
+    
+    mqttClient.publish(MQTT_BASE_TOPIC "/slave/d1/online", sysState.digitalSlaveOnline ? "true" : "false", true);
+    mqttClient.publish(MQTT_BASE_TOPIC "/slave/pzem/online", sysState.pzemSlaveOnline ? "true" : "false", true);
+    
+    mqttClient.publish(MQTT_BASE_TOPIC "/switch/6/state", sysState.digitalSwitchState ? "true" : "false", false);
+    
+    // Heartbeat payload
+    String heartbeat = "{\"uptime\":" + String(millis()) + ",\"ssid\":\"" + String(sysState.wifiSSID) + "\",\"rssi\":" + String(sysState.wifiRSSI) + "}";
+    mqttClient.publish(MQTT_BASE_TOPIC "/status", heartbeat.c_str(), false);
+    
+    xSemaphoreGive(stateMutex);
+  }
+}
+
+void mqttTask(void* pvParameters) {
+  mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
+
+  uint32_t lastReconnectAttempt = 0;
+  uint32_t lastHeartbeat = 0;
+  bool wasMqttConnected = false;
+
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!mqttClient.connected()) {
+        if (wasMqttConnected) {
+          enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
+          wasMqttConnected = false;
+        }
+        if (millis() - lastReconnectAttempt > 5000) {
+          lastReconnectAttempt = millis();
+          bool ok;
+          if (strlen(MQTT_USERNAME) > 0)
+            ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+          else
+            ok = mqttClient.connect(MQTT_CLIENT_ID);
+          if (ok) {
+            mqttClient.subscribe(MQTT_BASE_TOPIC "/relay/+/set");
+            mqttClient.subscribe(MQTT_BASE_TOPIC "/relay/+/lock");
+            mqttClient.subscribe(MQTT_BASE_TOPIC "/cmd/shutdown");
+            mqttClient.subscribe(MQTT_BASE_TOPIC "/cmd/slave/d1");
+            mqttClient.subscribe(MQTT_BASE_TOPIC "/cmd/slave/pzem");
+            
+            publishAllRetainedStates();
+            enqueueUartCmd("{\"t\":\"cloud\",\"up\":true}");
+            wasMqttConnected = true;
+          }
+        }
+      } else {
+        mqttClient.loop();
+        if (millis() - lastHeartbeat > HEARTBEAT_MS) {
+          lastHeartbeat = millis();
+          publishTelemetry();
         }
       }
     }
-    return false;
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
+}
+#endif
 
-  UartData newData;
-  memset(&newData, 0, sizeof(newData));
-  newData.hasNewData = true;
-
-  int curPos = msg.indexOf("\"current\":");
-  if (curPos >= 0) {
-    int valStart = curPos + 10;
-    int valEnd = msg.indexOf(",", valStart);
-    if (valEnd < 0) valEnd = msg.indexOf("}", valStart);
-    newData.deviceCurrent = msg.substring(valStart, valEnd).toFloat();
-  }
-
-  int errPos = msg.indexOf("\"err\":[");
-  if (errPos >= 0) {
-    int arrStart = errPos + 7;
-    for (int i = 0; i < 4; i++) {
-      if (arrStart < (int)msg.length()) {
-        newData.errors[i] = (msg.charAt(arrStart) == '1' || msg.charAt(arrStart) == 't');
-        arrStart = msg.indexOf(",", arrStart);
-        if (arrStart >= 0) arrStart++;
-        else break;
-      }
-    }
-  }
-
-  int msgPos = msg.indexOf("\"msg\":\"");
-  if (msgPos >= 0) {
-    int msgStart = msgPos + 7;
-    int msgEnd = msg.indexOf("\"", msgStart);
-    if (msgEnd >= 0) {
-      String errMsg = msg.substring(msgStart, msgEnd);
-      strncpy(newData.errorMsg, errMsg.c_str(), sizeof(newData.errorMsg) - 1);
-      newData.errorMsg[sizeof(newData.errorMsg) - 1] = '\0';
-    }
-  }
-
-  bool changed = false;
-  if (fabs(newData.deviceCurrent - lastReceivedData.deviceCurrent) > 0.01f) changed = true;
-  for (int i = 0; i < 4; i++) {
-    if (newData.errors[i] != lastReceivedData.errors[i]) changed = true;
-  }
-  if (strcmp(newData.errorMsg, lastReceivedData.errorMsg) != 0) changed = true;
-
-  if (changed) {
-    memcpy(&lastReceivedData, &newData, sizeof(UartData));
-
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      memcpy(&sysState.uartData, &newData, sizeof(UartData));
-      xSemaphoreGive(stateMutex);
-    }
-
-    return true;
-  }
-
-  return false;
+// UART COMM TASK (Internet ESP32 Side)
+void uartCommInit() {
+  Serial2.begin(UART2_BAUD, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
 }
 
 void uartCommTask(void *pvParameters) {
   uartCommInit();
-
+  
   String rxBuffer = "";
+  uint32_t lastAcsSentTime = 0;
 
   while (true) {
-    checkAndSendRelayUpdates();
+    // TX: Send pending slave command or combined current telemetry
+    UartCmdItem txItem;
+    if (xQueueReceive(UartCmdQueue, &txItem, 0) == pdTRUE) {
+      Serial2.println(txItem.text);
+    }
+    
+    uint32_t now = millis();
+    if (now - lastAcsSentTime >= 10000) {
+      lastAcsSentTime = now;
+      float ampsVal = 0.0f;
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        ampsVal = sysState.currentAmps;
+        xSemaphoreGive(stateMutex);
+      }
+      String acsMsg = "{\"t\":\"acs\",\"i\":" + String(ampsVal, 2) + "}";
+      Serial2.println(acsMsg);
+    }
 
-    while (UartSerial.available()) {
-      char c = UartSerial.read();
-
+    // RX: Read incoming serial line from Master
+    while (Serial2.available() > 0) {
+      char c = Serial2.read();
       if (c == '\n') {
         rxBuffer.trim();
         if (rxBuffer.length() > 0) {
-          parseIncomingData(rxBuffer);
+          // Parse JSON
+          StaticJsonDocument<1024> doc;
+          DeserializationError err = deserializeJson(doc, rxBuffer);
+          if (!err) {
+            String type = doc["t"];
+            if (type == "tel") {
+              if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                sysState.acsCurrentA = doc["acs"];
+                sysState.pzemVoltage = doc["v"];
+                sysState.pzemCurrentA = doc["pi"];
+                sysState.pzemPowerW = doc["pp"];
+                sysState.energyDailyWh = doc["d_wh"];
+                sysState.energyMonthlyWh = doc["m_wh"];
+                sysState.energyLifetimeWh = doc["l_wh"];
+                sysState.digitalSlaveOnline = doc["d_on"];
+                sysState.pzemSlaveOnline = doc["p_on"];
+                sysState.digitalSlaveRSSI = doc["d_rssi"];
+                sysState.pzemSlaveRSSI = doc["p_rssi"];
+                sysState.digitalRelayState = doc["d_relay"];
+                sysState.digitalSwitchState = doc["d_sw"];
+                sysState.digitalRelayLocked = doc["d_lock"];
+                xSemaphoreGive(stateMutex);
+              }
+              pushWsUpdate();
+              #if MQTT_ENABLED
+              if (mqttClient.connected()) {
+                publishTelemetry();
+              }
+              #endif
+            }
+            else if (type == "sw") {
+              int idx = doc["idx"];
+              int s = doc["s"];
+              if (idx >= 0 && idx < NUM_RELAYS) {
+                setRelayState(idx, s == 1);
+              }
+            }
+            else if (type == "off") {
+              String dev = doc["dev"];
+              if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (dev == "d1") sysState.digitalSlaveOnline = false;
+                else if (dev == "pzem") sysState.pzemSlaveOnline = false;
+                xSemaphoreGive(stateMutex);
+              }
+              pushWsUpdate();
+              #if MQTT_ENABLED
+              if (mqttClient.connected()) {
+                mqttClient.publish((MQTT_BASE_TOPIC "/slave/" + dev + "/online").c_str(), "false", true);
+              }
+              #endif
+            }
+            else if (type == "on") {
+              String dev = doc["dev"];
+              if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (dev == "d1") sysState.digitalSlaveOnline = true;
+                else if (dev == "pzem") sysState.pzemSlaveOnline = true;
+                xSemaphoreGive(stateMutex);
+              }
+              pushWsUpdate();
+              #if MQTT_ENABLED
+              if (mqttClient.connected()) {
+                mqttClient.publish((MQTT_BASE_TOPIC "/slave/" + dev + "/online").c_str(), "true", true);
+              }
+              #endif
+            }
+            else if (type == "hist") {
+              uint32_t batch = doc["batch"];
+              JsonArray recs = doc["recs"];
+              bool allPublished = true;
+              uint32_t lastEpoch = 0;
+              
+              #if MQTT_ENABLED
+              if (mqttClient.connected()) {
+                for (JsonObject rec : recs) {
+                  uint32_t ep = rec["epoch"];
+                  float v = rec["v"];
+                  float load = rec["load"];
+                  float pi = rec["pi"];
+                  float pva = rec["powerVA"];
+                  lastEpoch = ep;
+                  
+                  String recJson = "{\"epoch\":" + String(ep) + ",\"v\":" + String(v, 1) + 
+                                   ",\"load\":" + String(load, 2) + ",\"pi\":" + String(pi, 3) + 
+                                   ",\"powerVA\":" + String(pva, 1) + "}";
+                  
+                  bool pubOk = mqttClient.publish(MQTT_BASE_TOPIC "/history", recJson.c_str(), false);
+                  if (!pubOk) {
+                    allPublished = false;
+                    break;
+                  }
+                }
+              } else {
+                allPublished = false;
+              }
+              #else
+              allPublished = false;
+              #endif
+              
+              if (allPublished && lastEpoch > 0) {
+                enqueueUartCmd("{\"t\":\"hist_ack\",\"batch\":" + String(batch) + ",\"upto\":" + String(lastEpoch) + "}");
+              }
+            }
+          }
         }
         rxBuffer = "";
       } else if (c != '\r') {
         rxBuffer += c;
-
-        if (rxBuffer.length() > 256) {
+        if (rxBuffer.length() > 1024) {
           rxBuffer = "";
         }
       }
     }
-
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-static String buildPayload() {
-  String json = "{";
-
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    json += "\"relays\":[";
-    for (int i = 0; i < NUM_RELAYS; i++) {
-      if (i > 0) json += ",";
-      json += sysState.relayStates[i] ? "true" : "false";
-    }
-    json += "],";
-
-    json += "\"current\":" + String(sysState.currentAmps, 2) + ",";
-
-    json += "\"rssi\":" + String(sysState.wifiRSSI) + ",";
-
-    if (sysState.uartData.hasNewData) {
-      json += "\"uart\":{";
-      json += "\"current\":" + String(sysState.uartData.deviceCurrent, 2) + ",";
-      json += "\"errors\":[";
-      for (int i = 0; i < 4; i++) {
-        if (i > 0) json += ",";
-        json += sysState.uartData.errors[i] ? "true" : "false";
-      }
-      json += "]";
-      if (strlen(sysState.uartData.errorMsg) > 0) {
-        json += ",\"msg\":\"" + String(sysState.uartData.errorMsg) + "\"";
-      }
-      json += "},";
-    }
-
-    xSemaphoreGive(stateMutex);
-  }
-
-  json += "\"uptime\":" + String(millis());
-  json += "}";
-
-  return json;
-}
-
-static void parseCommands(const String &response) {
-  int searchFrom = 0;
-
+// NTP Synchronizer Task
+void ntpSyncTask(void *pvParameters) {
   while (true) {
-    int relayKeyPos = response.indexOf("\"relay\":", searchFrom);
-    if (relayKeyPos < 0) break;
-
-    int valStart = relayKeyPos + 8;
-    int valEnd = response.indexOf(",", valStart);
-    if (valEnd < 0) valEnd = response.indexOf("}", valStart);
-    if (valEnd < 0) break;
-
-    String relayStr = response.substring(valStart, valEnd);
-    relayStr.trim();
-    int relayIdx = relayStr.toInt();
-
-    int stateKeyPos = response.indexOf("\"state\":", valEnd);
-    if (stateKeyPos < 0 || stateKeyPos > valEnd + 30) {
-      searchFrom = valEnd + 1;
-      continue;
-    }
-
-    int stateStart = stateKeyPos + 8;
-    String stateStr = response.substring(stateStart, stateStart + 5);
-    stateStr.trim();
-    bool state = stateStr.startsWith("true");
-
-    if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
-      setRelayState(relayIdx, state);
-    }
-
-    searchFrom = stateStart + 5;
-  }
-}
-
-void cloudClientTask(void *pvParameters) {
-  while (true) {
-    RelayEvent event;
-    bool gotEvent = (xQueueReceive(relayEventQueue, &event,
-                                   pdMS_TO_TICKS(HEARTBEAT_MS))
-                     == pdTRUE);
-
-    if (gotEvent) {
-      RelayEvent extra;
-      while (xQueueReceive(relayEventQueue, &extra, 0) == pdTRUE) {
-      }
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-      continue;
-    }
-
-    String payload = buildPayload();
-
-    WiFiClientSecure *client = new WiFiClientSecure;
-    if (!client) {
-      continue;
-    }
-
-    client->setInsecure();
-
-    HTTPClient https;
-    if (https.begin(*client, CLOUD_URL)) {
-      https.addHeader("Content-Type", "application/json");
-      https.setTimeout(HTTP_TIMEOUT_MS);
-
-      int code = https.POST(payload);
-
-      if (code > 0) {
-        if (code == HTTP_CODE_OK) {
-          String response = https.getString();
-          if (response.indexOf("\"commands\"") >= 0) {
-            parseCommands(response);
-          }
+    if (WiFi.status() == WL_CONNECTED) {
+      configTime(19800, 0, "pool.ntp.org"); // IST (UTC + 5:30)
+      struct tm timeinfo;
+      int retry = 0;
+      bool success = false;
+      while (retry < 5) {
+        if (getLocalTime(&timeinfo, 1000)) {
+          success = true;
+          break;
         }
+        retry++;
       }
-
-      https.end();
+      if (success) {
+        time_t nowSecs;
+        time(&nowSecs);
+        String msg = "{\"t\":\"ntp\",\"epoch\":" + String((uint32_t)nowSecs) + ",\"tz_h\":5,\"tz_m\":30}";
+        enqueueUartCmd(msg);
+      }
     }
-
-    delete client;
-
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(300000)); // Every 5 minutes
   }
 }
 
@@ -823,11 +881,29 @@ static String buildStatusJSON() {
     json += "\"current\":" + String(sysState.currentAmps, 2) + ",";
     json += "\"rssi\":" + String(sysState.wifiRSSI) + ",";
     json += "\"ssid\":\"" + String(sysState.wifiSSID) + "\",";
+    
+    // masters / slaves data fields
+    json += "\"acs\":"       + String(sysState.acsCurrentA, 2) + ",";
+    json += "\"load\":"      + String(sysState.currentAmps, 2) + ",";
+    json += "\"v\":"         + String(sysState.pzemVoltage, 1) + ",";
+    json += "\"pw\":"        + String(sysState.pzemPowerW, 1) + ",";
+    json += "\"daily\":"     + String(sysState.energyDailyWh / 1000.0, 3) + ",";
+    json += "\"monthly\":"   + String(sysState.energyMonthlyWh / 1000.0, 3) + ",";
+    json += "\"lifetime\":"  + String(sysState.energyLifetimeWh / 1000.0, 3) + ",";
+    json += "\"d_on\":"      + String(sysState.digitalSlaveOnline ? "true":"false") + ",";
+    json += "\"p_on\":"      + String(sysState.pzemSlaveOnline ? "true":"false") + ",";
+    json += "\"d_rssi\":"    + String(sysState.digitalSlaveRSSI) + ",";
+    json += "\"p_rssi\":"    + String(sysState.pzemSlaveRSSI) + ",";
+    json += "\"d_relay\":"   + String(sysState.digitalRelayState ? "true" : "false") + ",";
+    json += "\"d_lock\":"    + String(sysState.digitalRelayLocked ? "true" : "false") + ",";
+    json += "\"d_sw\":"      + String(sysState.digitalSwitchState ? "true" : "false");
+    
     xSemaphoreGive(stateMutex);
   } else {
     json += "],\"locks\":[false,false,false,false,false,false],\"shutdown\":false,\"current\":0,\"rssi\":0,\"ssid\":\"\",";
+    json += "\"acs\":0.00,\"load\":0.00,\"v\":0.0,\"pw\":0.0,\"daily\":0.000,\"monthly\":0.000,\"lifetime\":0.000,\"d_on\":false,\"p_on\":false,\"d_rssi\":0,\"p_rssi\":0,\"d_relay\":false,\"d_lock\":false,\"d_sw\":false";
   }
-  json += "\"uptime\":" + String(millis());
+  json += ",\"uptime\":" + String(millis());
   json += "}";
   return json;
 }
@@ -869,6 +945,11 @@ void dashboardInit() {
         setRelayState(relayIdx, state);
         req->send(200, "application/json",
                   "{\"success\":true,\"relay\":" + String(relayIdx) + ",\"state\":" + (state ? "true" : "false") + "}");
+      } else if (relayIdx == 6) {
+        String cmd = state ? "relay_on" : "relay_off";
+        enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + cmd + "\"}");
+        req->send(200, "application/json",
+                  "{\"success\":true,\"relay\":6,\"state\":" + String(state ? "true" : "false") + "}");
       } else {
         req->send(400, "application/json", "{\"error\":\"Invalid index\"}");
       }
@@ -906,6 +987,11 @@ void dashboardInit() {
         updateRelayHardware();
         req->send(200, "application/json",
                   "{\"success\":true,\"relay\":" + String(relayIdx) + ",\"locked\":" + (state ? "true" : "false") + "}");
+      } else if (relayIdx == 6) {
+        String cmd = state ? "relay_lock" : "relay_unlock";
+        enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + cmd + "\"}");
+        req->send(200, "application/json",
+                  "{\"success\":true,\"relay\":6,\"locked\":" + String(state ? "true" : "false") + "}");
       } else {
         req->send(400, "application/json", "{\"error\":\"Invalid index\"}");
       }
@@ -933,16 +1019,43 @@ void dashboardInit() {
         sysState.masterShutdown = state;
         xSemaphoreGive(stateMutex);
       }
-
       updateRelayHardware();
-
       req->send(200, "application/json",
                 "{\"success\":true,\"shutdown\":" + String(state ? "true" : "false") + "}");
+    });
+
+  // Post handler for slave commands from the web UI
+  dashServer.on(
+    "/api/slave-cmd", HTTP_POST,
+    [](AsyncWebServerRequest *req) {},
+    NULL,
+    [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
+      String body = String((char *)data).substring(0, len);
+      StaticJsonDocument<256> doc;
+      DeserializationError err = deserializeJson(doc, body);
+      if (err) {
+        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+      String target = doc["target"];
+      String cmd = doc["cmd"];
+      
+      if ((target == "d1" && (cmd == "relay_on" || cmd == "relay_off" || cmd == "relay_lock" || cmd == "relay_unlock" || cmd == "reboot")) ||
+          (target == "pzem" && (cmd == "reboot" || cmd == "energy_reset"))) {
+        enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"" + target + "\",\"cmd\":\"" + cmd + "\"}");
+        req->send(200, "application/json", "{\"success\":true}");
+      } else {
+        req->send(400, "application/json", "{\"error\":\"Invalid target or command\"}");
+      }
     });
 
   dashServer.onNotFound([](AsyncWebServerRequest *req) {
     req->redirect("/");
   });
+
+  // Register WebSocket server
+  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {});
+  dashServer.addHandler(&ws);
 
   dashServer.begin();
 }
@@ -955,8 +1068,9 @@ void setup() {
 
   relayEventQueue = xQueueCreate(10, sizeof(RelayEvent));
   stateMutex = xSemaphoreCreateMutex();
+  UartCmdQueue = xQueueCreate(5, sizeof(UartCmdItem));
 
-  if (!relayEventQueue || !stateMutex) {
+  if (!relayEventQueue || !stateMutex || !UartCmdQueue) {
     delay(1000);
     ESP.restart();
   }
@@ -996,18 +1110,6 @@ void setup() {
   if (wifiConnected) {
     dashboardInit();
 
-    #if CLOUD_ENABLED
-    xTaskCreatePinnedToCore(
-      cloudClientTask,
-      "CloudClient",
-      8192,
-      NULL,
-      1,
-      &hCloudClient,
-      0
-    );
-    #endif
-
     xTaskCreatePinnedToCore(
       uartCommTask,
       "UartComm",
@@ -1027,6 +1129,28 @@ void setup() {
       &hWifiReconnect,
       0
     );
+
+    xTaskCreatePinnedToCore(
+      ntpSyncTask,
+      "NtpSync",
+      4096,
+      NULL,
+      1,
+      &hNtpSync,
+      0
+    );
+
+    #if MQTT_ENABLED
+    xTaskCreatePinnedToCore(
+      mqttTask,
+      "MqttTask",
+      8192,
+      NULL,
+      1,
+      &hMqttTask,
+      0
+    );
+    #endif
   }
 }
 
@@ -1035,6 +1159,8 @@ void loop() {
     wifiManagerLoop();
     vTaskDelay(pdMS_TO_TICKS(10));
   } else {
-    vTaskDelay(portMAX_DELAY);
+    // Periodically cleanup clients to free memory
+    ws.cleanupClients();
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }

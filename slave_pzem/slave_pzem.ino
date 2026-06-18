@@ -1,8 +1,20 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <ArduinoJson.h>
 #include <PZEM004Tv30.h>
+
+struct __attribute__((packed)) CmdPacket {
+    uint8_t type;
+};
+
+struct __attribute__((packed)) PzemSlavePacket {
+    uint8_t type;
+    float   voltage;
+    float   current;
+    float   power;
+    float   energy;
+};
+
 
 // Pins
 #define PIN_LED_R            5 
@@ -81,13 +93,8 @@ void updateRGBLED() {
 }
 
 // ESP-NOW Receive Callback
-#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
 void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     const uint8_t* senderMac = info->src_addr;
-#else
-void onReceive(const uint8_t* mac, const uint8_t* data, int len) {
-    const uint8_t* senderMac = mac;
-#endif
 
     if (memcmp(senderMac, masterMAC, 6) == 0) {
         if (len <= sizeof(rxBuffer.data)) {
@@ -98,41 +105,32 @@ void onReceive(const uint8_t* mac, const uint8_t* data, int len) {
     }
 }
 
-// Read PZEM and send JSON packet
-void readPzemAndSend(const char* type) {
-    float voltage = pzem.voltage();
-    float current = pzem.current();
-    float power = pzem.power();
-    float energy = pzem.energy();
+// Read PZEM and send binary packet
+void sendPzemPacket(uint8_t pktType) {
+    float v = pzem.voltage();
+    float i = pzem.current();
+    float p = pzem.power();
+    float e = pzem.energy();
     
-    if (isnan(voltage) || isnan(current) || isnan(power) || isnan(energy)) {
+    if (isnan(v) || isnan(i) || isnan(p) || isnan(e)) {
         pzemHealthy = false;
         Serial.println("[PZEM ERROR] Failed to read sensor values (returned NAN)");
         return;
     }
     
     pzemHealthy = true;
-
-    #if ARDUINOJSON_VERSION_MAJOR >= 7
-    JsonDocument doc;
-    #else
-    StaticJsonDocument<256> doc;
-    #endif
-
-    doc["type"] = type;
-    doc["voltage"] = voltage;
-    doc["current"] = current;
-    doc["power"] = power;
-    doc["energy"] = energy;
-
-    char txBuffer[256];
-    size_t len = serializeJson(doc, txBuffer);
+    PzemSlavePacket pkt;
+    pkt.type    = pktType;
+    pkt.voltage = v;
+    pkt.current = i;
+    pkt.power   = p;
+    pkt.energy  = e;
     
     if (espNowInitialized) {
-        esp_err_t result = esp_now_send(masterMAC, (uint8_t*)txBuffer, len);
+        esp_err_t result = esp_now_send(masterMAC, (uint8_t*)&pkt, sizeof(pkt));
         if (result == ESP_OK) {
-            Serial.printf("[TX OK] Type: %s | V: %.1fV | I: %.3fA | P: %.1fW | E: %.1fWh\n", 
-                          type, voltage, current, power, energy);
+            Serial.printf("[TX OK] Type: 0x%02X | V: %.1fV | I: %.3fA | P: %.1fW | E: %.1fWh\n", 
+                          pktType, v, i, p, e);
         } else {
             Serial.println("[TX FAIL] ESP-NOW transmission failed");
         }
@@ -147,49 +145,31 @@ void handleIncomingPackets() {
     lastMasterContactTime = millis();
     firstContactMade = true;
 
-    #if ARDUINOJSON_VERSION_MAJOR >= 7
-    JsonDocument doc;
-    #else
-    StaticJsonDocument<256> doc;
-    #endif
-
-    DeserializationError error = deserializeJson(doc, rxBuffer.data, rxBuffer.len);
-    if (error) {
-        Serial.print("[JSON ERROR] Parse failed: ");
-        Serial.println(error.c_str());
-        return;
-    }
-
-    if (doc.containsKey("type")) {
-        const char* type = doc["type"];
-        if (strcmp(type, "ack") == 0) {
-            Serial.println("[RX] ACK ping received from Master");
-            readPzemAndSend("ack_ok");
-        }
-    }
-
-    if (doc.containsKey("cmd")) {
-        const char* cmd = doc["cmd"];
-        Serial.printf("[RX] Command received: %s\n", cmd);
-        
+    if (rxBuffer.len >= 1) {
+        CmdPacket* cmd = (CmdPacket*)rxBuffer.data;
         yellowActiveUntilTime = millis() + YELLOW_BLINK_DURATION_MS;
-
-        if (strcmp(cmd, "reboot") == 0) {
-            Serial.println("[CMD] Rebooting system in 1 second...");
-            rebootRequested = true;
-            rebootTime = millis() + 1000;
-        } 
-        else if (strcmp(cmd, "energy_reset") == 0) {
-            Serial.println("[CMD] Resetting energy accumulation register...");
-            
-            bool resetOk = pzem.resetEnergy();
-            if (resetOk) {
-                Serial.println("[CMD] PZEM Energy reset successfully completed");
-                readPzemAndSend("data");
-            } else {
-                Serial.println("[ERROR] PZEM Energy reset operation failed");
-                pzemHealthy = false;
-            }
+        
+        switch (cmd->type) {
+            case 0x01:  // ACK ping
+                Serial.println("[RX] ACK ping received from Master");
+                sendPzemPacket(0x21);
+                break;
+            case 0x06:  // Reboot
+                Serial.println("[CMD] Rebooting system in 1 second...");
+                rebootRequested = true;
+                rebootTime = millis() + 1000;
+                break;
+            case 0x07:  // Energy reset
+                Serial.println("[CMD] Resetting energy accumulation register...");
+                if (pzem.resetEnergy()) {
+                    Serial.println("[CMD] PZEM Energy reset successfully completed");
+                    pzemHealthy = true;
+                    sendPzemPacket(0x20);
+                } else {
+                    Serial.println("[ERROR] PZEM Energy reset operation failed");
+                    pzemHealthy = false;
+                }
+                break;
         }
     }
 }
@@ -242,7 +222,7 @@ void loop() {
 
     if (millis() - lastTelemetrySentTime >= TELEMETRY_INTERVAL_MS) {
         lastTelemetrySentTime = millis();
-        readPzemAndSend("data");
+        sendPzemPacket(0x20);
     }
 
     if (rebootRequested && (millis() >= rebootTime)) {
