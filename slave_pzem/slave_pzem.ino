@@ -40,6 +40,7 @@ struct RxMessageBuffer {
     volatile bool pending;
 };
 RxMessageBuffer rxBuffer = { {}, 0, false };
+portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Communication & Device Health States
 bool espNowInitialized = false;
@@ -98,9 +99,11 @@ void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 
     if (memcmp(senderMac, masterMAC, 6) == 0) {
         if (len <= sizeof(rxBuffer.data)) {
+            portENTER_CRITICAL_ISR(&rxMux);
             memcpy((void*)rxBuffer.data, data, len);
             rxBuffer.len = len;
             rxBuffer.pending = true;
+            portEXIT_CRITICAL_ISR(&rxMux);
         }
     }
 }
@@ -139,17 +142,27 @@ void sendPzemPacket(uint8_t pktType) {
 
 // Process incoming packages in loop context
 void handleIncomingPackets() {
-    if (!rxBuffer.pending) return;
+    portENTER_CRITICAL(&rxMux);
+    if (!rxBuffer.pending) {
+        portEXIT_CRITICAL(&rxMux);
+        return;
+    }
     
     rxBuffer.pending = false;
+    int len = rxBuffer.len;
+    uint8_t cmdType = 0;
+    if (len >= 1) {
+        cmdType = ((CmdPacket*)rxBuffer.data)->type;
+    }
+    portEXIT_CRITICAL(&rxMux);
+    
     lastMasterContactTime = millis();
     firstContactMade = true;
 
-    if (rxBuffer.len >= 1) {
-        CmdPacket* cmd = (CmdPacket*)rxBuffer.data;
+    if (len >= 1) {
         yellowActiveUntilTime = millis() + YELLOW_BLINK_DURATION_MS;
         
-        switch (cmd->type) {
+        switch (cmdType) {
             case 0x01:  // ACK ping
                 Serial.println("[RX] ACK ping received from Master");
                 sendPzemPacket(0x21);

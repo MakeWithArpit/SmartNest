@@ -41,12 +41,16 @@ volatile bool messageReceived = false;
 uint8_t receiveBuffer[250];
 int receiveLength = 0;
 uint32_t lastAcknowledgementTime = 0;
+portMUX_TYPE receiveMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ESP-NOW Receive Callback
 void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-    memcpy(receiveBuffer, data, len);
-    receiveLength = len;
+    portENTER_CRITICAL_ISR(&receiveMux);
+    int copyLen = len > 250 ? 250 : len;
+    memcpy(receiveBuffer, data, copyLen);
+    receiveLength = copyLen;
     messageReceived = true;
+    portEXIT_CRITICAL_ISR(&receiveMux);
 }
 
 // Relay Control
@@ -226,7 +230,7 @@ void setup() {
     pinMode(BLUE_LED_PIN, OUTPUT);
     
     pinMode(RELAY_PIN, OUTPUT);
-    digitalWrite(RELAY_PIN, HIGH); // Start with Relay OFF (Active LOW)
+    digitalWrite(RELAY_PIN, LOW); // Start with Relay OFF (Active HIGH)
     
     pinMode(MANUAL_SWITCH_PIN, INPUT_PULLUP);
     pinMode(CURRENT_SENSOR_PIN, INPUT);
@@ -271,11 +275,17 @@ void setup() {
 // Loop
 void loop() {
     if (messageReceived) {
+        portENTER_CRITICAL(&receiveMux);
         messageReceived = false;
+        int len = receiveLength;
+        uint8_t cmdType = 0;
+        if (len >= 1) {
+            cmdType = ((CmdPacket*)receiveBuffer)->type;
+        }
+        portEXIT_CRITICAL(&receiveMux);
         
-        if (receiveLength >= 1) {
-            CmdPacket* cmd = (CmdPacket*)receiveBuffer;
-            switch (cmd->type) {
+        if (len >= 1) {
+            switch (cmdType) {
                 case 0x01:  // ACK ping
                     lastAcknowledgementTime = millis();
                     sendAckReply();

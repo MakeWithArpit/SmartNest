@@ -582,30 +582,76 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Republish changed retained state
   if (t.startsWith(MQTT_BASE_TOPIC "/relay/")) {
     int idx = getRelayIndexFromTopic(t);
-    if (idx >= 0 && idx < NUM_RELAYS) {
-      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/state").c_str(),
-                         getRelayState(idx) ? "true" : "false", true);
-      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/locked").c_str(),
-                         sysState.lockedStates[idx] ? "true" : "false", true);
-    } else if (idx == 6) {
-      mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", sysState.digitalRelayState ? "true" : "false", true);
-      mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", sysState.digitalRelayLocked ? "true" : "false", true);
+    bool stateVal = false;
+    bool lockedVal = false;
+    bool gotMutex = false;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      if (idx >= 0 && idx < NUM_RELAYS) {
+        stateVal = sysState.relayStates[idx];
+        lockedVal = sysState.lockedStates[idx];
+      } else if (idx == 6) {
+        stateVal = sysState.digitalRelayState;
+        lockedVal = sysState.digitalRelayLocked;
+      }
+      gotMutex = true;
+      xSemaphoreGive(stateMutex);
+    }
+    if (gotMutex) {
+      if (idx >= 0 && idx < NUM_RELAYS) {
+        mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/state").c_str(),
+                           stateVal ? "true" : "false", true);
+        mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(idx) + "/locked").c_str(),
+                           lockedVal ? "true" : "false", true);
+      } else if (idx == 6) {
+        mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", stateVal ? "true" : "false", true);
+        mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", lockedVal ? "true" : "false", true);
+      }
     }
   } else if (t == MQTT_BASE_TOPIC "/cmd/shutdown") {
-    mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", sysState.masterShutdown ? "true" : "false", true);
+    bool shutdownVal = false;
+    bool gotMutex = false;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      shutdownVal = sysState.masterShutdown;
+      gotMutex = true;
+      xSemaphoreGive(stateMutex);
+    }
+    if (gotMutex) {
+      mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", shutdownVal ? "true" : "false", true);
+    }
   }
 }
 
 void publishAllRetainedStates() {
-  for (int i = 0; i < NUM_RELAYS; i++) {
-    mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/state").c_str(),
-                       getRelayState(i) ? "true" : "false", true);
-    mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/locked").c_str(),
-                       sysState.lockedStates[i] ? "true" : "false", true);
+  bool localRelays[NUM_RELAYS];
+  bool localLocks[NUM_RELAYS];
+  bool localDigitalRelay = false;
+  bool localDigitalLocked = false;
+  bool localShutdown = false;
+  bool gotMutex = false;
+  
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      localRelays[i] = sysState.relayStates[i];
+      localLocks[i] = sysState.lockedStates[i];
+    }
+    localDigitalRelay = sysState.digitalRelayState;
+    localDigitalLocked = sysState.digitalRelayLocked;
+    localShutdown = sysState.masterShutdown;
+    gotMutex = true;
+    xSemaphoreGive(stateMutex);
   }
-  mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", sysState.digitalRelayState ? "true" : "false", true);
-  mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", sysState.digitalRelayLocked ? "true" : "false", true);
-  mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", sysState.masterShutdown ? "true" : "false", true);
+  
+  if (gotMutex) {
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/state").c_str(),
+                         localRelays[i] ? "true" : "false", true);
+      mqttClient.publish((MQTT_BASE_TOPIC "/relay/" + String(i) + "/locked").c_str(),
+                         localLocks[i] ? "true" : "false", true);
+    }
+    mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/state", localDigitalRelay ? "true" : "false", true);
+    mqttClient.publish(MQTT_BASE_TOPIC "/relay/6/locked", localDigitalLocked ? "true" : "false", true);
+    mqttClient.publish(MQTT_BASE_TOPIC "/shutdown", localShutdown ? "true" : "false", true);
+  }
 }
 
 void publishTelemetry() {
@@ -922,24 +968,18 @@ void dashboardInit() {
     [](AsyncWebServerRequest *req) {},
     NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
-      String body = String((char *)data).substring(0, len);
-      int relayPos = body.indexOf("\"relay\":");
-      int statePos = body.indexOf("\"state\":");
-
-      if (relayPos < 0 || statePos < 0) {
-        req->send(400, "application/json", "{\"error\":\"Invalid request\"}");
+      StaticJsonDocument<128> doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) {
+        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
       }
-
-      int valStart = relayPos + 8;
-      int valEnd = body.indexOf(",", valStart);
-      if (valEnd < 0) valEnd = body.indexOf("}", valStart);
-      int relayIdx = body.substring(valStart, valEnd).toInt();
-
-      int stStart = statePos + 8;
-      String stStr = body.substring(stStart, stStart + 5);
-      stStr.trim();
-      bool state = stStr.startsWith("true");
+      if (!doc.containsKey("relay") || !doc.containsKey("state")) {
+        req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
+        return;
+      }
+      int relayIdx = doc["relay"];
+      bool state = doc["state"];
 
       if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
         setRelayState(relayIdx, state);
@@ -960,24 +1000,18 @@ void dashboardInit() {
     [](AsyncWebServerRequest *req) {},
     NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
-      String body = String((char *)data).substring(0, len);
-      int relayPos = body.indexOf("\"relay\":");
-      int statePos = body.indexOf("\"state\":");
-
-      if (relayPos < 0 || statePos < 0) {
-        req->send(400, "application/json", "{\"error\":\"Invalid request\"}");
+      StaticJsonDocument<128> doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) {
+        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
       }
-
-      int valStart = relayPos + 8;
-      int valEnd = body.indexOf(",", valStart);
-      if (valEnd < 0) valEnd = body.indexOf("}", valStart);
-      int relayIdx = body.substring(valStart, valEnd).toInt();
-
-      int stStart = statePos + 8;
-      String stStr = body.substring(stStart, stStart + 5);
-      stStr.trim();
-      bool state = stStr.startsWith("true");
+      if (!doc.containsKey("relay") || !doc.containsKey("state")) {
+        req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
+        return;
+      }
+      int relayIdx = doc["relay"];
+      bool state = doc["state"];
 
       if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1002,18 +1036,17 @@ void dashboardInit() {
     [](AsyncWebServerRequest *req) {},
     NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
-      String body = String((char *)data).substring(0, len);
-      int statePos = body.indexOf("\"state\":");
-
-      if (statePos < 0) {
-        req->send(400, "application/json", "{\"error\":\"Invalid request\"}");
+      StaticJsonDocument<128> doc;
+      DeserializationError err = deserializeJson(doc, data, len);
+      if (err) {
+        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
       }
-
-      int stStart = statePos + 8;
-      String stStr = body.substring(stStart, stStart + 5);
-      stStr.trim();
-      bool state = stStr.startsWith("true");
+      if (!doc.containsKey("state")) {
+        req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
+        return;
+      }
+      bool state = doc["state"];
 
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         sysState.masterShutdown = state;
@@ -1030,9 +1063,8 @@ void dashboardInit() {
     [](AsyncWebServerRequest *req) {},
     NULL,
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index, size_t total) {
-      String body = String((char *)data).substring(0, len);
       StaticJsonDocument<256> doc;
-      DeserializationError err = deserializeJson(doc, body);
+      DeserializationError err = deserializeJson(doc, data, len);
       if (err) {
         req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
         return;
