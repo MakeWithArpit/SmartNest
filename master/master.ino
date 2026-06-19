@@ -2,6 +2,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
+#include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <freertos/FreeRTOS.h>
@@ -81,6 +82,8 @@ struct SystemData {
     float internetAcsCurrentA; // Combined current
     bool  cloudOnline;
     bool  masterLock;          // Global lock — all relays OFF, ignores commands
+    bool  desiredDigitalRelay;
+    bool  desiredDigitalLocked;
     // SD log access flags (set by uartTask on Core 0, consumed by sdLoggingTask on Core 1)
     bool  filesRequest;
     bool  readRequest;
@@ -92,6 +95,8 @@ struct SystemData {
 
 SemaphoreHandle_t g_stateMutex = NULL;
 SystemData        g_systemState;
+Preferences       g_controlPrefs;
+volatile bool     g_applyDigitalControl = false;
 
 // Queue definitions
 struct EspNowPacket {
@@ -129,6 +134,120 @@ SemaphoreHandle_t g_histAckSem = NULL;
 struct __attribute__((packed)) CmdPacket {
     uint8_t type;
 };
+
+void sendDigitalCommand(uint8_t type) {
+    CmdPacket cp;
+    cp.type = type;
+    esp_now_send(SLAVE1_MAC, (uint8_t*)&cp, sizeof(cp));
+}
+
+void loadControlState() {
+    g_controlPrefs.begin("ctrl_state", false);
+
+    bool masterLock = g_controlPrefs.getBool("masterLock", false);
+    bool relay = g_controlPrefs.getBool("dRelay", false);
+    bool locked = g_controlPrefs.getBool("dLocked", false);
+
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_systemState.masterLock = masterLock;
+        g_systemState.desiredDigitalRelay = relay;
+        g_systemState.desiredDigitalLocked = locked;
+        g_systemState.digital.locked = locked || masterLock;
+        xSemaphoreGive(g_stateMutex);
+    }
+
+    Serial.printf("[Master] Loaded control state: masterLock=%s relay7=%s lock7=%s\n",
+                  masterLock ? "ON" : "OFF", relay ? "ON" : "OFF",
+                  locked ? "ON" : "OFF");
+}
+
+bool saveControlState() {
+    bool masterLock = false;
+    bool relay = false;
+    bool locked = false;
+
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+
+    masterLock = g_systemState.masterLock;
+    relay = g_systemState.desiredDigitalRelay;
+    locked = g_systemState.desiredDigitalLocked;
+    xSemaphoreGive(g_stateMutex);
+
+    g_controlPrefs.putBool("masterLock", masterLock);
+    g_controlPrefs.putBool("dRelay", relay);
+    g_controlPrefs.putBool("dLocked", locked);
+    return true;
+}
+
+void applyDigitalControlState() {
+    bool masterLock = false;
+    bool relay = false;
+    bool locked = false;
+
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    masterLock = g_systemState.masterLock;
+    relay = g_systemState.desiredDigitalRelay;
+    locked = g_systemState.desiredDigitalLocked;
+    xSemaphoreGive(g_stateMutex);
+
+    if (masterLock || locked) {
+        sendDigitalCommand(0x04);
+    } else {
+        sendDigitalCommand(0x05);
+        vTaskDelay(pdMS_TO_TICKS(30));
+        sendDigitalCommand(relay ? 0x02 : 0x03);
+    }
+
+    Serial.printf("[Master] Applied control state: masterLock=%s relay7=%s lock7=%s\n",
+                  masterLock ? "ON" : "OFF", relay ? "ON" : "OFF",
+                  locked ? "ON" : "OFF");
+}
+
+void setDesiredDigitalRelay(bool relay) {
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_systemState.desiredDigitalRelay = relay;
+        xSemaphoreGive(g_stateMutex);
+    }
+
+    if (saveControlState()) {
+        applyDigitalControlState();
+    } else {
+        Serial.println("[Master] Failed to persist relay 7 state; command not applied");
+    }
+}
+
+void setDesiredDigitalLock(bool locked) {
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_systemState.desiredDigitalLocked = locked;
+        g_systemState.digital.locked = g_systemState.masterLock || locked;
+        xSemaphoreGive(g_stateMutex);
+    }
+
+    if (saveControlState()) {
+        applyDigitalControlState();
+    } else {
+        Serial.println("[Master] Failed to persist relay 7 lock; command not applied");
+    }
+}
+
+void setDesiredMasterLock(bool locked) {
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_systemState.masterLock = locked;
+        g_systemState.digital.locked = locked || g_systemState.desiredDigitalLocked;
+        xSemaphoreGive(g_stateMutex);
+    }
+
+    if (saveControlState()) {
+        applyDigitalControlState();
+    } else {
+        Serial.println("[Master] Failed to persist master lock; command not applied");
+    }
+}
 
 struct __attribute__((packed)) DigitalSlavePacket {
     uint8_t type;
@@ -266,6 +385,7 @@ void espNowTask(void* pvParameters) {
                                 char buf[64];
                                 snprintf(buf, sizeof(buf), "{\"t\":\"on\",\"dev\":\"d1\"}");
                                 enqueueUartTx(buf);
+                                g_applyDigitalControl = true;
                             }
                         }
                     }
@@ -295,6 +415,11 @@ void espNowTask(void* pvParameters) {
                     }
                 }
             }
+        }
+
+        if (g_applyDigitalControl) {
+            g_applyDigitalControl = false;
+            applyDigitalControlState();
         }
     }
 }
@@ -347,24 +472,22 @@ void uartTask(void* pvParameters) {
                         bool isPzem = (strcmp(tgt, "pzem") == 0);
                         
                         if (isD1) {
-                            targetMac = SLAVE1_MAC;
-                            if (strcmp(cmd, "relay_on") == 0) typeVal = 0x02;
-                            else if (strcmp(cmd, "relay_off") == 0) typeVal = 0x03;
+                            if (strcmp(cmd, "relay_on") == 0) {
+                                setDesiredDigitalRelay(true);
+                            }
+                            else if (strcmp(cmd, "relay_off") == 0) {
+                                setDesiredDigitalRelay(false);
+                            }
                             else if (strcmp(cmd, "relay_lock") == 0) {
-                                typeVal = 0x04;
-                                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                    g_systemState.digital.locked = true;
-                                    xSemaphoreGive(g_stateMutex);
-                                }
+                                setDesiredDigitalLock(true);
                             }
                             else if (strcmp(cmd, "relay_unlock") == 0) {
-                                typeVal = 0x05;
-                                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                    g_systemState.digital.locked = false;
-                                    xSemaphoreGive(g_stateMutex);
-                                }
+                                setDesiredDigitalLock(false);
                             }
-                            else if (strcmp(cmd, "reboot") == 0) typeVal = 0x06;
+                            else if (strcmp(cmd, "reboot") == 0) {
+                                targetMac = SLAVE1_MAC;
+                                typeVal = 0x06;
+                            }
                         } else if (isPzem) {
                             targetMac = SLAVE2_MAC;
                             if (strcmp(cmd, "reboot") == 0) typeVal = 0x06;
@@ -445,19 +568,10 @@ void uartTask(void* pvParameters) {
                 else if (pLock) {
                     char* valPtr = strstr(rxLine, "\"val\":");
                     if (valPtr) {
-                        bool lockVal = (strncmp(valPtr + 5, "true", 4) == 0);
+                        bool lockVal = (strncmp(valPtr + 6, "true", 4) == 0);
                         Serial.printf("[LOCK] Lock command received from SmartNest: %s\n", lockVal ? "ON" : "OFF");
-                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            g_systemState.masterLock = lockVal;
-                            xSemaphoreGive(g_stateMutex);
-                        }
+                        setDesiredMasterLock(lockVal);
                         Serial.printf("[LOCK] g_systemState.masterLock stored: %s\n", lockVal ? "ON" : "OFF");
-                        
-                        // Forward lock/unlock to Digital Board slave via ESP-NOW
-                        CmdPacket cp;
-                        cp.type = lockVal ? 0x04 : 0x05;
-                        esp_now_send(SLAVE1_MAC, (uint8_t*)&cp, sizeof(cp));
-                        Serial.println("[LOCK] Digital Board lock command forwarded");
                         
                         // Send lock_ack back to SmartNest
                         char ackBuf[64];
@@ -1256,6 +1370,7 @@ void setup() {
     
     // Initialize system state
     memset(&g_systemState, 0, sizeof(g_systemState));
+    loadControlState();
     
     // WiFi Station mode before ESP-NOW to prevent boot looping
     WiFi.mode(WIFI_STA);
@@ -1288,6 +1403,7 @@ void setup() {
     if (esp_now_add_peer(&peer2) != ESP_OK) {
         Serial.println("[ERROR] Failed to add PZEM Board peer");
     }
+    g_applyDigitalControl = true;
     
     // Launch FreeRTOS Tasks
     // Core 0
@@ -1306,3 +1422,5 @@ void setup() {
 void loop() {
     vTaskDelay(portMAX_DELAY);
 }
+
+

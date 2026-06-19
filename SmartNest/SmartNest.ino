@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <AsyncWebSocket.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
@@ -13,7 +12,6 @@
 #include <freertos/semphr.h>
 
 #define NUM_RELAYS 6
-#define FIRMWARE_VERSION "1.0.0"
 
 #define RELAY_1_PIN 2
 #define RELAY_2_PIN 4
@@ -23,7 +21,6 @@
 #define RELAY_6_PIN 15
 
 #define ACS712_PIN 34
-#define ACS712_SENSITIVITY 0.066f
 #define ACS712_DIVIDER_RATIO 1.5f
 static float acs712ZeroMv = 2500.0f;
 
@@ -42,7 +39,6 @@ static float acs712ZeroMv = 2500.0f;
 #define NVS_PASS_KEY "wifi_pass"
 #define NVS_PROV_KEY "provisioned"
 
-// MQTT Configuration
 #define MQTT_ENABLED true
 #define MQTT_BROKER_HOST "broker.hivemq.com"
 #define MQTT_BROKER_PORT 1883
@@ -139,51 +135,38 @@ void resetMqttConfigToDefault() {
   Serial.println("[MQTT] Configuration reset to defaults");
 }
 
-struct RelayEvent {
-  int index;
-  bool state;
-  unsigned long timestamp;
-};
-
 struct SystemState {
-  // Direct GPIO Relays (0-5)
   bool relayStates[NUM_RELAYS];
-  bool dashboardStates[NUM_RELAYS];
+  bool requestedRelayStates[NUM_RELAYS];
   bool masterShutdown;
   bool lockedStates[NUM_RELAYS];
   bool wifiConnected;
   int wifiRSSI;
   char wifiSSID[33];
   unsigned long lastChangeMs;
-  float currentAmps; // Internet Board's own combined ACS712 current
+  float currentAmps;
 
-  // Telemetry from Master via UART
-  float acsCurrentA;       // Digital Slave's ACS712 current
-  float pzemVoltage;       // PZEM voltage (V)
-  float pzemCurrentA;      // PZEM current (A)
-  float pzemPowerW;        // PZEM apparent power (W)
-  double energyDailyWh;    // Daily energy (Wh)
-  double energyMonthlyWh;  // Monthly energy (Wh)
-  double energyLifetimeWh; // Lifetime energy (Wh)
+  float acsCurrentA;
+  float pzemVoltage;
+  float pzemCurrentA;
+  float pzemPowerW;
+  double energyDailyWh;
+  double energyMonthlyWh;
+  double energyLifetimeWh;
   bool digitalSlaveOnline;
   bool pzemSlaveOnline;
   int digitalSlaveRSSI;
   int pzemSlaveRSSI;
 
-  // 7th Relay (Digital Board Slave)
   bool digitalRelayState;
   bool digitalRelayLocked;
   bool digitalSwitchState;
-
-  // Master Lock (global system lock)
   bool masterLock;
 
-  // SD Card stats from Master
   bool sdOk;
   uint64_t sdTotal;
   uint64_t sdUsed;
 
-  // New fields
   bool pzemSensorHealthy;
   int mqttStatus;
 };
@@ -191,10 +174,6 @@ struct SystemState {
 const int RELAY_PINS[NUM_RELAYS] = {RELAY_1_PIN, RELAY_2_PIN, RELAY_3_PIN,
                                     RELAY_4_PIN, RELAY_5_PIN, RELAY_6_PIN};
 
-const char *const RELAY_NAMES[NUM_RELAYS] = {
-    "Light 1", "Light 2", "Light 3", "Light 4", "Light 5", "Power Socket"};
-
-QueueHandle_t relayEventQueue = NULL;
 SemaphoreHandle_t stateMutex = NULL;
 SystemState sysState;
 String wifiPassword = "";
@@ -202,7 +181,6 @@ volatile bool isProvisioningMode = false;
 volatile bool pendingMasterLockSync = false;
 volatile unsigned long pendingMasterLockSyncTime = 0;
 
-// UART command items queue
 struct UartCmdItem {
   char text[256];
 };
@@ -216,17 +194,12 @@ static TaskHandle_t hResetButton = NULL;
 static TaskHandle_t hNtpSync = NULL;
 static TaskHandle_t hMqttTask = NULL;
 
-// WebSocket
-AsyncWebSocket ws("/ws");
-
-// MQTT objects
 #if MQTT_ENABLED
 WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
 #endif
 
 void setRelayState(int index, bool state);
-bool getRelayState(int index);
 void toggleRelay(int index);
 void updateRelayHardware();
 void relaySwitchInit();
@@ -235,8 +208,8 @@ bool wifiManagerInit();
 void wifiManagerLoop();
 void resetWiFiCredentials();
 void uartCommInit();
-void dashboardInit();
-void pushWsUpdate();
+void serialCommandInit();
+void serialCommandLoop();
 void setShutdownState(bool state);
 
 void relaySwitchTask(void *pvParameters);
@@ -259,13 +232,13 @@ void enqueueUartCmd(const String &cmd) {
 void relaySwitchInit() {
   for (int i = 0; i < NUM_RELAYS; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
-    digitalWrite(RELAY_PINS[i], HIGH); // Starts OFF (Active LOW)
+    digitalWrite(RELAY_PINS[i], HIGH);
   }
 
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
     for (int i = 0; i < NUM_RELAYS; i++) {
       sysState.relayStates[i] = false;
-      sysState.dashboardStates[i] = false;
+      sysState.requestedRelayStates[i] = false;
       sysState.lockedStates[i] = false;
     }
     sysState.masterShutdown = false;
@@ -285,7 +258,7 @@ void setRelayState(int index, bool state) {
                     "or shutdown\n",
                     index);
     } else {
-      sysState.dashboardStates[index] = state;
+      sysState.requestedRelayStates[index] = state;
     }
     xSemaphoreGive(stateMutex);
   }
@@ -301,79 +274,50 @@ void setShutdownState(bool state) {
   updateRelayHardware();
   if (state) {
     enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
-    Serial.println("[SmartNest] Shutdown ON — sending relay_off command to Digital Board");
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_lock\"}");
+    Serial.println("[SmartNest] Shutdown ON - local relays OFF, relay 7 OFF and locked");
+  } else {
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_unlock\"}");
+    Serial.println("[SmartNest] Shutdown OFF - relay 7 unlocked");
   }
-  pushWsUpdate();
 }
-
-bool getRelayState(int index) {
-  if (index < 0 || index >= NUM_RELAYS)
-    return false;
-
-  bool s = false;
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    s = sysState.relayStates[index];
-    xSemaphoreGive(stateMutex);
-  }
-  return s;
-}
-
 void toggleRelay(int index) {
   bool currentCmd = false;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-    currentCmd = sysState.dashboardStates[index];
+    currentCmd = sysState.requestedRelayStates[index];
     xSemaphoreGive(stateMutex);
   }
   setRelayState(index, !currentCmd);
 }
 
 void updateRelayHardware() {
-  bool stateChanged = false;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     for (int i = 0; i < NUM_RELAYS; i++) {
-      bool D = sysState.dashboardStates[i];
-      bool R = false;
+      bool requested = sysState.requestedRelayStates[i];
+      bool actual = requested;
 
       if (sysState.masterShutdown || sysState.masterLock ||
           sysState.lockedStates[i]) {
-        R = false;
-      } else {
-        R = D;
+        actual = false;
       }
 
-      if (sysState.relayStates[i] != R) {
-        sysState.relayStates[i] = R;
-        digitalWrite(RELAY_PINS[i], R ? LOW : HIGH); // LOW = ON, HIGH = OFF
-        Serial.printf("[TIMING] SmartNest local relay GPIO written at: %lu\n",
-                      millis());
+      if (sysState.relayStates[i] != actual) {
+        sysState.relayStates[i] = actual;
+        digitalWrite(RELAY_PINS[i], actual ? LOW : HIGH);
+        Serial.printf("[SmartNest] Relay %d set %s\n", i + 1,
+                      actual ? "ON" : "OFF");
         sysState.lastChangeMs = millis();
-        stateChanged = true;
 
-        RelayEvent evt;
-        evt.index = i;
-        evt.state = R;
-        evt.timestamp = millis();
-        xQueueSend(relayEventQueue, &evt, 0);
       }
     }
     xSemaphoreGive(stateMutex);
   }
-  
-  if (stateChanged) {
-    pushWsUpdate();
-  }
 }
-
 void relaySwitchTask(void *pvParameters) {
   relaySwitchInit();
   updateRelayHardware();
-  Serial.println("[SmartNest] Relay hardware initialized. Task suspending "
-                 "(event-driven mode).");
-  // No polling loop — relay changes are applied immediately via
-  // setRelayState()/updateRelayHardware() from HTTP API handlers, MQTT
-  // callbacks, and UART telemetry processing.
-  vTaskSuspend(
-      NULL); // Suspend forever; task handle kept for potential future use
+  Serial.println("[SmartNest] Relay hardware initialized.");
+  vTaskSuspend(NULL);
 }
 
 void currentSensorInit() {
@@ -398,7 +342,6 @@ void currentSensorTask(void *pvParameters) {
 
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t lastProcessTime = millis();
-  uint32_t lastWsPushTime = 0;
   
   static float lastSentAmps = 0.0f;
   static uint32_t lastSentTime = 0;
@@ -408,7 +351,6 @@ void currentSensorTask(void *pvParameters) {
   static uint32_t sampleCount = 0;
 
   while (true) {
-    // Check if any local relays are ON and check for changes
     bool anyRelayOn = false;
     bool relayStateChanged = false;
     if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -425,7 +367,6 @@ void currentSensorTask(void *pvParameters) {
     }
 
     if (!anyRelayOn) {
-      // Force current to 0.00A and clear accumulators
       float oldAmps = 0.0f;
       bool changed = false;
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -438,23 +379,18 @@ void currentSensorTask(void *pvParameters) {
       sampleCount = 0;
 
       if (changed || relayStateChanged) {
-        pushWsUpdate();
-        
-        // Immediately send 0.00A to Master
         uint32_t now = millis();
         lastSentTime = now;
         lastSentAmps = 0.0f;
         enqueueUartCmd("{\"t\":\"acs\",\"i\":0.00}");
       }
-      // Sleep a bit longer when idle
       vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
       continue;
     }
 
-    // 1 kHz non-blocking sample
     float milliVolts = analogReadMilliVolts(ACS712_PIN);
     float deltaMv = (milliVolts - acs712ZeroMv) * ACS712_DIVIDER_RATIO;
-    float instCurrent = deltaMv / 66.0f; // 66 mV/A sensitivity
+    float instCurrent = deltaMv / 66.0f;
 
     sqSum += (double)(instCurrent * instCurrent);
     sampleCount++;
@@ -466,7 +402,7 @@ void currentSensorTask(void *pvParameters) {
         float meanSquare = (float)(sqSum / (double)sampleCount);
         float rmsCurrent = sqrtf(meanSquare);
         float finalAmps = 0.0f;
-        if (rmsCurrent >= 0.15f) { // 0.15A deadband filter
+        if (rmsCurrent >= 0.15f) {
           finalAmps = rmsCurrent;
         }
 
@@ -481,13 +417,6 @@ void currentSensorTask(void *pvParameters) {
         sqSum = 0.0;
         sampleCount = 0;
 
-        // Push WebSocket update if changed significantly or at 1s interval
-        if (changedSignificantly || (now - lastWsPushTime >= 1000)) {
-          lastWsPushTime = now;
-          pushWsUpdate();
-        }
-
-        // Send immediately to Master if force conditions met, or if changed significantly and rate-limited
         bool forceSend = relayStateChanged || 
                          (lastSentAmps == 0.0f && finalAmps > 0.0f) || 
                          (lastSentAmps > 0.0f && finalAmps == 0.0f);
@@ -746,16 +675,6 @@ void resetButtonTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
-
-// WebSocket publisher helper
-void pushWsUpdate() {
-  if (ws.count() == 0)
-    return;
-  String payload = buildStatusJSON();
-  ws.textAll(payload);
-}
-
-// MQTT Callback and publishing helpers
 #if MQTT_ENABLED
 int getRelayIndexFromTopic(const String &topic) {
   String prefix = String(g_mqttConfig.baseTopic) + "/relay/";
@@ -776,8 +695,6 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
   String base = String(g_mqttConfig.baseTopic);
   String relayPrefix = base + "/relay/";
-
-  // Relay set: {baseTopic}/relay/N/set
   if (t.startsWith(relayPrefix) && t.endsWith("/set")) {
     int idx = getRelayIndexFromTopic(t);
     if (idx >= 0 && idx < NUM_RELAYS) {
@@ -787,7 +704,6 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
                      (p == "true" ? "relay_on" : "relay_off") + "\"}");
     }
   }
-  // Relay lock: {baseTopic}/relay/N/lock
   else if (t.startsWith(relayPrefix) && t.endsWith("/lock")) {
     int idx = getRelayIndexFromTopic(t);
     if (idx >= 0 && idx < NUM_RELAYS) {
@@ -801,20 +717,18 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
                      (p == "true" ? "relay_lock" : "relay_unlock") + "\"}");
     }
   }
-  // Master shutdown
   else if (t == base + "/cmd/shutdown") {
     setShutdownState(p == "true");
   }
-  // Slave commands
   else if (t == base + "/cmd/slave/d1") {
-    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + p + "\"}");
+    if (p == "reboot") {
+      enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"reboot\"}");
+    }
   } else if (t == base + "/cmd/slave/pzem") {
-    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"" + p + "\"}");
+    if (p == "reboot" || p == "energy_reset") {
+      enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"" + p + "\"}");
+    }
   }
-
-  pushWsUpdate();
-
-  // Republish changed retained state
   if (t.startsWith(relayPrefix)) {
     int idx = getRelayIndexFromTopic(t);
     bool stateVal = false;
@@ -925,8 +839,6 @@ void publishTelemetry() {
 
     mqttClient.publish((base + "/switch/6/state").c_str(),
                        sysState.digitalSwitchState ? "true" : "false", false);
-
-    // Heartbeat payload
     String heartbeat = "{\"uptime\":" + String(millis()) + ",\"ssid\":\"" +
                        String(sysState.wifiSSID) +
                        "\",\"rssi\":" + String(sysState.wifiRSSI) + "}";
@@ -946,10 +858,9 @@ void mqttTask(void *pvParameters) {
   bool wasMqttConnected = false;
 
   while (true) {
-    // Detect dynamic config changes and re-initialize
     if (g_mqttConfigChanged) {
       g_mqttConfigChanged = false;
-      Serial.println("[MQTT] Config changed — disconnecting for re-init");
+      Serial.println("[MQTT] Config changed - disconnecting for re-init");
       if (mqttClient.connected()) {
         mqttClient.disconnect();
       }
@@ -958,17 +869,14 @@ void mqttTask(void *pvParameters) {
       wasMqttConnected = false;
       lastReconnectAttempt = 0;
     }
-
-    // Skip MQTT processing if disabled
     if (!g_mqttConfig.enabled) {
       if (wasMqttConnected) {
         mqttClient.disconnect();
         enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
         wasMqttConnected = false;
       }
-      // Update MQTT status
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        sysState.mqttStatus = 0; // 0 = Disabled
+        sysState.mqttStatus = 0;
         xSemaphoreGive(stateMutex);
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
@@ -981,9 +889,8 @@ void mqttTask(void *pvParameters) {
           enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
           wasMqttConnected = false;
         }
-        // Update MQTT status
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          sysState.mqttStatus = 1; // 1 = Connecting
+          sysState.mqttStatus = 1;
           xSemaphoreGive(stateMutex);
         }
         if (millis() - lastReconnectAttempt > 5000) {
@@ -1009,15 +916,13 @@ void mqttTask(void *pvParameters) {
             Serial.printf("[MQTT] Connected to %s:%d (topic: %s)\n",
                           g_mqttConfig.broker, g_mqttConfig.port,
                           g_mqttConfig.baseTopic);
-            // Update MQTT status
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-              sysState.mqttStatus = 2; // 2 = Connected
+              sysState.mqttStatus = 2;
               xSemaphoreGive(stateMutex);
             }
           } else {
-            // Update MQTT status
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-              sysState.mqttStatus = 3; // 3 = Error
+              sysState.mqttStatus = 3;
               xSemaphoreGive(stateMutex);
             }
           }
@@ -1034,8 +939,6 @@ void mqttTask(void *pvParameters) {
   }
 }
 #endif
-
-// UART COMM TASK (Internet ESP32 Side)
 void uartCommInit() {
   Serial2.begin(UART2_BAUD, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
 }
@@ -1051,8 +954,6 @@ void uartCommTask(void *pvParameters) {
       Serial.println("[LOCK] pendingMasterLockSync timed out. Resetting flag.");
       pendingMasterLockSync = false;
     }
-
-    // TX: Send pending slave command or combined current telemetry
     UartCmdItem txItem;
     if (xQueueReceive(UartCmdQueue, &txItem, 0) == pdTRUE) {
       Serial2.println(txItem.text);
@@ -1069,14 +970,11 @@ void uartCommTask(void *pvParameters) {
       String acsMsg = "{\"t\":\"acs\",\"i\":" + String(ampsVal, 2) + "}";
       Serial2.println(acsMsg);
     }
-
-    // RX: Read incoming serial line from Master
     while (Serial2.available() > 0) {
       char c = Serial2.read();
       if (c == '\n') {
         rxBuffer.trim();
         if (rxBuffer.length() > 0) {
-          // Parse JSON
           StaticJsonDocument<1024> doc;
           DeserializationError err = deserializeJson(doc, rxBuffer);
           if (!err) {
@@ -1097,8 +995,6 @@ void uartCommTask(void *pvParameters) {
                 sysState.digitalRelayState = doc["d_relay"];
                 sysState.digitalSwitchState = doc["d_sw"];
                 sysState.digitalRelayLocked = doc["d_lock"];
-
-                // Parse SD card stats + masterLock from Master
                 sysState.sdOk = doc["sd_ok"];
                 sysState.sdTotal = doc["sd_total"];
                 sysState.sdUsed = doc["sd_used"];
@@ -1119,19 +1015,15 @@ void uartCommTask(void *pvParameters) {
                 sysState.pzemSensorHealthy = doc["p_health"] | false;
                 xSemaphoreGive(stateMutex);
               }
-
-              // Non-spamming periodic 5s log prefix [SmartNest]
               static uint32_t lastTelLogTime = 0;
               if (millis() - lastTelLogTime >= 5000) {
                 lastTelLogTime = millis();
-                Serial.printf("[SmartNest] Telemetry update — V: %.1fV, Load: "
+                Serial.printf("[SmartNest] Telemetry update - V: %.1fV, Load: "
                               "%.2fA, SD: %s, MasterLock: %s\n",
                               sysState.pzemVoltage, sysState.currentAmps,
                               sysState.sdOk ? "OK" : "ERROR",
                               sysState.masterLock ? "LOCKED" : "UNLOCKED");
               }
-
-              pushWsUpdate();
 #if MQTT_ENABLED
               if (mqttClient.connected()) {
                 publishTelemetry();
@@ -1140,10 +1032,9 @@ void uartCommTask(void *pvParameters) {
             } else if (type == "sw") {
               int idx = doc["idx"];
               int s = doc["s"];
-              Serial.printf("[SmartNest][SW] Manual switch event received: idx=%d, state=%d, dashboard updated\n", idx, s);
+              Serial.printf("[SmartNest][SW] Manual switch event received: idx=%d, state=%d\n", idx, s);
               if (idx >= 0 && idx < NUM_RELAYS) {
                 setRelayState(idx, s == 1);
-                pushWsUpdate();
               }
             } else if (type == "lock_ack") {
               bool val = doc["val"];
@@ -1154,7 +1045,6 @@ void uartCommTask(void *pvParameters) {
                 xSemaphoreGive(stateMutex);
               }
               updateRelayHardware();
-              pushWsUpdate();
             } else if (type == "off") {
               String dev = doc["dev"];
               if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1164,7 +1054,6 @@ void uartCommTask(void *pvParameters) {
                   sysState.pzemSlaveOnline = false;
                 xSemaphoreGive(stateMutex);
               }
-              pushWsUpdate();
 #if MQTT_ENABLED
               if (mqttClient.connected()) {
                 mqttClient.publish(
@@ -1181,7 +1070,6 @@ void uartCommTask(void *pvParameters) {
                   sysState.pzemSlaveOnline = true;
                 xSemaphoreGive(stateMutex);
               }
-              pushWsUpdate();
 #if MQTT_ENABLED
               if (mqttClient.connected()) {
                 mqttClient.publish(
@@ -1231,10 +1119,7 @@ void uartCommTask(void *pvParameters) {
                     ",\"upto\":" + String(lastEpoch) + "}");
               }
             } else if (type == "files_res" || type == "read_res") {
-              Serial.printf("[SmartNest] Proxy-broadcasting %s WebSocket "
-                            "update (%d bytes)\n",
-                            type.c_str(), rxBuffer.length());
-              ws.textAll(rxBuffer);
+              Serial.println(rxBuffer);
             }
           }
         }
@@ -1249,12 +1134,10 @@ void uartCommTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
-
-// NTP Synchronizer Task
 void ntpSyncTask(void *pvParameters) {
   while (true) {
     if (WiFi.status() == WL_CONNECTED) {
-      configTime(19800, 0, "pool.ntp.org"); // IST (UTC + 5:30)
+      configTime(19800, 0, "pool.ntp.org");
       struct tm timeinfo;
       int retry = 0;
       bool success = false;
@@ -1273,13 +1156,9 @@ void ntpSyncTask(void *pvParameters) {
         enqueueUartCmd(msg);
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(300000)); // Every 5 minutes
+    vTaskDelay(pdMS_TO_TICKS(300000));
   }
 }
-
-static AsyncWebServer dashServer(80);
-
-#include "dashboard_html.h"
 
 String getFormattedTime() {
   time_t nowSecs;
@@ -1304,488 +1183,364 @@ static String buildStatusJSON() {
         json += ",";
       json += sysState.relayStates[i] ? "true" : "false";
     }
-    json += "],";
-    json += "\"locks\":[";
+    json += "],\"locks\":[";
     for (int i = 0; i < NUM_RELAYS; i++) {
       if (i > 0)
         json += ",";
       json += sysState.lockedStates[i] ? "true" : "false";
     }
     json += "],";
-    json +=
-        "\"shutdown\":" + String(sysState.masterShutdown ? "true" : "false") +
-        ",";
+    json += "\"shutdown\":" + String(sysState.masterShutdown ? "true" : "false") + ",";
     json += "\"current\":" + String(sysState.currentAmps, 2) + ",";
     json += "\"rssi\":" + String(sysState.wifiRSSI) + ",";
     json += "\"ssid\":\"" + String(sysState.wifiSSID) + "\",";
-
-    // masters / slaves data fields
     json += "\"acs\":" + String(sysState.acsCurrentA, 2) + ",";
     json += "\"load\":" + String(sysState.currentAmps, 2) + ",";
     json += "\"v\":" + String(sysState.pzemVoltage, 1) + ",";
     json += "\"pw\":" + String(sysState.pzemPowerW, 1) + ",";
     json += "\"daily\":" + String(sysState.energyDailyWh / 1000.0, 3) + ",";
     json += "\"monthly\":" + String(sysState.energyMonthlyWh / 1000.0, 3) + ",";
-    json +=
-        "\"lifetime\":" + String(sysState.energyLifetimeWh / 1000.0, 3) + ",";
-    json +=
-        "\"d_on\":" + String(sysState.digitalSlaveOnline ? "true" : "false") +
-        ",";
-    json +=
-        "\"p_on\":" + String(sysState.pzemSlaveOnline ? "true" : "false") + ",";
+    json += "\"lifetime\":" + String(sysState.energyLifetimeWh / 1000.0, 3) + ",";
+    json += "\"d_on\":" + String(sysState.digitalSlaveOnline ? "true" : "false") + ",";
+    json += "\"p_on\":" + String(sysState.pzemSlaveOnline ? "true" : "false") + ",";
     json += "\"d_rssi\":" + String(sysState.digitalSlaveRSSI) + ",";
     json += "\"p_rssi\":" + String(sysState.pzemSlaveRSSI) + ",";
-    json +=
-        "\"d_relay\":" + String(sysState.digitalRelayState ? "true" : "false") +
-        ",";
-    json +=
-        "\"d_lock\":" + String(sysState.digitalRelayLocked ? "true" : "false") +
-        ",";
-    json +=
-        "\"d_sw\":" + String(sysState.digitalSwitchState ? "true" : "false") +
-        ",";
-
-    // masterLock + SD stats
-    json +=
-        "\"m_lock\":" + String(sysState.masterLock ? "true" : "false") + ",";
+    json += "\"d_relay\":" + String(sysState.digitalRelayState ? "true" : "false") + ",";
+    json += "\"d_lock\":" + String(sysState.digitalRelayLocked ? "true" : "false") + ",";
+    json += "\"d_sw\":" + String(sysState.digitalSwitchState ? "true" : "false") + ",";
+    json += "\"m_lock\":" + String(sysState.masterLock ? "true" : "false") + ",";
     json += "\"sd_ok\":" + String(sysState.sdOk ? "true" : "false") + ",";
-    json +=
-        "\"sd_total\":" + String((unsigned long long)sysState.sdTotal) + ",";
+    json += "\"sd_total\":" + String((unsigned long long)sysState.sdTotal) + ",";
     json += "\"sd_used\":" + String((unsigned long long)sysState.sdUsed) + ",";
-    json += "\"p_health\":" +
-            String(sysState.pzemSensorHealthy ? "true" : "false") + ",";
+    json += "\"p_health\":" + String(sysState.pzemSensorHealthy ? "true" : "false") + ",";
     json += "\"mqtt_status\":" + String(sysState.mqttStatus);
-
     xSemaphoreGive(stateMutex);
   } else {
-    json += "],\"locks\":[false,false,false,false,false,false],\"shutdown\":"
-            "false,\"current\":0,\"rssi\":0,\"ssid\":\"\",";
-    json += "\"acs\":0.00,\"load\":0.00,\"v\":0.0,\"pw\":0.0,\"daily\":0.000,"
-            "\"monthly\":0.000,\"lifetime\":0.000,\"d_on\":false,\"p_on\":"
-            "false,\"d_rssi\":0,\"p_rssi\":0,\"d_relay\":false,\"d_lock\":"
-            "false,\"d_sw\":false,";
-    json += "\"m_lock\":false,\"sd_ok\":false,\"sd_total\":0,\"sd_used\":0,\"p_"
-            "health\":false,\"mqtt_status\":0";
+    json += "],\"locks\":[false,false,false,false,false,false],\"shutdown\":false,\"current\":0,\"rssi\":0,\"ssid\":\"\",\"mqtt_status\":0";
   }
   json += ",\"uptime\":" + String(millis());
-  json += ",\"time\":\"" + getFormattedTime() + "\"";
-  json += "}";
+  json += ",\"time\":\"" + getFormattedTime() + "\"}";
   return json;
 }
 
-void dashboardInit() {
-  dashServer.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send_P(200, "text/html", DASHBOARD_HTML);
-  });
-
-  dashServer.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send(200, "application/json", buildStatusJSON());
-  });
-
-  dashServer.on(
-      "/api/relay", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        StaticJsonDocument<128> doc;
-        DeserializationError err = deserializeJson(doc, data, len);
-        if (err) {
-          req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-          return;
-        }
-        if (!doc.containsKey("relay") || !doc.containsKey("state")) {
-          req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
-          return;
-        }
-        int relayIdx = doc["relay"];
-        bool state = doc["state"];
-
-        if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
-          setRelayState(relayIdx, state);
-          pushWsUpdate();
-          bool actualState = getRelayState(relayIdx);
-          req->send(200, "application/json",
-                    "{\"success\":true,\"relay\":" + String(relayIdx) +
-                        ",\"state\":" + (actualState ? "true" : "false") + "}");
-        } else if (relayIdx == 6) {
-          bool actualState = false;
-          bool lockActive = false;
-          if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            lockActive = sysState.masterLock || sysState.digitalRelayLocked || sysState.masterShutdown;
-            actualState = sysState.digitalRelayState;
-            xSemaphoreGive(stateMutex);
-          }
-          if (state && lockActive) {
-            Serial.println("[LOCK] /api/relay (6, ON) blocked locally");
-            req->send(200, "application/json", "{\"success\":true,\"relay\":6,\"state\":" + String(actualState ? "true" : "false") + "}");
-          } else {
-            String cmd = state ? "relay_on" : "relay_off";
-            enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + cmd + "\"}");
-            req->send(200, "application/json",
-                      "{\"success\":true,\"relay\":6,\"state\":" +
-                          String(state ? "true" : "false") + "}");
-          }
-        } else {
-          req->send(400, "application/json", "{\"error\":\"Invalid index\"}");
-        }
-      });
-
-  dashServer.on(
-      "/api/lock", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        StaticJsonDocument<128> doc;
-        DeserializationError err = deserializeJson(doc, data, len);
-        if (err) {
-          req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-          return;
-        }
-        if (!doc.containsKey("relay") || !doc.containsKey("state")) {
-          req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
-          return;
-        }
-        int relayIdx = doc["relay"];
-        bool state = doc["state"];
-
-        if (relayIdx >= 0 && relayIdx < NUM_RELAYS) {
-          if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            sysState.lockedStates[relayIdx] = state;
-            xSemaphoreGive(stateMutex);
-          }
-          updateRelayHardware();
-          pushWsUpdate();
-          req->send(200, "application/json",
-                    "{\"success\":true,\"relay\":" + String(relayIdx) +
-                        ",\"locked\":" + (state ? "true" : "false") + "}");
-        } else if (relayIdx == 6) {
-          String cmd = state ? "relay_lock" : "relay_unlock";
-          enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + cmd +
-                         "\"}");
-          req->send(200, "application/json",
-                    "{\"success\":true,\"relay\":6,\"locked\":" +
-                        String(state ? "true" : "false") + "}");
-        } else {
-          req->send(400, "application/json", "{\"error\":\"Invalid index\"}");
-        }
-      });
-
-  dashServer.on(
-      "/api/shutdown", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        StaticJsonDocument<128> doc;
-        DeserializationError err = deserializeJson(doc, data, len);
-        if (err) {
-          req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-          return;
-        }
-        if (!doc.containsKey("state")) {
-          req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
-          return;
-        }
-        bool state = doc["state"];
-
-        setShutdownState(state);
-        req->send(200, "application/json",
-                  "{\"success\":true,\"shutdown\":" +
-                      String(state ? "true" : "false") + "}");
-      });
-
-  // Post handler for master lock setting
-  dashServer.on(
-      "/api/master-lock", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        StaticJsonDocument<128> doc;
-        DeserializationError err = deserializeJson(doc, data, len);
-        if (err) {
-          req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-          return;
-        }
-        if (!doc.containsKey("state")) {
-          req->send(400, "application/json", "{\"error\":\"Missing fields\"}");
-          return;
-        }
-        bool state = doc["state"];
-
-        Serial.printf("[LOCK] Dashboard requested Global Master Lock: %s\n", state ? "ON" : "OFF");
-        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          sysState.masterLock = state;
-          pendingMasterLockSync = true;
-          pendingMasterLockSyncTime = millis();
-          xSemaphoreGive(stateMutex);
-        }
-        Serial.printf("[LOCK] Local masterLock set: %s\n", state ? "ON" : "OFF");
-        updateRelayHardware();
-
-        // Send master lock status change command to Master
-        enqueueUartCmd("{\"t\":\"lock\",\"val\":" +
-                       String(state ? "true" : "false") + "}");
-        Serial.println("[LOCK] UART lock command sent to Master");
-
-        pushWsUpdate();
-        req->send(200, "application/json",
-                  "{\"success\":true,\"state\":" +
-                      String(state ? "true" : "false") + "}");
-      });
-
-  // Post handler for factory reset
-  dashServer.on(
-      "/api/factory-reset", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        Serial.println("[SmartNest] FACTORY RESET requested — wiping WiFi "
-                       "credentials and notifying Master...");
-        // Send reset command to Master
-        enqueueUartCmd("{\"t\":\"factory_reset\"}");
-
-        req->send(200, "application/json",
-                  "{\"success\":true,\"msg\":\"Factory reset initiated. Device "
-                  "is resetting...\"}");
-
-        // Wipe NVS WiFi credentials and reboot
-        delay(1000);
-        Preferences prefs;
-        prefs.begin(NVS_NAMESPACE, false);
-        prefs.clear();
-        prefs.end();
-        delay(1000);
-        ESP.restart();
-      });
-
-  // GET handler to request directory listing of SD card logs
-  dashServer.on("/api/logs/list", HTTP_GET, [](AsyncWebServerRequest *req) {
-    Serial.println(
-        "[SmartNest] GET /api/logs/list — requesting directory from Master");
-    enqueueUartCmd("{\"t\":\"files_req\"}");
-    req->send(200, "application/json",
-              "{\"success\":true,\"msg\":\"Log list requested\"}");
-  });
-
-  // GET handler to request chunk contents of a specific log file
-  dashServer.on("/api/logs/view", HTTP_GET, [](AsyncWebServerRequest *req) {
-    if (req->hasParam("file") && req->hasParam("chunk")) {
-      String fileVal = req->getParam("file")->value();
-      int chunkVal = req->getParam("chunk")->value().toInt();
-      Serial.printf(
-          "[SmartNest] GET /api/logs/view — requesting file: %s chunk: %d\n",
-          fileVal.c_str(), chunkVal);
-
-      enqueueUartCmd("{\"t\":\"read_req\",\"file\":\"" + fileVal +
-                     "\",\"chunk\":" + String(chunkVal) + "}");
-      req->send(200, "application/json",
-                "{\"success\":true,\"msg\":\"Log chunk requested\"}");
-    } else {
-      req->send(400, "application/json",
-                "{\"error\":\"Missing file or chunk parameter\"}");
-    }
-  });
-
-  // Post handler for slave commands from the web UI
-  dashServer.on(
-      "/api/slave-cmd", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        StaticJsonDocument<256> doc;
-        DeserializationError err = deserializeJson(doc, data, len);
-        if (err) {
-          req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-          return;
-        }
-        String target = doc["target"];
-        String cmd = doc["cmd"];
-
-        if ((target == "d1" &&
-             (cmd == "relay_on" || cmd == "relay_off" || cmd == "relay_lock" ||
-              cmd == "relay_unlock" || cmd == "reboot")) ||
-            (target == "pzem" && (cmd == "reboot" || cmd == "energy_reset"))) {
-          enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"" + target +
-                         "\",\"cmd\":\"" + cmd + "\"}");
-          req->send(200, "application/json", "{\"success\":true}");
-        } else {
-          req->send(400, "application/json",
-                    "{\"error\":\"Invalid target or command\"}");
-        }
-      });
-
-  // --- MQTT Configuration API Endpoints ---
-  dashServer.on("/api/mqtt/config", HTTP_GET, [](AsyncWebServerRequest *req) {
-    StaticJsonDocument<512> doc;
-    doc["enabled"] = g_mqttConfig.enabled;
-    doc["broker"] = g_mqttConfig.broker;
-    doc["port"] = g_mqttConfig.port;
-    doc["clientId"] = g_mqttConfig.clientId;
-    doc["username"] = g_mqttConfig.username;
-    doc["password"] = strlen(g_mqttConfig.password) > 0 ? "********" : "";
-    doc["baseTopic"] = g_mqttConfig.baseTopic;
-    doc["keepAlive"] = g_mqttConfig.keepAlive;
-    String output;
-    serializeJson(doc, output);
-    req->send(200, "application/json", output);
-  });
-
-  dashServer.on(
-      "/api/mqtt/config", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        StaticJsonDocument<512> doc;
-        DeserializationError err = deserializeJson(doc, data, len);
-        if (err) {
-          req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-          return;
-        }
-        if (doc.containsKey("enabled"))
-          g_mqttConfig.enabled = doc["enabled"];
-        if (doc.containsKey("broker")) {
-          strncpy(g_mqttConfig.broker, doc["broker"] | "",
-                  sizeof(g_mqttConfig.broker) - 1);
-          g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
-        }
-        if (doc.containsKey("port"))
-          g_mqttConfig.port = doc["port"];
-        if (doc.containsKey("clientId")) {
-          strncpy(g_mqttConfig.clientId, doc["clientId"] | "",
-                  sizeof(g_mqttConfig.clientId) - 1);
-          g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
-        }
-        if (doc.containsKey("username")) {
-          strncpy(g_mqttConfig.username, doc["username"] | "",
-                  sizeof(g_mqttConfig.username) - 1);
-          g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
-        }
-        if (doc.containsKey("password") &&
-            String(doc["password"] | "") != "********") {
-          strncpy(g_mqttConfig.password, doc["password"] | "",
-                  sizeof(g_mqttConfig.password) - 1);
-          g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
-        }
-        if (doc.containsKey("baseTopic")) {
-          strncpy(g_mqttConfig.baseTopic, doc["baseTopic"] | "",
-                  sizeof(g_mqttConfig.baseTopic) - 1);
-          g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
-        }
-        if (doc.containsKey("keepAlive"))
-          g_mqttConfig.keepAlive = doc["keepAlive"];
-        saveMqttConfig();
-        g_mqttConfigChanged = true;
-        Serial.println("[MQTT] Config updated via API");
-        req->send(200, "application/json",
-                  "{\"success\":true,\"msg\":\"MQTT config saved. "
-                  "Reconnecting...\"}");
-      });
-
-  dashServer.on(
-      "/api/mqtt/test", HTTP_POST, [](AsyncWebServerRequest *req) {}, NULL,
-      [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t index,
-         size_t total) {
-        WiFiClient testClient;
-        PubSubClient testMqtt(testClient);
-        testMqtt.setServer(g_mqttConfig.broker, g_mqttConfig.port);
-        bool ok;
-        if (strlen(g_mqttConfig.username) > 0)
-          ok = testMqtt.connect("SmartNest_test", g_mqttConfig.username,
-                                g_mqttConfig.password);
-        else
-          ok = testMqtt.connect("SmartNest_test");
-        if (ok) {
-          testMqtt.disconnect();
-          req->send(200, "application/json",
-                    "{\"success\":true,\"msg\":\"Connection test passed!\"}");
-        } else {
-          req->send(200, "application/json",
-                    "{\"success\":false,\"msg\":\"Connection failed. Check "
-                    "broker/credentials.\"}");
-        }
-      });
-
-  dashServer.on(
-      "/api/mqtt/reset-default", HTTP_POST, [](AsyncWebServerRequest *req) {
-        resetMqttConfigToDefault();
-        g_mqttConfigChanged = true;
-        req->send(
-            200, "application/json",
-            "{\"success\":true,\"msg\":\"MQTT config reset to defaults\"}");
-      });
-
-  // --- Modular Reset API Endpoints ---
-  dashServer.on("/api/reset/wifi", HTTP_POST, [](AsyncWebServerRequest *req) {
-    Serial.println("[SmartNest] WiFi reset requested");
-    req->send(200, "application/json",
-              "{\"success\":true,\"msg\":\"WiFi credentials cleared. "
-              "Rebooting...\"}");
-    delay(500);
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, false);
-    prefs.clear();
-    prefs.end();
-    delay(500);
-    ESP.restart();
-  });
-
-  dashServer.on("/api/reset/mqtt", HTTP_POST, [](AsyncWebServerRequest *req) {
-    Serial.println("[SmartNest] MQTT config reset requested");
-    resetMqttConfigToDefault();
-    g_mqttConfigChanged = true;
-    req->send(200, "application/json",
-              "{\"success\":true,\"msg\":\"MQTT config reset to defaults\"}");
-  });
-
-  dashServer.on("/api/reset/energy", HTTP_POST, [](AsyncWebServerRequest *req) {
-    Serial.println("[SmartNest] Energy counter reset requested");
-    enqueueUartCmd("{\"t\":\"factory_reset\"}");
-    req->send(
-        200, "application/json",
-        "{\"success\":true,\"msg\":\"Energy counters reset sent to Master\"}");
-  });
-
-  dashServer.on("/api/reset/logs", HTTP_POST, [](AsyncWebServerRequest *req) {
-    Serial.println("[SmartNest] SD log clear requested");
-    enqueueUartCmd("{\"t\":\"clear_logs\"}");
-    req->send(200, "application/json",
-              "{\"success\":true,\"msg\":\"SD log clear sent to Master\"}");
-  });
-
-  dashServer.on("/api/reset/full", HTTP_POST, [](AsyncWebServerRequest *req) {
-    Serial.println("[SmartNest] FULL factory reset requested");
-    enqueueUartCmd("{\"t\":\"factory_reset\"}");
-    enqueueUartCmd("{\"t\":\"clear_logs\"}");
-    resetMqttConfigToDefault();
-    req->send(
-        200, "application/json",
-        "{\"success\":true,\"msg\":\"Full reset initiated. Rebooting...\"}");
-    delay(1000);
-    Preferences prefs;
-    prefs.begin(NVS_NAMESPACE, false);
-    prefs.clear();
-    prefs.end();
-    delay(500);
-    ESP.restart();
-  });
-
-  dashServer.onNotFound([](AsyncWebServerRequest *req) { req->redirect("/"); });
-
-  // Register WebSocket server
-  ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client,
-                AwsEventType type, void *arg, uint8_t *data, size_t len) {});
-  dashServer.addHandler(&ws);
-
-  dashServer.begin();
+static bool parseBoolValue(const String &value, bool &out) {
+  if (value == "ON" || value == "1" || value == "TRUE") {
+    out = true;
+    return true;
+  }
+  if (value == "OFF" || value == "0" || value == "FALSE") {
+    out = false;
+    return true;
+  }
+  return false;
 }
 
+static void setMasterLock(bool state) {
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    sysState.masterLock = state;
+    pendingMasterLockSync = true;
+    pendingMasterLockSyncTime = millis();
+    xSemaphoreGive(stateMutex);
+  }
+  updateRelayHardware();
+  enqueueUartCmd("{\"t\":\"lock\",\"val\":" + String(state ? "true" : "false") + "}");
+  Serial.printf("[LOCK] Master lock: %s\n", state ? "ON" : "OFF");
+}
+
+static void printHelp() {
+  Serial.println();
+  Serial.println("SmartNest serial commands:");
+  Serial.println("HELP");
+  Serial.println("STATUS");
+  Serial.println("RELAY <1-7> ON|OFF|TOGGLE");
+  Serial.println("LOCK <1-7> ON|OFF");
+  Serial.println("SHUTDOWN ON|OFF");
+  Serial.println("MASTERLOCK ON|OFF");
+  Serial.println("SLAVE D1 reboot");
+  Serial.println("SLAVE PZEM reboot|energy_reset");
+  Serial.println("LOGS LIST");
+  Serial.println("LOGS VIEW <file> <chunk>");
+  Serial.println("RESET WIFI|MQTT|ENERGY|LOGS|FULL");
+  Serial.println("MQTT SHOW");
+  Serial.println("MQTT ENABLE ON|OFF");
+  Serial.println("MQTT SET BROKER <host>");
+  Serial.println("MQTT SET PORT <port>");
+  Serial.println("MQTT SET CLIENT <clientId>");
+  Serial.println("MQTT SET USER <username>");
+  Serial.println("MQTT SET PASS <password>");
+  Serial.println("MQTT SET TOPIC <baseTopic>");
+  Serial.println("MQTT SET KEEPALIVE <seconds>");
+  Serial.println("MQTT RESET");
+  Serial.println();
+}
+
+static void resetWifiAndRestart() {
+  Preferences prefs;
+  prefs.begin(NVS_NAMESPACE, false);
+  prefs.clear();
+  prefs.end();
+  delay(500);
+  ESP.restart();
+}
+
+static void fullFactoryReset() {
+  enqueueUartCmd("{\"t\":\"factory_reset\"}");
+  enqueueUartCmd("{\"t\":\"clear_logs\"}");
+  resetMqttConfigToDefault();
+  delay(1000);
+  resetWifiAndRestart();
+}
+
+static void handleRelayCommand(int relayIdx, const String &action) {
+  if (relayIdx < 1 || relayIdx > 7) {
+    Serial.println("ERR: relay must be 1-7");
+    return;
+  }
+
+  bool state = false;
+  if (action == "TOGGLE") {
+    if (relayIdx <= NUM_RELAYS) {
+      toggleRelay(relayIdx - 1);
+    } else {
+      bool current = false;
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        current = sysState.digitalRelayState;
+        xSemaphoreGive(stateMutex);
+      }
+      enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
+                     (current ? "relay_off" : "relay_on") + "\"}");
+    }
+    Serial.println("OK");
+    return;
+  }
+
+  if (!parseBoolValue(action, state)) {
+    Serial.println("ERR: use ON, OFF, or TOGGLE");
+    return;
+  }
+
+  if (relayIdx <= NUM_RELAYS) {
+    setRelayState(relayIdx - 1, state);
+  } else {
+    bool lockActive = false;
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      lockActive = sysState.masterLock || sysState.digitalRelayLocked ||
+                   sysState.masterShutdown;
+      xSemaphoreGive(stateMutex);
+    }
+    if (state && lockActive) {
+      Serial.println("ERR: relay 7 is locked or shutdown is active");
+      return;
+    }
+    enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
+                   (state ? "relay_on" : "relay_off") + "\"}");
+  }
+  Serial.println("OK");
+}
+
+static void handleLockCommand(int relayIdx, const String &value) {
+  bool state = false;
+  if (relayIdx < 1 || relayIdx > 7 || !parseBoolValue(value, state)) {
+    Serial.println("ERR: use LOCK <1-7> ON|OFF");
+    return;
+  }
+
+  if (relayIdx <= NUM_RELAYS) {
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      sysState.lockedStates[relayIdx - 1] = state;
+      xSemaphoreGive(stateMutex);
+    }
+    updateRelayHardware();
+  } else {
+    enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
+                   (state ? "relay_lock" : "relay_unlock") + "\"}");
+  }
+  Serial.println("OK");
+}
+
+static void printMqttConfig() {
+  Serial.printf("enabled=%s\n", g_mqttConfig.enabled ? "ON" : "OFF");
+  Serial.printf("broker=%s\n", g_mqttConfig.broker);
+  Serial.printf("port=%d\n", g_mqttConfig.port);
+  Serial.printf("client=%s\n", g_mqttConfig.clientId);
+  Serial.printf("user=%s\n", g_mqttConfig.username);
+  Serial.printf("topic=%s\n", g_mqttConfig.baseTopic);
+  Serial.printf("keepalive=%d\n", g_mqttConfig.keepAlive);
+}
+
+static void handleMqttCommand(const String &cmdRaw, const String &cmdUpper) {
+  if (cmdUpper == "MQTT SHOW") {
+    printMqttConfig();
+    return;
+  }
+  if (cmdUpper == "MQTT RESET") {
+    resetMqttConfigToDefault();
+    g_mqttConfigChanged = true;
+    Serial.println("OK");
+    return;
+  }
+  if (cmdUpper.startsWith("MQTT ENABLE ")) {
+    bool enabled = false;
+    if (!parseBoolValue(cmdUpper.substring(12), enabled)) {
+      Serial.println("ERR: use MQTT ENABLE ON|OFF");
+      return;
+    }
+    g_mqttConfig.enabled = enabled;
+  } else if (cmdUpper.startsWith("MQTT SET BROKER ")) {
+    strncpy(g_mqttConfig.broker, cmdRaw.substring(16).c_str(), sizeof(g_mqttConfig.broker) - 1);
+    g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
+  } else if (cmdUpper.startsWith("MQTT SET PORT ")) {
+    g_mqttConfig.port = cmdUpper.substring(14).toInt();
+  } else if (cmdUpper.startsWith("MQTT SET CLIENT ")) {
+    strncpy(g_mqttConfig.clientId, cmdRaw.substring(16).c_str(), sizeof(g_mqttConfig.clientId) - 1);
+    g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
+  } else if (cmdUpper.startsWith("MQTT SET USER ")) {
+    strncpy(g_mqttConfig.username, cmdRaw.substring(14).c_str(), sizeof(g_mqttConfig.username) - 1);
+    g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
+  } else if (cmdUpper.startsWith("MQTT SET PASS ")) {
+    strncpy(g_mqttConfig.password, cmdRaw.substring(14).c_str(), sizeof(g_mqttConfig.password) - 1);
+    g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
+  } else if (cmdUpper.startsWith("MQTT SET TOPIC ")) {
+    strncpy(g_mqttConfig.baseTopic, cmdRaw.substring(15).c_str(), sizeof(g_mqttConfig.baseTopic) - 1);
+    g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
+  } else if (cmdUpper.startsWith("MQTT SET KEEPALIVE ")) {
+    g_mqttConfig.keepAlive = cmdUpper.substring(19).toInt();
+  } else {
+    Serial.println("ERR: unknown MQTT command");
+    return;
+  }
+  saveMqttConfig();
+  g_mqttConfigChanged = true;
+  Serial.println("OK");
+}
+
+static void handleSerialCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0)
+    return;
+  String raw = cmd;
+  String upper = cmd;
+  upper.toUpperCase();
+
+  int p1 = upper.indexOf(' ');
+  String head = p1 < 0 ? upper : upper.substring(0, p1);
+  String rest = p1 < 0 ? "" : upper.substring(p1 + 1);
+
+  if (upper == "HELP") {
+    printHelp();
+  } else if (upper == "STATUS") {
+    Serial.println(buildStatusJSON());
+  } else if (head == "RELAY") {
+    int p2 = rest.indexOf(' ');
+    if (p2 < 0) {
+      Serial.println("ERR: use RELAY <1-7> ON|OFF|TOGGLE");
+    } else {
+      handleRelayCommand(rest.substring(0, p2).toInt(), rest.substring(p2 + 1));
+    }
+  } else if (head == "LOCK") {
+    int p2 = rest.indexOf(' ');
+    if (p2 < 0) {
+      Serial.println("ERR: use LOCK <1-7> ON|OFF");
+    } else {
+      handleLockCommand(rest.substring(0, p2).toInt(), rest.substring(p2 + 1));
+    }
+  } else if (head == "SHUTDOWN") {
+    bool state = false;
+    if (parseBoolValue(rest, state)) {
+      setShutdownState(state);
+      Serial.println("OK");
+    } else {
+      Serial.println("ERR: use SHUTDOWN ON|OFF");
+    }
+  } else if (head == "MASTERLOCK") {
+    bool state = false;
+    if (parseBoolValue(rest, state)) {
+      setMasterLock(state);
+      Serial.println("OK");
+    } else {
+      Serial.println("ERR: use MASTERLOCK ON|OFF");
+    }
+  } else if (upper.startsWith("SLAVE D1 ") || upper.startsWith("SLAVE PZEM ")) {
+    String target = upper.startsWith("SLAVE D1 ") ? "d1" : "pzem";
+    String slaveCmd = raw.substring(target == "d1" ? 9 : 11);
+    slaveCmd.toLowerCase();
+    bool validD1 = target == "d1" && slaveCmd == "reboot";
+    bool validPzem = target == "pzem" &&
+                     (slaveCmd == "reboot" || slaveCmd == "energy_reset");
+    if (!validD1 && !validPzem) {
+      Serial.println("ERR: invalid slave command");
+      return;
+    }
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"" + target + "\",\"cmd\":\"" + slaveCmd + "\"}");
+    Serial.println("OK");
+  } else if (upper == "LOGS LIST") {
+    enqueueUartCmd("{\"t\":\"files_req\"}");
+    Serial.println("OK");
+  } else if (upper.startsWith("LOGS VIEW ")) {
+    String args = raw.substring(10);
+    int p2 = args.lastIndexOf(' ');
+    if (p2 < 1) {
+      Serial.println("ERR: use LOGS VIEW <file> <chunk>");
+    } else {
+      enqueueUartCmd("{\"t\":\"read_req\",\"file\":\"" + args.substring(0, p2) +
+                     "\",\"chunk\":" + String(args.substring(p2 + 1).toInt()) + "}");
+      Serial.println("OK");
+    }
+  } else if (upper == "RESET WIFI") {
+    resetWifiAndRestart();
+  } else if (upper == "RESET MQTT") {
+    resetMqttConfigToDefault();
+    g_mqttConfigChanged = true;
+    Serial.println("OK");
+  } else if (upper == "RESET ENERGY") {
+    enqueueUartCmd("{\"t\":\"factory_reset\"}");
+    Serial.println("OK");
+  } else if (upper == "RESET LOGS") {
+    enqueueUartCmd("{\"t\":\"clear_logs\"}");
+    Serial.println("OK");
+  } else if (upper == "RESET FULL") {
+    fullFactoryReset();
+  } else if (head == "MQTT") {
+    handleMqttCommand(raw, upper);
+  } else {
+    Serial.println("ERR: unknown command. Type HELP");
+  }
+}
+
+void serialCommandInit() {
+  printHelp();
+}
+
+void serialCommandLoop() {
+  static String line;
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n') {
+      handleSerialCommand(line);
+      line = "";
+    } else if (c != '\r') {
+      line += c;
+      if (line.length() > 220)
+        line = "";
+    }
+  }
+}
 void setup() {
   Serial.begin(115200);
   delay(500);
 
   memset(&sysState, 0, sizeof(SystemState));
-  loadMqttConfig(); // Load MQTT config from NVS Preferences
+  loadMqttConfig();
 
-  relayEventQueue = xQueueCreate(10, sizeof(RelayEvent));
   stateMutex = xSemaphoreCreateMutex();
   UartCmdQueue = xQueueCreate(5, sizeof(UartCmdItem));
 
-  if (!relayEventQueue || !stateMutex || !UartCmdQueue) {
+  if (!stateMutex || !UartCmdQueue) {
     delay(1000);
     ESP.restart();
   }
+
+  serialCommandInit();
 
   xTaskCreatePinnedToCore(relaySwitchTask, "RelaySwitch", 4096, NULL, 2,
                           &hRelaySwitch, 1);
@@ -1798,12 +1553,10 @@ void setup() {
 
   bool wifiConnected = wifiManagerInit();
 
+  xTaskCreatePinnedToCore(uartCommTask, "UartComm", 4096, NULL, 1, &hUartComm,
+                          0);
+
   if (wifiConnected) {
-    dashboardInit();
-
-    xTaskCreatePinnedToCore(uartCommTask, "UartComm", 4096, NULL, 1, &hUartComm,
-                            0);
-
     xTaskCreatePinnedToCore(wifiReconnectTask, "WifiRecon", 4096, NULL, 1,
                             &hWifiReconnect, 0);
 
@@ -1817,12 +1570,12 @@ void setup() {
 }
 
 void loop() {
+  serialCommandLoop();
+
   if (isProvisioningMode) {
     wifiManagerLoop();
     vTaskDelay(pdMS_TO_TICKS(10));
   } else {
-    // Periodically cleanup clients to free memory
-    ws.cleanupClients();
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
