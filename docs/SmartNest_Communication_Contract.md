@@ -4,9 +4,9 @@ Version: current firmware state in this repository
 
 This document describes the communication interfaces used by the SmartNest system:
 
-- SmartNest ESP32: WiFi, MQTT, Serial Monitor command interface, UART link to Master.
-- Master ESP32: UART bridge, ESP-NOW controller, SD logging, state recovery.
-- Digital Board ESP32: relay 7, manual switch, ACS current sensing.
+- SmartNest ESP32: WiFi, MQTT, Serial Monitor command interface, UART link to Master, 6 relays.
+- Master ESP32: UART bridge, ESP-NOW controller, SD logging, state recovery, 6 manual switch.
+- Digital Board ESP32: relay, manual switch, ACS current sensing.
 - PZEM ESP32: voltage/current/power/energy sensing.
 
 Default MQTT base topic is `smartnest`, but it can be changed from the SmartNest Serial Monitor with `MQTT SET TOPIC <baseTopic>`. In this document, `<base>` means the configured MQTT base topic.
