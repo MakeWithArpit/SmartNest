@@ -418,13 +418,6 @@ Serial baud: `115200`.
 
 When SmartNest is connected to Wi-Fi, it starts a minimal authenticated dashboard on port `80`.
 
-Default login:
-
-| Field | Value |
-|---|---|
-| User ID | `admin` |
-| Password | `smartnest` |
-
 Access:
 
 ```text
