@@ -57,6 +57,8 @@ static float acs712ZeroMv = 2500.0f;
 #define MQTT_PASSWORD ""
 #define MQTT_KEEPALIVE_S 60
 #define MQTT_BASE_TOPIC "smartnest"
+#define MQTT_HISTORY_BATCH_LIMIT 6
+#define MQTT_HISTORY_RETRY_MS 15000
 
 struct MqttConfig {
   bool enabled;
@@ -71,6 +73,13 @@ struct MqttConfig {
 
 MqttConfig g_mqttConfig;
 volatile bool g_mqttConfigChanged = false;
+static String g_pendingD1CmdId = "";
+static String g_pendingD1CmdType = "";
+static uint32_t g_pendingD1CmdMs = 0;
+static bool g_historyPending = false;
+static String g_historyPendingBatchId = "";
+static uint32_t g_historyPendingLastId = 0;
+static uint32_t g_historyLastRequestMs = 0;
 
 void saveMqttConfig() {
   Preferences prefs;
@@ -241,6 +250,11 @@ void ntpSyncTask(void *pvParameters);
 void mqttTask(void *pvParameters);
 void dhtTask(void *pvParameters);
 void publishTelemetry();
+void publishLiveData();
+void requestHistoryBatch(bool force);
+static String jsonEscape(const char *value);
+static String jsonEscape(const String &value);
+static void setMasterLock(bool state);
 
 void enqueueUartCmd(const String &cmd) {
   if (UartCmdQueue == NULL)
@@ -558,11 +572,11 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SmartNest Dashboard</title>
 <style>
-*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f6f8;color:#111827}.wrap{max-width:1120px;margin:0 auto;padding:18px}header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}h1{font-size:24px;margin:0}h3{margin:0 0 10px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}.card{background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:12px;min-width:0}.label{font-size:12px;color:#5b6472}.val{font-size:21px;font-weight:700;margin-top:4px}.ok{color:#087443}.warn{color:#b54708}.bad{color:#b42318}.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:10px}button,select,input{font:inherit;border-radius:6px;min-width:0}button{border:0;background:#174ea6;color:#fff;font-weight:700;min-height:50px;padding:9px 10px;cursor:pointer;white-space:normal;line-height:1.15}button.secondary{background:#eef2f7;color:#111827;border:1px solid #c8d0dc}button.danger{background:#b42318}select,input{border:1px solid #c8d0dc;padding:9px;width:100%;background:#fff;min-height:40px}.row{display:grid;gap:8px;align-items:stretch}.cmdrow{grid-template-columns:minmax(120px,1.4fr) minmax(92px,1fr) minmax(68px,.6fr)}.btnrow{grid-template-columns:repeat(3,minmax(0,1fr))}.two{grid-template-columns:repeat(2,minmax(0,1fr))}.mqttgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.wide{grid-column:1/-1}pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;color:#d7e1f2;border-radius:8px;padding:12px;min-height:240px;max-height:520px;overflow:auto}.relays{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.relay{border:1px solid #d9dee7;border-radius:8px;padding:10px;background:#fff}.relay b{display:block;margin-bottom:8px}.mini{font-size:12px;color:#5b6472}.topbtn{width:auto;min-height:40px}.login{max-width:360px;margin:12vh auto}.hidden{display:none}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f6f8;color:#111827}.wrap{max-width:1120px;margin:0 auto;padding:18px}header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}h1{font-size:24px;margin:0;}h3{margin:0 0 10px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}.card{background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:12px;min-width:0}.label{font-size:12px;color:#5b6472}.val{font-size:21px;font-weight:700;margin-top:4px}.ok{color:#087443}.warn{color:#b54708}.bad{color:#b42318}.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:10px}button,select,input{font:inherit;border-radius:6px;min-width:0}button{border:0;background:#174ea6;color:#fff;font-weight:700;min-height:50px;padding:9px 10px;cursor:pointer;white-space:normal;line-height:1.15}button.secondary{background:#eef2f7;color:#111827;border:1px solid #c8d0dc}button.danger{background:#b42318}select,input{border:1px solid #c8d0dc;padding:9px;width:100%;background:#fff;min-height:40px}.row{display:grid;gap:8px;align-items:stretch}.cmdrow{grid-template-columns:minmax(120px,1.4fr) minmax(92px,1fr) minmax(68px,.6fr)}.btnrow{grid-template-columns:repeat(3,minmax(0,1fr))}.two{grid-template-columns:repeat(2,minmax(0,1fr))}.mqttgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.wide{grid-column:1/-1}pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;color:#d7e1f2;border-radius:8px;padding:12px;min-height:240px;max-height:520px;overflow:auto}.relays{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.relay{border:1px solid #d9dee7;border-radius:8px;padding:10px;background:#fff}.relay b{display:block;margin-bottom:8px}.mini{font-size:12px;color:#5b6472}.topbtn{width:auto;min-height:40px}.login{max-width:360px;margin:12vh auto}.hidden{display:none}
 </style></head><body>
-<div id="loginPanel" class="login card"><h1>SmartNest Login</h1><p class="mini">Dashboard session expires when this tab is closed.</p><input id="user" placeholder="User ID" autocomplete="username"><input id="pass" type="password" placeholder="Password" autocomplete="current-password" style="margin-top:8px"><button style="width:100%;margin-top:10px" onclick="doLogin()">Login</button><div id="loginMsg" class="mini"></div></div>
+<div id="loginPanel" class="login card"><h1 style="text-align:center;">SmartNest</h1><br><input id="user" placeholder="User ID" autocomplete="username"><input id="pass" type="password" placeholder="Password" autocomplete="current-password" style="margin-top:8px"><button style="width:100%;margin-top:10px" onclick="doLogin()">Login</button><div id="loginMsg" class="mini"></div></div>
 <div id="app" class="wrap hidden">
-<header><div><h1>SmartNest Dashboard</h1><div class="mini" id="stamp">Loading...</div></div><div><button class="secondary topbtn" onclick="refresh()">Refresh</button> <button class="danger topbtn" onclick="logout()">Logout</button></div></header>
+<header><div><h1>SmartNest Dashboard</h1><div class="mini" id="stamp">Loading...</div></div><div><button class="secondary topbtn" onclick="refresh()">Refresh</button></div></header>
 <section class="grid" id="metrics"></section>
 <section class="card wide" style="margin-top:10px"><h3>Signal Strength</h3><div class="grid" id="rssi"></div></section>
 <section class="card wide" style="margin-top:10px"><h3>Relays</h3><div class="relays" id="relays"></div></section>
@@ -570,7 +584,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <div class="card"><h3>Relay Command</h3><div class="row cmdrow"><select id="relayNo"></select><select id="relayAction"><option>ON</option><option>OFF</option><option>TOGGLE</option></select><button onclick="cmd('RELAY '+relayNo.value+' '+relayAction.value)">Send</button></div></div>
 <div class="card"><h3>Lock Command</h3><div class="row cmdrow"><select id="lockNo"></select><select id="lockAction"><option>ON</option><option>OFF</option></select><button onclick="cmd('LOCK '+lockNo.value+' '+lockAction.value)">Send</button></div></div>
 <div class="card"><h3>Master Lock</h3><div class="row two"><button onclick="cmd('MASTERLOCK ON')">Lock</button><button class="secondary" onclick="cmd('MASTERLOCK OFF')">Unlock</button></div></div>
-<div class="card"><h3>Slave</h3><div class="row btnrow"><button onclick="cmd('SLAVE D1 reboot')">D1 Reboot</button><button onclick="cmd('SLAVE PZEM reboot')">PZEM Reboot</button><button class="danger" onclick="cmd('SLAVE PZEM energy_reset')">Energy Reset</button></div></div>
+<div class="card"><h3>Slave</h3><div class="row btnrow"><button onclick="cmd('SLAVE D1 reboot')">Digital Reboot</button><button onclick="cmd('SLAVE PZEM reboot')">PZEM Reboot</button><button class="danger" onclick="cmd('SLAVE PZEM energy_reset')">Energy Reset</button></div></div>
 <div class="card"><h3>SD Logs</h3><div class="row btnrow"><button onclick="apiText('/api/logs/list')">List</button><button class="danger" onclick="apiText('/api/logs/clear',{method:'POST'})">Clear</button><button onclick="downloadCsv()">Download CSV</button></div></div>
 <div class="card"><h3>System</h3><div class="row two"><button onclick="apiText('/api/sd')">SD Info</button><button onclick="apiText('/api/status?pretty=1')">Status</button></div></div>
 <div class="card wide"><h3>MQTT Settings</h3><div class="mqttgrid"><select id="mqttEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select><input id="mqttBroker" placeholder="Broker"><input id="mqttPort" placeholder="Port" inputmode="numeric"><input id="mqttClient" placeholder="Client ID"><input id="mqttUser" placeholder="Username"><input id="mqttPass" placeholder="Password"><input id="mqttTopic" placeholder="Base topic"><input id="mqttKeepalive" placeholder="Keepalive seconds" inputmode="numeric"></div><div class="row btnrow" style="margin-top:8px"><button onclick="loadMqtt()">Load MQTT</button><button onclick="saveMqtt()">Save MQTT</button><button class="danger" onclick="cmd('RESET MQTT').then(loadMqtt)">Reset MQTT</button></div></div>
@@ -661,6 +675,10 @@ static String jsonEscape(const char *value) {
   out.replace("\\", "\\\\");
   out.replace("\"", "\\\"");
   return out;
+}
+
+static String jsonEscape(const String &value) {
+  return jsonEscape(value.c_str());
 }
 
 static String buildMqttConfigJSON() {
@@ -1106,6 +1124,197 @@ int getRelayIndexFromTopic(const String &topic) {
   return idxStr.toInt();
 }
 
+static String mqttBool(bool value) { return value ? "true" : "false"; }
+
+static void publishCommandAck(const String &cmdId, const String &type, bool ok,
+                              const String &reason, int relay = 0,
+                              bool state = false, bool locked = false) {
+  if (!mqttClient.connected())
+    return;
+  String base = String(g_mqttConfig.baseTopic);
+  String payload = "{\"cmd_id\":\"" + jsonEscape(cmdId) + "\",\"type\":\"" +
+                   jsonEscape(type) + "\",\"ok\":" + mqttBool(ok) +
+                   ",\"reason\":\"" + jsonEscape(reason) + "\"";
+  if (relay > 0) {
+    payload += ",\"relay\":" + String(relay);
+    payload += ",\"state\":" + mqttBool(state);
+    payload += ",\"locked\":" + mqttBool(locked);
+  }
+  payload += "}";
+  mqttClient.publish((base + "/cmd/ack").c_str(), payload.c_str(), false);
+}
+
+static bool parseJsonBool(JsonVariantConst v, bool &out) {
+  if (v.is<bool>()) {
+    out = v.as<bool>();
+    return true;
+  }
+  if (v.is<const char *>()) {
+    String s = v.as<const char *>();
+    s.trim();
+    s.toLowerCase();
+    if (s == "true" || s == "1" || s == "on") {
+      out = true;
+      return true;
+    }
+    if (s == "false" || s == "0" || s == "off") {
+      out = false;
+      return true;
+    }
+  }
+  return false;
+}
+
+static void publishRelayStateCompat(int relayNumber) {
+  if (!mqttClient.connected() || relayNumber < 1 || relayNumber > 7)
+    return;
+  String base = String(g_mqttConfig.baseTopic);
+  String relayPrefix = base + "/relay/";
+  bool stateVal = false;
+  bool lockedVal = false;
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    if (relayNumber <= NUM_RELAYS) {
+      stateVal = sysState.relayStates[relayNumber - 1];
+      lockedVal = sysState.lockedStates[relayNumber - 1];
+    } else {
+      stateVal = sysState.digitalRelayState;
+      lockedVal = sysState.digitalRelayLocked;
+    }
+    xSemaphoreGive(stateMutex);
+  }
+  int mqttIdx = relayNumber - 1;
+  mqttClient.publish((relayPrefix + String(mqttIdx) + "/state").c_str(),
+                     stateVal ? "true" : "false", true);
+  mqttClient.publish((relayPrefix + String(mqttIdx) + "/locked").c_str(),
+                     lockedVal ? "true" : "false", true);
+}
+
+static void handleCloudCommand(const String &payload, const String &legacyType,
+                               int legacyRelay = 0, bool legacyBool = false,
+                               const String &legacyTarget = "") {
+  StaticJsonDocument<512> doc;
+  String cmdId = "";
+  String type = legacyType;
+  int relay = legacyRelay;
+  bool boolValue = legacyBool;
+  String target = legacyTarget;
+
+  if (legacyType.length() == 0) {
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+      publishCommandAck("unknown", "unknown", false, "invalid_payload");
+      return;
+    }
+    cmdId = doc["cmd_id"] | "";
+    type = doc["type"] | "";
+    relay = doc["relay"] | 0;
+    target = doc["target"] | "";
+    if (!parseJsonBool(doc["state"], boolValue) &&
+        !parseJsonBool(doc["locked"], boolValue)) {
+      boolValue = false;
+    }
+  } else {
+    cmdId = "legacy-" + String(millis());
+  }
+
+  if (cmdId.length() == 0)
+    cmdId = "cmd-" + String(millis());
+
+  if (type == "relay_set" || type == "relay_toggle" || type == "relay_lock") {
+    if (relay < 1 || relay > 7) {
+      publishCommandAck(cmdId, type, false, "invalid_relay");
+      return;
+    }
+
+    if (relay <= NUM_RELAYS) {
+      if (type == "relay_set") {
+        setRelayState(relay - 1, boolValue);
+      } else if (type == "relay_toggle") {
+        toggleRelay(relay - 1);
+      } else {
+        if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sysState.lockedStates[relay - 1] = boolValue;
+          xSemaphoreGive(stateMutex);
+        }
+        saveLocalControlState();
+        updateRelayHardware();
+      }
+
+      bool stateVal = false;
+      bool lockedVal = false;
+      bool masterLockedVal = false;
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stateVal = sysState.relayStates[relay - 1];
+        lockedVal = sysState.lockedStates[relay - 1];
+        masterLockedVal = sysState.masterLock;
+        xSemaphoreGive(stateMutex);
+      }
+      publishRelayStateCompat(relay);
+      bool ok = true;
+      String reason = "done";
+      if (type == "relay_set" && boolValue && !stateVal) {
+        ok = false;
+        reason = masterLockedVal ? "master_locked" : (lockedVal ? "locked" : "rejected");
+      }
+      publishCommandAck(cmdId, type, ok, reason, relay, stateVal, lockedVal);
+      publishLiveData();
+      return;
+    }
+
+    if (g_pendingD1CmdId.length() > 0) {
+      publishCommandAck(cmdId, type, false, "busy", relay);
+      return;
+    }
+    String d1Cmd = "relay_off";
+    if (type == "relay_set")
+      d1Cmd = boolValue ? "relay_on" : "relay_off";
+    else if (type == "relay_toggle") {
+      bool current = false;
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        current = sysState.digitalRelayState;
+        xSemaphoreGive(stateMutex);
+      }
+      d1Cmd = current ? "relay_off" : "relay_on";
+    } else if (type == "relay_lock") {
+      d1Cmd = boolValue ? "relay_lock" : "relay_unlock";
+    }
+    g_pendingD1CmdId = cmdId;
+    g_pendingD1CmdType = type;
+    g_pendingD1CmdMs = millis();
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"" + d1Cmd + "\"}");
+    return;
+  }
+
+  if (type == "master_lock") {
+    setMasterLock(boolValue);
+    publishCommandAck(cmdId, type, true, "sent");
+    publishLiveData();
+    return;
+  }
+
+  if (type == "slave_reboot") {
+    if (target == "digital" || target == "d1") {
+      enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"reboot\"}");
+    } else if (target == "pzem") {
+      enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"reboot\"}");
+    } else {
+      publishCommandAck(cmdId, type, false, "invalid_target");
+      return;
+    }
+    publishCommandAck(cmdId, type, true, "sent");
+    return;
+  }
+
+  if (type == "pzem_energy_reset") {
+    enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"energy_reset\"}");
+    publishCommandAck(cmdId, type, true, "sent");
+    return;
+  }
+
+  publishCommandAck(cmdId, type.length() ? type : "unknown", false,
+                    "unsupported");
+}
+
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
   String t = String(topic);
   String p = String((char *)payload, length);
@@ -1113,66 +1322,38 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 
   String base = String(g_mqttConfig.baseTopic);
   String relayPrefix = base + "/relay/";
-  if (t.startsWith(relayPrefix) && t.endsWith("/set")) {
-    int idx = getRelayIndexFromTopic(t);
-    if (idx >= 0 && idx < NUM_RELAYS) {
-      setRelayState(idx, p == "true");
-    } else if (idx == 6) {
-      enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
-                     (p == "true" ? "relay_on" : "relay_off") + "\"}");
-    }
-  }
-  else if (t.startsWith(relayPrefix) && t.endsWith("/lock")) {
-    int idx = getRelayIndexFromTopic(t);
-    if (idx >= 0 && idx < NUM_RELAYS) {
-      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        sysState.lockedStates[idx] = (p == "true");
-        xSemaphoreGive(stateMutex);
+  if (t == base + "/cmd/request") {
+    handleCloudCommand(p, "");
+  } else if (t == base + "/history/ack") {
+    StaticJsonDocument<256> doc;
+    if (!deserializeJson(doc, p)) {
+      String batchId = doc["batch_id"] | "";
+      bool ok = doc["ok"] | false;
+      uint32_t lastId = doc["last_id"] | 0;
+      if (ok && g_historyPending && batchId == g_historyPendingBatchId) {
+        if (lastId == 0)
+          lastId = g_historyPendingLastId;
+        enqueueUartCmd("{\"t\":\"hist_ack\",\"last\":" + String(lastId) + "}");
+        g_historyPending = false;
+        g_historyPendingBatchId = "";
+        g_historyPendingLastId = lastId;
       }
-      saveLocalControlState();
-      updateRelayHardware();
-    } else if (idx == 6) {
-      enqueueUartCmd(String("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"") +
-                     (p == "true" ? "relay_lock" : "relay_unlock") + "\"}");
     }
-  }
-  else if (t == base + "/cmd/slave/d1") {
+  } else if (t.startsWith(relayPrefix) && t.endsWith("/set")) {
+    int idx = getRelayIndexFromTopic(t);
+    handleCloudCommand("", "relay_set", idx + 1, p == "true");
+  } else if (t.startsWith(relayPrefix) && t.endsWith("/lock")) {
+    int idx = getRelayIndexFromTopic(t);
+    handleCloudCommand("", "relay_lock", idx + 1, p == "true");
+  } else if (t == base + "/cmd/slave/d1") {
     if (p == "reboot") {
-      enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"reboot\"}");
+      handleCloudCommand("", "slave_reboot", 0, false, "digital");
     }
   } else if (t == base + "/cmd/slave/pzem") {
-    if (p == "reboot" || p == "energy_reset") {
-      enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"pzem\",\"cmd\":\"" + p + "\"}");
-    }
-  }
-  if (t.startsWith(relayPrefix)) {
-    int idx = getRelayIndexFromTopic(t);
-    bool stateVal = false;
-    bool lockedVal = false;
-    bool gotMutex = false;
-    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      if (idx >= 0 && idx < NUM_RELAYS) {
-        stateVal = sysState.relayStates[idx];
-        lockedVal = sysState.lockedStates[idx];
-      } else if (idx == 6) {
-        stateVal = sysState.digitalRelayState;
-        lockedVal = sysState.digitalRelayLocked;
-      }
-      gotMutex = true;
-      xSemaphoreGive(stateMutex);
-    }
-    if (gotMutex) {
-      if (idx >= 0 && idx < NUM_RELAYS) {
-        mqttClient.publish((relayPrefix + String(idx) + "/state").c_str(),
-                           stateVal ? "true" : "false", true);
-        mqttClient.publish((relayPrefix + String(idx) + "/locked").c_str(),
-                           lockedVal ? "true" : "false", true);
-      } else if (idx == 6) {
-        mqttClient.publish((relayPrefix + "6/state").c_str(),
-                           stateVal ? "true" : "false", true);
-        mqttClient.publish((relayPrefix + "6/locked").c_str(),
-                           lockedVal ? "true" : "false", true);
-      }
+    if (p == "reboot") {
+      handleCloudCommand("", "slave_reboot", 0, false, "pzem");
+    } else if (p == "energy_reset") {
+      handleCloudCommand("", "pzem_energy_reset");
     }
   }
 }
@@ -1249,12 +1430,91 @@ void publishTelemetry() {
 
     xSemaphoreGive(stateMutex);
   }
+  publishLiveData();
+}
+
+void publishLiveData() {
+  if (!mqttClient.connected())
+    return;
+
+  String base = String(g_mqttConfig.baseTopic);
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    String sensors = "{";
+    sensors += "\"voltage\":" + String(sysState.pzemVoltage, 1) + ",";
+    sensors += "\"main_current\":" + String(sysState.currentAmps, 2) + ",";
+    sensors += "\"digital_current\":" + String(sysState.acsCurrentA, 2) + ",";
+    sensors += "\"ac_current\":" + String(sysState.pzemCurrentA, 3) + ",";
+    sensors += "\"ac_power\":" + String(sysState.pzemPowerW, 1) + ",";
+    sensors += "\"ac_energy_kwh\":" + String(sysState.acEnergyKWh, 3) + ",";
+    sensors += "\"main_energy_kwh\":" + String(sysState.mainEnergyKWh, 3) + ",";
+    sensors += "\"digital_energy_kwh\":" + String(sysState.digitalEnergyKWh, 3) + ",";
+    sensors += "\"temperature_c\":" + String(sysState.temperatureC, 1) + ",";
+    sensors += "\"humidity_pct\":" + String(sysState.humidityPct, 1) + ",";
+    sensors += "\"dht_ok\":" + mqttBool(sysState.dhtHealthy);
+    sensors += "}";
+
+    String relays = "{\"states\":[";
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      if (i > 0)
+        relays += ",";
+      relays += mqttBool(sysState.relayStates[i]);
+    }
+    relays += "," + mqttBool(sysState.digitalRelayState) + "],\"locks\":[";
+    for (int i = 0; i < NUM_RELAYS; i++) {
+      if (i > 0)
+        relays += ",";
+      relays += mqttBool(sysState.lockedStates[i]);
+    }
+    relays += "," + mqttBool(sysState.digitalRelayLocked) + "],\"master_lock\":";
+    relays += mqttBool(sysState.masterLock);
+    relays += ",\"digital_switch\":" + mqttBool(sysState.digitalSwitchState);
+    relays += ",\"runtime\":[";
+    for (int i = 0; i < 7; i++) {
+      if (i > 0)
+        relays += ",";
+      relays += String(sysState.relayRuntimeSec[i]);
+    }
+    relays += "]}";
+
+    String status = "{";
+    status += "\"uptime\":" + String(millis()) + ",";
+    status += "\"ssid\":\"" + jsonEscape(sysState.wifiSSID) + "\",";
+    status += "\"rssi\":" + String(sysState.wifiRSSI) + ",";
+    status += "\"mqtt_status\":" + String(sysState.mqttStatus) + ",";
+    status += "\"sd_ok\":" + mqttBool(sysState.sdOk) + ",";
+    status += "\"sd_total\":" + String((unsigned long long)sysState.sdTotal) + ",";
+    status += "\"sd_used\":" + String((unsigned long long)sysState.sdUsed) + ",";
+    status += "\"digital_online\":" + mqttBool(sysState.digitalSlaveOnline) + ",";
+    status += "\"pzem_online\":" + mqttBool(sysState.pzemSlaveOnline) + ",";
+    status += "\"pzem_health\":" + mqttBool(sysState.pzemSensorHealthy) + ",";
+    status += "\"dht_ok\":" + mqttBool(sysState.dhtHealthy);
+    status += "}";
+
+    xSemaphoreGive(stateMutex);
+    mqttClient.publish((base + "/live/sensors").c_str(), sensors.c_str(),
+                       false);
+    mqttClient.publish((base + "/live/relays").c_str(), relays.c_str(), false);
+    mqttClient.publish((base + "/live/status").c_str(), status.c_str(), false);
+  }
+}
+
+void requestHistoryBatch(bool force) {
+  if (!mqttClient.connected() || g_historyPending)
+    return;
+  uint32_t now = millis();
+  if (!force && now - g_historyLastRequestMs < MQTT_HISTORY_RETRY_MS)
+    return;
+  g_historyLastRequestMs = now;
+  enqueueUartCmd("{\"t\":\"hist_req\",\"after\":" +
+                 String(g_historyPendingLastId) + ",\"limit\":" +
+                 String(MQTT_HISTORY_BATCH_LIMIT) + "}");
 }
 
 void mqttTask(void *pvParameters) {
   mqttClient.setServer(g_mqttConfig.broker, g_mqttConfig.port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(g_mqttConfig.keepAlive);
+  mqttClient.setBufferSize(3072);
 
   uint32_t lastReconnectAttempt = 0;
   uint32_t lastHeartbeat = 0;
@@ -1269,6 +1529,7 @@ void mqttTask(void *pvParameters) {
       }
       mqttClient.setServer(g_mqttConfig.broker, g_mqttConfig.port);
       mqttClient.setKeepAlive(g_mqttConfig.keepAlive);
+      mqttClient.setBufferSize(3072);
       wasMqttConnected = false;
       lastReconnectAttempt = 0;
     }
@@ -1311,8 +1572,12 @@ void mqttTask(void *pvParameters) {
             mqttClient.subscribe((base + "/relay/+/lock").c_str());
             mqttClient.subscribe((base + "/cmd/slave/d1").c_str());
             mqttClient.subscribe((base + "/cmd/slave/pzem").c_str());
+            mqttClient.subscribe((base + "/cmd/request").c_str());
+            mqttClient.subscribe((base + "/history/ack").c_str());
 
             publishAllRetainedStates();
+            publishLiveData();
+            requestHistoryBatch(true);
             enqueueUartCmd("{\"t\":\"cloud\",\"up\":true}");
             wasMqttConnected = true;
             Serial.printf("[MQTT] Connected to %s:%d (topic: %s)\n",
@@ -1331,10 +1596,23 @@ void mqttTask(void *pvParameters) {
         }
       } else {
         mqttClient.loop();
+        if (g_pendingD1CmdId.length() > 0 &&
+            millis() - g_pendingD1CmdMs > MQTT_HISTORY_RETRY_MS) {
+          publishCommandAck(g_pendingD1CmdId, g_pendingD1CmdType, false,
+                            "timeout", 7);
+          g_pendingD1CmdId = "";
+          g_pendingD1CmdType = "";
+        }
+        if (g_historyPending &&
+            millis() - g_historyLastRequestMs > MQTT_HISTORY_RETRY_MS) {
+          g_historyPending = false;
+          g_historyPendingBatchId = "";
+        }
         if (millis() - lastHeartbeat > HEARTBEAT_MS) {
           lastHeartbeat = millis();
           publishTelemetry();
         }
+        requestHistoryBatch(false);
       }
     }
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -1502,9 +1780,54 @@ void uartCommTask(void *pvParameters) {
                                    ",\"oc_lock\":" + String(overcurrentLock) + "}";
                   mqttClient.publish((base + "/relay/6/cmd_ack").c_str(),
                                      ackJson.c_str(), false);
+                  if (g_pendingD1CmdId.length() > 0) {
+                    String reasonText = "done";
+                    if (!ok) {
+                      if (reason == 1)
+                        reasonText = "locked";
+                      else if (reason == 2)
+                        reasonText = "master_locked";
+                      else if (reason == 3)
+                        reasonText = "overcurrent_locked";
+                      else
+                        reasonText = "rejected";
+                    }
+                    publishCommandAck(g_pendingD1CmdId, g_pendingD1CmdType, ok,
+                                      reasonText, 7, relay != 0,
+                                      (relayLock || masterLock) != 0);
+                    g_pendingD1CmdId = "";
+                    g_pendingD1CmdType = "";
+                  }
                 }
 #endif
               }
+            } else if (type == "hist_res") {
+#if MQTT_ENABLED
+              if (mqttClient.connected() && !g_historyPending) {
+                JsonArray records = doc["records"].as<JsonArray>();
+                uint32_t lastId = doc["last"] | 0;
+                if (records.size() > 0 && lastId > 0) {
+                  String batchId = String(g_mqttConfig.clientId) + "-" +
+                                   String(lastId) + "-" + String(millis());
+                  String payload = "{\"batch_id\":\"" + jsonEscape(batchId) +
+                                   "\",\"device\":\"" +
+                                   jsonEscape(g_mqttConfig.clientId) +
+                                   "\",\"records\":";
+                  String recordsJson;
+                  serializeJson(records, recordsJson);
+                  payload += recordsJson;
+                  payload += "}";
+                  String base = String(g_mqttConfig.baseTopic);
+                  if (mqttClient.publish((base + "/history/batch").c_str(),
+                                         payload.c_str(), false)) {
+                    g_historyPending = true;
+                    g_historyPendingBatchId = batchId;
+                    g_historyPendingLastId = lastId;
+                    g_historyLastRequestMs = millis();
+                  }
+                }
+              }
+#endif
             } else if (type == "off") {
               String dev = doc["dev"];
               if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {

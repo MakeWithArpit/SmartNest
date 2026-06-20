@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <esp_now.h>
+#include <Preferences.h>
 
 struct __attribute__((packed)) CmdPacket {
   uint8_t type;
@@ -10,6 +11,18 @@ struct __attribute__((packed)) DigitalSlavePacket {
   float rmsCurrent;
   uint8_t relayState;
   uint8_t switchState;
+  uint8_t lockState;
+};
+
+struct __attribute__((packed)) DigitalCmdAckPacket {
+  uint8_t type;
+  uint8_t cmdType;
+  uint8_t accepted;
+  uint8_t reason;
+  uint8_t relayState;
+  uint8_t relayLockState;
+  uint8_t masterLockState;
+  uint8_t overcurrentLockState;
 };
 
 // Pins
@@ -25,10 +38,13 @@ struct __attribute__((packed)) DigitalSlavePacket {
 uint8_t masterMacAddress[] = {0x88, 0x57, 0x21, 0xB1, 0xD3, 0x74};
 
 bool overcurrentLock = false;
+bool relayLock = false;
 bool masterLock = false;
 bool relayCondition = false;
+bool relayOutputState = false;
 float currentAmperes = 0.0f;
 float zeroMilliVolts = 0.0f;
+Preferences controlPrefs;
 
 // Non-blocking current measurement integration variables
 double sqSum = 0.0;
@@ -52,23 +68,102 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   portEXIT_CRITICAL_ISR(&receiveMux);
 }
 
+void saveControlState() {
+  controlPrefs.putBool("relay", relayCondition);
+  controlPrefs.putBool("rLock", relayLock);
+  controlPrefs.putBool("mLock", masterLock);
+}
+
+void applyRelayHardware() {
+  bool actualRelay = relayCondition && !relayLock && !masterLock && !overcurrentLock;
+  digitalWrite(RELAY_PIN, actualRelay ? LOW : HIGH);
+  relayOutputState = actualRelay;
+}
+
+void loadControlState() {
+  controlPrefs.begin("d1_ctrl", false);
+  relayCondition = controlPrefs.getBool("relay", false);
+  relayLock = controlPrefs.getBool("rLock", false);
+  masterLock = controlPrefs.getBool("mLock", false);
+  applyRelayHardware();
+  Serial.printf("[DigitalBoard] Loaded state: relay=%s relayLock=%s masterLock=%s\n",
+                relayCondition ? "ON" : "OFF", relayLock ? "ON" : "OFF",
+                masterLock ? "ON" : "OFF");
+}
+
 // Relay Control
-void relayOn() {
-  if (masterLock || overcurrentLock) {
-    Serial.printf(
-        "[DigitalBoard] relayOn() blocked — masterLock=%d overcurrentLock=%d\n",
-        masterLock, overcurrentLock);
-    return;
+uint8_t currentLockReason() {
+  if (relayLock || masterLock || overcurrentLock) {
+    if (relayLock)
+      return 1;
+    if (masterLock)
+      return 2;
+    return 3;
   }
-  digitalWrite(RELAY_PIN, LOW);
+  return 0;
+}
+
+void sendCommandAck(uint8_t cmdType, bool accepted, uint8_t reason) {
+  DigitalCmdAckPacket pkt;
+  pkt.type = 0x12;
+  pkt.cmdType = cmdType;
+  pkt.accepted = accepted ? 1 : 0;
+  pkt.reason = reason;
+  pkt.relayState = relayOutputState ? 1 : 0;
+  pkt.relayLockState = relayLock ? 1 : 0;
+  pkt.masterLockState = masterLock ? 1 : 0;
+  pkt.overcurrentLockState = overcurrentLock ? 1 : 0;
+  esp_now_send(masterMacAddress, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+bool relayOn() {
+  uint8_t reason = currentLockReason();
+  if (reason != 0) {
+    Serial.printf(
+        "[DigitalBoard] relayOn() blocked - relayLock=%d masterLock=%d overcurrentLock=%d\n",
+        relayLock, masterLock, overcurrentLock);
+    return false;
+  }
   relayCondition = true;
+  saveControlState();
+  applyRelayHardware();
   Serial.println("[DigitalBoard] Relay -> ON");
+  return true;
 }
 
 void relayOff() {
-  digitalWrite(RELAY_PIN, HIGH);
   relayCondition = false;
+  saveControlState();
+  applyRelayHardware();
   Serial.println("[DigitalBoard] Relay -> OFF");
+}
+
+void forceRelayOff() {
+  bool wasOn = relayOutputState;
+  applyRelayHardware();
+  if (wasOn) {
+    Serial.println("[DigitalBoard] Relay forced OFF");
+  }
+}
+
+void setRelayLock(bool locked) {
+  relayLock = locked;
+  if (relayLock) {
+    relayCondition = false;
+  }
+  saveControlState();
+  applyRelayHardware();
+  Serial.printf("[DigitalBoard] Relay lock -> %s\n", locked ? "ON" : "OFF");
+}
+
+void setMasterLock(bool locked) {
+  masterLock = locked;
+  if (masterLock) {
+    relayCondition = false;
+  }
+  saveControlState();
+  applyRelayHardware();
+  Serial.printf("[DigitalBoard] Master lock -> %s\n", locked ? "ON" : "OFF");
 }
 
 // 1 kHz non-blocking current sampler
@@ -92,11 +187,15 @@ void sampleCurrentNonBlocking() {
 // Overcurrent Protection check (Threshold: 6.0A RMS)
 void checkOvercurrentProtection() {
   if (currentAmperes >= 6.0f) {
-    overcurrentLock = true;
-    relayOff();
-    Serial.print("[CRITICAL ERROR] Overcurrent detected: ");
-    Serial.print(currentAmperes, 2);
-    Serial.println(" A! Relay locked OFF.");
+    if (!overcurrentLock) {
+      overcurrentLock = true;
+      forceRelayOff();
+      Serial.print("[CRITICAL ERROR] Overcurrent detected: ");
+      Serial.print(currentAmperes, 2);
+      Serial.println(" A! Relay locked OFF.");
+    } else {
+      forceRelayOff();
+    }
   }
 
   if (overcurrentLock) {
@@ -105,6 +204,7 @@ void checkOvercurrentProtection() {
       if (consecutiveLowCurrentCount >= 3) { // Stays below 5.5A for 600ms total
         overcurrentLock = false;
         consecutiveLowCurrentCount = 0;
+        applyRelayHardware();
         Serial.println("[INFO] Overcurrent cleared. System restored.");
       }
     } else {
@@ -139,9 +239,18 @@ void checkManualSwitch() {
   static bool lastRawState = HIGH;
   static bool lastDebouncedState = HIGH;
   static unsigned long stateStableTime = 0;
+  static bool initialized = false;
 
   bool rawState = digitalRead(MANUAL_SWITCH_PIN);
   unsigned long currentTime = millis();
+
+  if (!initialized) {
+    lastRawState = rawState;
+    lastDebouncedState = rawState;
+    stateStableTime = currentTime;
+    initialized = true;
+    return;
+  }
 
   if (rawState != lastRawState) {
     stateStableTime = currentTime;
@@ -151,7 +260,7 @@ void checkManualSwitch() {
       lastDebouncedState = rawState;
 
       if (rawState == HIGH) {
-        if (masterLock || overcurrentLock) {
+        if (relayLock || masterLock || overcurrentLock) {
           Serial.println("[DigitalBoard] Switch ON ignored — locked");
         } else {
           Serial.println("[DigitalBoard] Switch toggled ON");
@@ -194,6 +303,9 @@ void updateLEDState() {
   } else if (masterLock) {
     // Master Lock: Cyan solid
     setLEDColor(false, true, true);
+  } else if (relayLock) {
+    // Relay Lock: Yellow solid
+    setLEDColor(true, true, false);
   } else if (relayCondition) {
     // Relay ON: Green solid
     setLEDColor(false, true, false);
@@ -214,18 +326,20 @@ void updateLEDState() {
 void sendSlaveData() {
   DigitalSlavePacket pkt;
   pkt.type = 0x10;
-  pkt.rmsCurrent = relayCondition ? currentAmperes : 0.0f;
-  pkt.relayState = relayCondition ? 1 : 0;
+  pkt.rmsCurrent = relayOutputState ? currentAmperes : 0.0f;
+  pkt.relayState = relayOutputState ? 1 : 0;
   pkt.switchState = (digitalRead(MANUAL_SWITCH_PIN) == LOW) ? 1 : 0;
+  pkt.lockState = (relayLock || masterLock) ? 1 : 0;
   esp_now_send(masterMacAddress, (uint8_t *)&pkt, sizeof(pkt));
 }
 
 void sendAckReply() {
   DigitalSlavePacket pkt;
   pkt.type = 0x11;
-  pkt.rmsCurrent = currentAmperes;
-  pkt.relayState = relayCondition ? 1 : 0;
+  pkt.rmsCurrent = relayOutputState ? currentAmperes : 0.0f;
+  pkt.relayState = relayOutputState ? 1 : 0;
   pkt.switchState = 0;
+  pkt.lockState = (relayLock || masterLock) ? 1 : 0;
   esp_now_send(masterMacAddress, (uint8_t *)&pkt, sizeof(pkt));
 }
 
@@ -239,6 +353,7 @@ void setup() {
 
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH); // Start with Relay OFF (Active HIGH)
+  loadControlState();
 
   pinMode(MANUAL_SWITCH_PIN, INPUT_PULLUP);
   pinMode(CURRENT_SENSOR_PIN, INPUT);
@@ -302,27 +417,43 @@ void loop() {
         Serial.printf("[TIMING] Digital Board relay toggled at: %lu\n",
                       millis());
         Serial.println("[DigitalBoard] CMD: relay_on");
-        relayOn();
+        {
+          bool accepted = relayOn();
+          sendCommandAck(cmdType, accepted, accepted ? 0 : currentLockReason());
+        }
         break;
       case 0x03:
         Serial.printf("[TIMING] Digital Board relay toggled at: %lu\n",
                       millis());
         Serial.println("[DigitalBoard] CMD: relay_off");
         relayOff();
+        sendCommandAck(cmdType, true, 0);
         break;
       case 0x04:
-        Serial.println("[DigitalBoard] CMD: masterLock ON");
-        masterLock = true;
-        relayOff();
+        Serial.println("[DigitalBoard] CMD: relay_lock");
+        setRelayLock(true);
+        sendCommandAck(cmdType, true, 0);
         break;
       case 0x05:
-        Serial.println("[DigitalBoard] CMD: masterLock OFF");
-        masterLock = false;
+        Serial.println("[DigitalBoard] CMD: relay_unlock");
+        setRelayLock(false);
+        sendCommandAck(cmdType, true, 0);
         break;
       case 0x06:
         Serial.println("[DigitalBoard] CMD: reboot");
+        sendCommandAck(cmdType, true, 0);
         delay(100);
         ESP.restart();
+        break;
+      case 0x08:
+        Serial.println("[DigitalBoard] CMD: masterLock ON");
+        setMasterLock(true);
+        sendCommandAck(cmdType, true, 0);
+        break;
+      case 0x09:
+        Serial.println("[DigitalBoard] CMD: masterLock OFF");
+        setMasterLock(false);
+        sendCommandAck(cmdType, true, 0);
         break;
       }
     }
@@ -347,18 +478,19 @@ void loop() {
   if (millis() - lastStatusLogTime >= 5000) {
     lastStatusLogTime = millis();
     Serial.printf("[DigitalBoard] RMS: %.2fA | Relay: %s | MasterLock: %s | "
-                  "OC-Lock: %s\n",
-                  currentAmperes, relayCondition ? "ON" : "OFF",
-                  masterLock ? "YES" : "NO", overcurrentLock ? "YES" : "NO");
+                  "RelayLock: %s | OC-Lock: %s\n",
+                  currentAmperes, relayOutputState ? "ON" : "OFF",
+                  masterLock ? "YES" : "NO", relayLock ? "YES" : "NO",
+                  overcurrentLock ? "YES" : "NO");
   }
 
   static bool lastRelayCondition = false;
   static unsigned long lastTelemetryTime = 0;
   unsigned long currentTime = millis();
 
-  if (relayCondition != lastRelayCondition ||
+  if (relayOutputState != lastRelayCondition ||
       (currentTime - lastTelemetryTime >= 30000)) {
-    lastRelayCondition = relayCondition;
+    lastRelayCondition = relayOutputState;
     lastTelemetryTime = currentTime;
 
     if (lastAcknowledgementTime > 0) {

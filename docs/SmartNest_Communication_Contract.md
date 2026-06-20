@@ -220,6 +220,8 @@ Master UART pins:
 | `{"t":"cloud","up":true}` | MQTT/cloud online status |
 | `{"t":"files_req"}` | Request SD log file list |
 | `{"t":"read_req","file":"energy_log.csv","chunk":0}` | Read 10 energy-log CSV rows from file chunk |
+| `{"t":"hist_req","after":41,"limit":6}` | Request unsent history records after record id |
+| `{"t":"hist_ack","last":51}` | Mark cloud-uploaded history records through id as synced |
 | `{"t":"factory_reset"}` | Reset saved energy state on Master SD |
 | `{"t":"clear_logs"}` | Delete SD log files |
 
@@ -360,6 +362,12 @@ The CSV header is:
 epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s
 ```
 
+New rows use this expanded header:
+
+```csv
+record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s
+```
+
 Logging rules:
 
 | Field | Meaning |
@@ -373,6 +381,8 @@ Logging rules:
 | `digital_power_w` | Digital board calculated power: PZEM voltage x digital current |
 | `digital_energy_kwh` | Integrated digital board energy |
 | `r1_on_s` to `r7_on_s` | Relay ON runtime counters in seconds |
+| `record_id` | Monotonic SD record id used by MQTT history sync |
+| `ac_current`, `ac_power_w`, `ac_energy_kwh` | PZEM air-conditioner current, power, and energy |
 
 Master updates energy every second and writes SD snapshots every 10 seconds when there is measured current or accumulated energy. PZEM voltage is used as the common voltage reference.
 
@@ -506,6 +516,96 @@ Default connection:
 | Base topic | `smartnest` |
 
 ### MQTT Topics Published By SmartNest
+
+The MQTT contract is now split into three sections:
+
+- `live`: current readings and state, no ACK required.
+- `cmd`: cloud commands and SmartNest command acknowledgements.
+- `history`: SD-backed records intended for cloud database storage.
+
+During migration, older relay/sensor topics continue to publish/subscribe for compatibility.
+
+#### Live Topics
+
+| Topic | Payload | Retained | Meaning |
+|---|---|---:|---|
+| `<base>/live/status` | JSON | no | Uptime, WiFi, MQTT, SD, slave, and sensor health |
+| `<base>/live/sensors` | JSON | no | Voltage, currents, power, energy, temperature, humidity |
+| `<base>/live/relays` | JSON | no | Relay states, locks, master lock, digital switch, runtimes |
+
+#### Command Topics
+
+| Topic | Payload | Direction | Meaning |
+|---|---|---|---|
+| `<base>/cmd/request` | JSON | Cloud -> SmartNest | Cloud command with `cmd_id` |
+| `<base>/cmd/ack` | JSON | SmartNest -> Cloud | Result for a command |
+
+Command request example:
+
+```json
+{"cmd_id":"abc123","type":"relay_set","relay":1,"state":true}
+```
+
+Supported command `type` values:
+
+| Type | Required fields | Meaning |
+|---|---|---|
+| `relay_set` | `relay`, `state` | Set relay 1-7 ON/OFF |
+| `relay_toggle` | `relay` | Toggle relay 1-7 |
+| `relay_lock` | `relay`, `locked` | Lock/unlock relay 1-7 |
+| `master_lock` | `state` | Set master lock |
+| `slave_reboot` | `target` | Reboot `digital`, `d1`, or `pzem` |
+| `pzem_energy_reset` | none | Reset PZEM energy register |
+
+ACK example:
+
+```json
+{"cmd_id":"abc123","type":"relay_set","ok":true,"reason":"done","relay":1,"state":true,"locked":false}
+```
+
+Common failure reasons: `invalid_payload`, `invalid_relay`, `locked`, `master_locked`, `overcurrent_locked`, `busy`, `timeout`, `unsupported`.
+
+#### History Topics
+
+| Topic | Payload | Direction | Meaning |
+|---|---|---|---|
+| `<base>/history/batch` | JSON | SmartNest -> Cloud | SD-backed records for database storage |
+| `<base>/history/ack` | JSON | Cloud -> SmartNest | Batch acknowledgement |
+
+History batch example:
+
+```json
+{
+  "batch_id": "SmartNest_001-51-123456",
+  "device": "SmartNest_001",
+  "records": [
+    {
+      "id": 51,
+      "epoch": 1781971200,
+      "date": "2026-06-20 22:10:00",
+      "voltage": 230.1,
+      "main_current": 1.250,
+      "main_power_w": 287.63,
+      "main_energy_kwh": 0.120400,
+      "digital_current": 0.520,
+      "digital_power_w": 119.65,
+      "digital_energy_kwh": 0.040150,
+      "ac_current": 1.234,
+      "ac_power_w": 287.50,
+      "ac_energy_kwh": 18.905000,
+      "runtimes": [12, 0, 44, 0, 0, 0, 18]
+    }
+  ]
+}
+```
+
+Cloud ACK example:
+
+```json
+{"batch_id":"SmartNest_001-51-123456","ok":true,"last_id":51}
+```
+
+SmartNest requests history from Master over UART, publishes a batch, and only advances Master sync state after cloud ACK.
 
 #### Retained State Topics
 

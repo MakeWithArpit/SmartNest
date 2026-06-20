@@ -2,7 +2,6 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <HardwareSerial.h>
-#include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <freertos/FreeRTOS.h>
@@ -22,6 +21,10 @@ const int SWITCH_PINS[6] = {33, 32, 26, 27, 14, 13};
 #define SD_MOSI 23
 #define SD_MISO 19
 #define SD_SCK  18
+#define SD_LOG_DIR "/SmartNestLogs"
+#define SD_ENERGY_LOG_FILE "energy_log.csv"
+#define SD_SYNC_STATE_FILE "sync_state.txt"
+#define SD_HISTORY_MAX_BATCH 10
 
 // Hardware Structures & Centralized State
 struct DigitalBoardState {
@@ -45,16 +48,6 @@ struct PzemBoardState {
     bool     sensorHealthy;  // true if PZEM sensor returned valid (non-NaN) readings
 };
 
-struct EnergyState {
-    double   activePowerVA;
-    double   dailyEnergy;      // Wh
-    double   monthlyEnergy;    // Wh
-    double   lifetimeEnergy;   // Wh
-    uint32_t lastCalcTime;
-    bool     pendingSave;
-    double   lastSavedLifetime;
-};
-
 struct TimeState {
     uint32_t baseEpoch;
     uint32_t baseMillis;
@@ -67,19 +60,25 @@ struct SdCardState {
     uint64_t totalBytes;
     uint64_t usedBytes;
     uint32_t droppedRecords;
-    uint8_t  syncStatus;       // 0=Idle, 1=Syncing, 2=Error
+    uint32_t nextRecordId;
+    uint32_t lastAckedRecordId;
     bool     cardPresent;
-    uint32_t lastSyncedEpoch;
-    uint32_t lastLoggedEpoch;
+};
+
+struct EnergyMeterState {
+    double mainEnergyWh;
+    double digitalEnergyWh;
+    uint32_t relayRuntimeSec[7];
 };
 
 struct SystemData {
     DigitalBoardState digital;
     PzemBoardState    pzem;
-    EnergyState       energy;
     TimeState         time;
     SdCardState       sd;
-    float internetAcsCurrentA; // Combined current
+    EnergyMeterState  energy;
+    float smartNestAcsCurrentA; // SmartNest local six-relay ACS current
+    uint8_t smartNestRelayMask;
     bool  cloudOnline;
     bool  masterLock;          // Global lock — all relays OFF, ignores commands
     bool  desiredDigitalRelay;
@@ -91,12 +90,15 @@ struct SystemData {
     int   readChunk;
     bool  factoryResetRequest;
     bool  clearLogsRequest;
+    bool  historyRequest;
+    uint32_t historyAfterId;
+    uint8_t historyLimit;
+    bool  historyAckRequest;
+    uint32_t historyAckLastId;
 };
 
 SemaphoreHandle_t g_stateMutex = NULL;
 SystemData        g_systemState;
-Preferences       g_controlPrefs;
-volatile bool     g_applyDigitalControl = false;
 
 // Queue definitions
 struct EspNowPacket {
@@ -108,17 +110,26 @@ struct EspNowPacket {
 QueueHandle_t g_espNowQueue = NULL;
 
 struct UartTxItem {
-    char     json[768];
+    char     json[2048];
 };
 QueueHandle_t g_uartTxQueue = NULL;
 
-struct __attribute__((packed)) SdLogRecord {
+struct EnergyLogSample {
+    uint32_t recordId;
     uint32_t epoch;
-    float    voltage;
-    float    acsCurrent; // Combined current
-    float    pzemCurrent;
-    float    powerVA;
-    uint8_t  relayStates;
+    int8_t   tzHours;
+    uint8_t  tzMins;
+    float voltage;
+    float mainCurrent;
+    float mainPowerW;
+    double mainEnergyWh;
+    float digitalCurrent;
+    float digitalPowerW;
+    double digitalEnergyWh;
+    float acCurrent;
+    float acPowerW;
+    float acEnergyKWh;
+    uint32_t relayRuntimeSec[7];
 };
 QueueHandle_t g_sdQueue = NULL;
 
@@ -127,8 +138,6 @@ struct SwitchEvent {
     bool    state;
 };
 QueueHandle_t g_switchQueue = NULL;
-
-SemaphoreHandle_t g_histAckSem = NULL;
 
 // Binary ESP-NOW Structs
 struct __attribute__((packed)) CmdPacket {
@@ -141,84 +150,14 @@ void sendDigitalCommand(uint8_t type) {
     esp_now_send(SLAVE1_MAC, (uint8_t*)&cp, sizeof(cp));
 }
 
-void loadControlState() {
-    g_controlPrefs.begin("ctrl_state", false);
-
-    bool masterLock = g_controlPrefs.getBool("masterLock", false);
-    bool relay = g_controlPrefs.getBool("dRelay", false);
-    bool locked = g_controlPrefs.getBool("dLocked", false);
-
-    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        g_systemState.masterLock = masterLock;
-        g_systemState.desiredDigitalRelay = relay;
-        g_systemState.desiredDigitalLocked = locked;
-        g_systemState.digital.locked = locked || masterLock;
-        xSemaphoreGive(g_stateMutex);
-    }
-
-    Serial.printf("[Master] Loaded control state: masterLock=%s relay7=%s lock7=%s\n",
-                  masterLock ? "ON" : "OFF", relay ? "ON" : "OFF",
-                  locked ? "ON" : "OFF");
-}
-
-bool saveControlState() {
-    bool masterLock = false;
-    bool relay = false;
-    bool locked = false;
-
-    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        return false;
-    }
-
-    masterLock = g_systemState.masterLock;
-    relay = g_systemState.desiredDigitalRelay;
-    locked = g_systemState.desiredDigitalLocked;
-    xSemaphoreGive(g_stateMutex);
-
-    g_controlPrefs.putBool("masterLock", masterLock);
-    g_controlPrefs.putBool("dRelay", relay);
-    g_controlPrefs.putBool("dLocked", locked);
-    return true;
-}
-
-void applyDigitalControlState() {
-    bool masterLock = false;
-    bool relay = false;
-    bool locked = false;
-
-    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-        return;
-    }
-
-    masterLock = g_systemState.masterLock;
-    relay = g_systemState.desiredDigitalRelay;
-    locked = g_systemState.desiredDigitalLocked;
-    xSemaphoreGive(g_stateMutex);
-
-    if (masterLock || locked) {
-        sendDigitalCommand(0x04);
-    } else {
-        sendDigitalCommand(0x05);
-        vTaskDelay(pdMS_TO_TICKS(30));
-        sendDigitalCommand(relay ? 0x02 : 0x03);
-    }
-
-    Serial.printf("[Master] Applied control state: masterLock=%s relay7=%s lock7=%s\n",
-                  masterLock ? "ON" : "OFF", relay ? "ON" : "OFF",
-                  locked ? "ON" : "OFF");
-}
-
 void setDesiredDigitalRelay(bool relay) {
     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         g_systemState.desiredDigitalRelay = relay;
         xSemaphoreGive(g_stateMutex);
     }
 
-    if (saveControlState()) {
-        applyDigitalControlState();
-    } else {
-        Serial.println("[Master] Failed to persist relay 7 state; command not applied");
-    }
+    sendDigitalCommand(relay ? 0x02 : 0x03);
+    Serial.printf("[Master] Digital relay command forwarded: %s\n", relay ? "ON" : "OFF");
 }
 
 void setDesiredDigitalLock(bool locked) {
@@ -228,11 +167,8 @@ void setDesiredDigitalLock(bool locked) {
         xSemaphoreGive(g_stateMutex);
     }
 
-    if (saveControlState()) {
-        applyDigitalControlState();
-    } else {
-        Serial.println("[Master] Failed to persist relay 7 lock; command not applied");
-    }
+    sendDigitalCommand(locked ? 0x04 : 0x05);
+    Serial.printf("[Master] Digital relay lock command forwarded: %s\n", locked ? "ON" : "OFF");
 }
 
 void setDesiredMasterLock(bool locked) {
@@ -242,11 +178,8 @@ void setDesiredMasterLock(bool locked) {
         xSemaphoreGive(g_stateMutex);
     }
 
-    if (saveControlState()) {
-        applyDigitalControlState();
-    } else {
-        Serial.println("[Master] Failed to persist master lock; command not applied");
-    }
+    sendDigitalCommand(locked ? 0x08 : 0x09);
+    Serial.printf("[Master] Master lock command forwarded: %s\n", locked ? "ON" : "OFF");
 }
 
 struct __attribute__((packed)) DigitalSlavePacket {
@@ -254,6 +187,18 @@ struct __attribute__((packed)) DigitalSlavePacket {
     float   rmsCurrent;
     uint8_t relayState;
     uint8_t switchState;
+    uint8_t lockState;
+};
+
+struct __attribute__((packed)) DigitalCmdAckPacket {
+    uint8_t type;
+    uint8_t cmdType;
+    uint8_t accepted;
+    uint8_t reason;
+    uint8_t relayState;
+    uint8_t relayLockState;
+    uint8_t masterLockState;
+    uint8_t overcurrentLockState;
 };
 
 struct __attribute__((packed)) PzemSlavePacket {
@@ -296,24 +241,162 @@ void epochToDateTime(uint32_t epoch, int &year, int &month, int &day, int &hour,
     day = days + 1;
 }
 
-// Binary search inside day's log file to seek to target record
-int findFirstRecordAfter(File &file, uint32_t targetEpoch) {
-    int low = 0;
-    int high = (file.size() / 21) - 1;
-    int ans = -1;
-    while (low <= high) {
-        int mid = low + (high - low) / 2;
-        if (!file.seek(mid * 21)) break;
-        uint32_t recEpoch = 0;
-        if (file.read((uint8_t*)&recEpoch, 4) != 4) break;
-        if (recEpoch > targetEpoch) {
-            ans = mid;
-            high = mid - 1;
-        } else {
-            low = mid + 1;
+void buildLogFilePath(char* out, size_t outSize, const char* filename) {
+    snprintf(out, outSize, "%s/%s", SD_LOG_DIR, filename);
+}
+
+void buildEnergyLogPath(char* out, size_t outSize) {
+    buildLogFilePath(out, outSize, SD_ENERGY_LOG_FILE);
+}
+
+void buildSyncStatePath(char* out, size_t outSize) {
+    buildLogFilePath(out, outSize, SD_SYNC_STATE_FILE);
+}
+
+uint32_t readUintFile(const char* path, uint32_t fallback) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        return fallback;
+    }
+    String s = f.readStringUntil('\n');
+    f.close();
+    s.trim();
+    if (s.length() == 0) {
+        return fallback;
+    }
+    return (uint32_t)strtoul(s.c_str(), NULL, 10);
+}
+
+void writeUintFile(const char* path, uint32_t value) {
+    SD.remove(path);
+    File f = SD.open(path, FILE_WRITE);
+    if (f) {
+        f.printf("%u\n", value);
+        f.close();
+    }
+}
+
+uint32_t scanMaxEnergyRecordId(const char* path) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        return 0;
+    }
+    uint32_t maxId = 0;
+    bool header = true;
+    char line[256];
+    size_t idx = 0;
+    while (f.available()) {
+        char c = f.read();
+        if (c == '\n') {
+            line[idx] = '\0';
+            if (!header && idx > 0) {
+                uint32_t id = (uint32_t)strtoul(line, NULL, 10);
+                if (id > maxId) {
+                    maxId = id;
+                }
+            }
+            header = false;
+            idx = 0;
+        } else if (c != '\r' && idx < sizeof(line) - 1) {
+            line[idx++] = c;
         }
     }
-    return ans;
+    if (!header && idx > 0) {
+        line[idx] = '\0';
+        uint32_t id = (uint32_t)strtoul(line, NULL, 10);
+        if (id > maxId) {
+            maxId = id;
+        }
+    }
+    f.close();
+    return maxId;
+}
+
+void sendHistoryResponse(uint32_t afterId, uint8_t limit) {
+    char energyLogPath[96];
+    buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+    File f = SD.open(energyLogPath, FILE_READ);
+    if (!f) {
+        enqueueUartTx("{\"t\":\"hist_res\",\"records\":[],\"last\":0}");
+        return;
+    }
+
+    uint32_t ackedId = 0;
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        ackedId = g_systemState.sd.lastAckedRecordId;
+        xSemaphoreGive(g_stateMutex);
+    }
+    uint32_t cursor = afterId > ackedId ? afterId : ackedId;
+    if (limit == 0 || limit > SD_HISTORY_MAX_BATCH) {
+        limit = SD_HISTORY_MAX_BATCH;
+    }
+
+    char json[2048];
+    int written = snprintf(json, sizeof(json), "{\"t\":\"hist_res\",\"records\":[");
+    bool first = true;
+    bool header = true;
+    uint8_t count = 0;
+    uint32_t lastId = cursor;
+    char line[320];
+    size_t idx = 0;
+
+    while (f.available() && count < limit) {
+        char c = f.read();
+        if (c == '\n') {
+            line[idx] = '\0';
+            if (!header && idx > 0) {
+                char work[320];
+                strncpy(work, line, sizeof(work) - 1);
+                work[sizeof(work) - 1] = '\0';
+                char* fields[20] = {0};
+                int fieldCount = 0;
+                char* tok = strtok(work, ",");
+                while (tok && fieldCount < 20) {
+                    fields[fieldCount++] = tok;
+                    tok = strtok(NULL, ",");
+                }
+                if (fieldCount >= 20) {
+                    uint32_t id = (uint32_t)strtoul(fields[0], NULL, 10);
+                    if (id > cursor) {
+                        int n = snprintf(
+                            json + written, sizeof(json) - written,
+                            "%s{\"id\":%u,\"epoch\":%lu,\"date\":\"%s\",\"voltage\":%s,"
+                            "\"main_current\":%s,\"main_power_w\":%s,\"main_energy_kwh\":%s,"
+                            "\"digital_current\":%s,\"digital_power_w\":%s,\"digital_energy_kwh\":%s,"
+                            "\"ac_current\":%s,\"ac_power_w\":%s,\"ac_energy_kwh\":%s,"
+                            "\"runtimes\":[%s,%s,%s,%s,%s,%s,%s]}",
+                            first ? "" : ",", id, strtoul(fields[1], NULL, 10), fields[2],
+                            fields[3], fields[4], fields[5], fields[6], fields[7],
+                            fields[8], fields[9], fields[10], fields[11], fields[12],
+                            fields[13], fields[14], fields[15], fields[16], fields[17],
+                            fields[18], fields[19]);
+                        if (n > 0 && written + n < (int)sizeof(json) - 32) {
+                            written += n;
+                            first = false;
+                            count++;
+                            lastId = id;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            header = false;
+            idx = 0;
+        } else if (c != '\r' && idx < sizeof(line) - 1) {
+            line[idx++] = c;
+        }
+    }
+    f.close();
+    snprintf(json + written, sizeof(json) - written, "],\"last\":%u}", lastId);
+    enqueueUartTx(json);
+}
+
+void formatLocalDateTime(uint32_t epoch, int8_t tzH, uint8_t tzM, char* out, size_t outSize) {
+    uint32_t localEpoch = epoch + tzH * 3600 + tzM * 60;
+    int y, m, d, hh, mm, ss;
+    epochToDateTime(localEpoch, y, m, d, hh, mm, ss);
+    snprintf(out, outSize, "%04d-%02d-%02d %02d:%02d:%02d", y, m, d, hh, mm, ss);
 }
 
 // ESP-NOW Receive Callback (ISR context)
@@ -368,27 +451,49 @@ void espNowTask(void* pvParameters) {
             bool isSlave2 = (memcmp(pkt.srcMac, SLAVE2_MAC, 6) == 0);
             
             if (isSlave1) {
-                if (pkt.len == sizeof(DigitalSlavePacket)) {
+                uint8_t pktType = pkt.len >= 1 ? pkt.data[0] : 0;
+                if ((pktType == 0x10 || pktType == 0x11) && pkt.len == sizeof(DigitalSlavePacket)) {
                     DigitalSlavePacket* p = (DigitalSlavePacket*)pkt.data;
-                    if (p->type == 0x10 || p->type == 0x11) {
-                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            bool wasOffline = !g_systemState.digital.online;
-                            g_systemState.digital.rmsCurrent = p->rmsCurrent;
-                            g_systemState.digital.relayState = p->relayState;
-                            g_systemState.digital.switchState = p->switchState;
-                            g_systemState.digital.rssi = pkt.rssi;
-                            g_systemState.digital.lastSeenTime = millis();
-                            g_systemState.digital.online = true;
-                            xSemaphoreGive(g_stateMutex);
-                            
-                            if (wasOffline) {
-                                char buf[64];
-                                snprintf(buf, sizeof(buf), "{\"t\":\"on\",\"dev\":\"d1\"}");
-                                enqueueUartTx(buf);
-                                g_applyDigitalControl = true;
-                            }
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        bool wasOffline = !g_systemState.digital.online;
+                        g_systemState.digital.rmsCurrent = p->rmsCurrent;
+                        g_systemState.digital.relayState = p->relayState;
+                        g_systemState.digital.switchState = p->switchState;
+                        g_systemState.digital.locked = p->lockState != 0;
+                        g_systemState.digital.rssi = pkt.rssi;
+                        g_systemState.digital.lastSeenTime = millis();
+                        g_systemState.digital.online = true;
+                        xSemaphoreGive(g_stateMutex);
+
+                        if (wasOffline) {
+                            char buf[64];
+                            snprintf(buf, sizeof(buf), "{\"t\":\"on\",\"dev\":\"d1\"}");
+                            enqueueUartTx(buf);
                         }
                     }
+                } else if (pktType == 0x12 && pkt.len == sizeof(DigitalCmdAckPacket)) {
+                    DigitalCmdAckPacket* p = (DigitalCmdAckPacket*)pkt.data;
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        g_systemState.digital.relayState = p->relayState;
+                        g_systemState.digital.locked = (p->relayLockState != 0) || (p->masterLockState != 0);
+                        g_systemState.masterLock = p->masterLockState != 0;
+                        g_systemState.desiredDigitalLocked = p->relayLockState != 0;
+                        g_systemState.digital.rssi = pkt.rssi;
+                        g_systemState.digital.lastSeenTime = millis();
+                        g_systemState.digital.online = true;
+                        xSemaphoreGive(g_stateMutex);
+                    }
+
+                    char ackBuf[192];
+                    snprintf(ackBuf, sizeof(ackBuf),
+                             "{\"t\":\"cmd_ack\",\"tgt\":\"d1\",\"cmd_type\":%u,\"ok\":%s,\"reason\":%u,\"relay\":%u,\"relay_lock\":%u,\"master_lock\":%u,\"oc_lock\":%u}",
+                             p->cmdType, p->accepted ? "true" : "false",
+                             p->reason, p->relayState, p->relayLockState,
+                             p->masterLockState, p->overcurrentLockState);
+                    enqueueUartTx(ackBuf);
+                    Serial.printf("[Master] Digital cmd_ack type=0x%02X ok=%s reason=%u\n",
+                                  p->cmdType, p->accepted ? "YES" : "NO",
+                                  p->reason);
                 }
             } else if (isSlave2) {
                 if (pkt.len == sizeof(PzemSlavePacket)) {
@@ -415,11 +520,6 @@ void espNowTask(void* pvParameters) {
                     }
                 }
             }
-        }
-
-        if (g_applyDigitalControl) {
-            g_applyDigitalControl = false;
-            applyDigitalControlState();
         }
     }
 }
@@ -449,13 +549,15 @@ void uartTask(void* pvParameters) {
                 char* pCmd = strstr(rxLine, "\"t\":\"cmd\"");
                 char* pNtp = strstr(rxLine, "\"t\":\"ntp\"");
                 char* pAcs = strstr(rxLine, "\"t\":\"acs\"");
+                char* pRel = strstr(rxLine, "\"t\":\"rel\"");
                 char* pCloud = strstr(rxLine, "\"t\":\"cloud\"");
-                char* pHistAck = strstr(rxLine, "\"t\":\"hist_ack\"");
                 char* pLock = strstr(rxLine, "\"t\":\"lock\"");
                 char* pFilesReq = strstr(rxLine, "\"t\":\"files_req\"");
                 char* pReadReq = strstr(rxLine, "\"t\":\"read_req\"");
                 char* pFactoryReset = strstr(rxLine, "\"t\":\"factory_reset\"");
                 char* pClearLogs = strstr(rxLine, "\"t\":\"clear_logs\"");
+                char* pHistReq = strstr(rxLine, "\"t\":\"hist_req\"");
+                char* pHistAck = strstr(rxLine, "\"t\":\"hist_ack\"");
                 
                 if (pCmd) {
                     char* tgtPtr = strstr(rxLine, "\"tgt\":\"");
@@ -538,7 +640,17 @@ void uartTask(void* pvParameters) {
                     if (iPtr) {
                         float iVal = strtof(iPtr + 4, NULL);
                         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            g_systemState.internetAcsCurrentA = iVal;
+                            g_systemState.smartNestAcsCurrentA = iVal;
+                            xSemaphoreGive(g_stateMutex);
+                        }
+                    }
+                }
+                else if (pRel) {
+                    char* maskPtr = strstr(rxLine, "\"mask\":");
+                    if (maskPtr) {
+                        uint8_t maskVal = (uint8_t)strtoul(maskPtr + 7, NULL, 10);
+                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            g_systemState.smartNestRelayMask = maskVal & 0x3F;
                             xSemaphoreGive(g_stateMutex);
                         }
                     }
@@ -553,17 +665,6 @@ void uartTask(void* pvParameters) {
                         }
                     }
                 }
-                else if (pHistAck) {
-                    char* uptoPtr = strstr(rxLine, "\"upto\":");
-                    if (uptoPtr) {
-                        uint32_t uptoVal = strtoul(uptoPtr + 7, NULL, 10);
-                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            g_systemState.sd.lastSyncedEpoch = uptoVal;
-                            xSemaphoreGive(g_stateMutex);
-                        }
-                        xSemaphoreGive(g_histAckSem);
-                    }
-                }
                 // Master Lock: {"t":"lock","val":true/false}
                 else if (pLock) {
                     char* valPtr = strstr(rxLine, "\"val\":");
@@ -571,7 +672,7 @@ void uartTask(void* pvParameters) {
                         bool lockVal = (strncmp(valPtr + 6, "true", 4) == 0);
                         Serial.printf("[LOCK] Lock command received from SmartNest: %s\n", lockVal ? "ON" : "OFF");
                         setDesiredMasterLock(lockVal);
-                        Serial.printf("[LOCK] g_systemState.masterLock stored: %s\n", lockVal ? "ON" : "OFF");
+                        Serial.printf("[LOCK] g_systemState.masterLock updated: %s\n", lockVal ? "ON" : "OFF");
                         
                         // Send lock_ack back to SmartNest
                         char ackBuf[64];
@@ -622,7 +723,35 @@ void uartTask(void* pvParameters) {
                     }
                     Serial.println("[Master] clear_logs received — queued for sdLoggingTask");
                 }
-                
+                else if (pHistReq) {
+                    char* afterPtr = strstr(rxLine, "\"after\":");
+                    char* limitPtr = strstr(rxLine, "\"limit\":");
+                    uint32_t afterVal = afterPtr ? (uint32_t)strtoul(afterPtr + 8, NULL, 10) : 0;
+                    uint8_t limitVal = limitPtr ? (uint8_t)strtoul(limitPtr + 8, NULL, 10) : 6;
+                    if (limitVal == 0 || limitVal > SD_HISTORY_MAX_BATCH) {
+                        limitVal = SD_HISTORY_MAX_BATCH;
+                    }
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        g_systemState.historyRequest = true;
+                        g_systemState.historyAfterId = afterVal;
+                        g_systemState.historyLimit = limitVal;
+                        xSemaphoreGive(g_stateMutex);
+                    }
+                    Serial.printf("[Master] hist_req received after=%u limit=%u\n", afterVal, limitVal);
+                }
+                else if (pHistAck) {
+                    char* lastPtr = strstr(rxLine, "\"last\":");
+                    if (lastPtr) {
+                        uint32_t lastVal = (uint32_t)strtoul(lastPtr + 7, NULL, 10);
+                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            g_systemState.historyAckRequest = true;
+                            g_systemState.historyAckLastId = lastVal;
+                            xSemaphoreGive(g_stateMutex);
+                        }
+                        Serial.printf("[Master] hist_ack received last=%u\n", lastVal);
+                    }
+                }
+
                 rxIndex = 0;
             } else if (c != '\r') {
                 if (rxIndex < sizeof(rxLine) - 1) {
@@ -675,22 +804,18 @@ void switchPollTask(void* pvParameters) {
 // Core 1 Tasks
 
 void energyTimeTask(void* pvParameters) {
-    uint32_t lastTick = millis();
     uint32_t lastTxTime = 0;
-    int lastDay = -1;
-    int lastMonth = -1;
+    uint32_t lastCalcTime = millis();
     
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         
         uint32_t now = millis();
-        uint32_t deltaMs = now - lastTick;
-        lastTick = now;
-        
-        double apparentPower = 0.0;
-        double dailyEnergyVal = 0.0;
-        double monthlyEnergyVal = 0.0;
-        double lifetimeEnergyVal = 0.0;
+        float deltaSeconds = (now - lastCalcTime) / 1000.0f;
+        if (deltaSeconds < 0.0f || deltaSeconds > 10.0f) {
+            deltaSeconds = 1.0f;
+        }
+        lastCalcTime = now;
         float rmsCurrentVal = 0.0f;
         int rssiVal = 0;
         int pzemRssiVal = 0;
@@ -703,8 +828,12 @@ void energyTimeTask(void* pvParameters) {
         float pzemCurrentVal = 0.0f;
         float pzemPowerVal = 0.0f;
         float pzemVoltageVal = 0.0f;
-        float combinedCurrent = 0.0f;
+        float pzemEnergyVal = 0.0f;
+        float smartNestLoadCurrent = 0.0f;
         bool masterLockVal = false;
+        double mainEnergyWhVal = 0.0;
+        double digitalEnergyWhVal = 0.0;
+        uint32_t relayRuntimeVals[7] = {0};
         bool sdOkVal = false;
         uint64_t sdTotalVal = 0;
         uint64_t sdUsedVal = 0;
@@ -712,76 +841,11 @@ void energyTimeTask(void* pvParameters) {
         
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             pzemVoltageVal = g_systemState.pzem.voltage;
-            combinedCurrent = g_systemState.internetAcsCurrentA;
-            apparentPower = (double)pzemVoltageVal * (double)combinedCurrent;
-            g_systemState.energy.activePowerVA = apparentPower;
-            
-            // Only update energy if time is synchronized and PZEM readings are healthy
-            bool timeValid = g_systemState.time.timeValid;
-            bool pzemHealthy = g_systemState.pzem.sensorHealthy && g_systemState.pzem.online;
-            if (timeValid && pzemHealthy && !isnan(apparentPower)) {
-                double deltaWh = (apparentPower * (double)deltaMs) / 3600000.0;
-                g_systemState.energy.dailyEnergy += deltaWh;
-                g_systemState.energy.monthlyEnergy += deltaWh;
-                g_systemState.energy.lifetimeEnergy += deltaWh;
-                g_systemState.energy.pendingSave = true;
-            } else {
-                g_systemState.energy.activePowerVA = 0.0;
-            }
-            
-            dailyEnergyVal = g_systemState.energy.dailyEnergy;
-            monthlyEnergyVal = g_systemState.energy.monthlyEnergy;
-            lifetimeEnergyVal = g_systemState.energy.lifetimeEnergy;
-            
-            // Calendar check for resets
-            if (g_systemState.time.timeValid) {
-                uint32_t curEpoch = g_systemState.time.baseEpoch + (millis() - g_systemState.time.baseMillis) / 1000;
-                int localEpoch = curEpoch + g_systemState.time.tzHours * 3600 + g_systemState.time.tzMins * 60;
-                
-                int y, m, d, hh, mm, ss;
-                epochToDateTime(localEpoch, y, m, d, hh, mm, ss);
-                
-                if (lastDay == -1) {
-                    uint32_t savedEpoch = g_systemState.energy.lastCalcTime;
-                    if (savedEpoch > 0) {
-                        uint32_t savedLocalEpoch = savedEpoch + g_systemState.time.tzHours * 3600 + g_systemState.time.tzMins * 60;
-                        int y_s, m_s, d_s, hh_s, mm_s, ss_s;
-                        epochToDateTime(savedLocalEpoch, y_s, m_s, d_s, hh_s, mm_s, ss_s);
-                        if (y_s != y || m_s != m) {
-                            g_systemState.energy.dailyEnergy = 0.0;
-                            g_systemState.energy.monthlyEnergy = 0.0;
-                            dailyEnergyVal = 0.0;
-                            monthlyEnergyVal = 0.0;
-                            Serial.println("[ENERGY] Restored state from different month. Daily & Monthly reset.");
-                        } else if (d_s != d) {
-                            g_systemState.energy.dailyEnergy = 0.0;
-                            dailyEnergyVal = 0.0;
-                            Serial.println("[ENERGY] Restored state from different day. Daily reset.");
-                        }
-                    }
-                    lastDay = d;
-                    lastMonth = m;
-                } else {
-                    if (m != lastMonth) {
-                        g_systemState.energy.monthlyEnergy = 0.0;
-                        g_systemState.energy.dailyEnergy = 0.0;
-                        dailyEnergyVal = 0.0;
-                        monthlyEnergyVal = 0.0;
-                        lastMonth = m;
-                        lastDay = d;
-                        Serial.println("[ENERGY] Monthly & Daily Counters Reset");
-                    }
-                    else if (d != lastDay) {
-                        g_systemState.energy.dailyEnergy = 0.0;
-                        dailyEnergyVal = 0.0;
-                        lastDay = d;
-                        Serial.println("[ENERGY] Daily Counter Reset");
-                    }
-                }
-            }
+            smartNestLoadCurrent = g_systemState.smartNestAcsCurrentA;
             
             pzemCurrentVal = g_systemState.pzem.current;
             pzemPowerVal = g_systemState.pzem.power;
+            pzemEnergyVal = g_systemState.pzem.energy;
             rmsCurrentVal = g_systemState.digital.rmsCurrent;
             digitalOnlineVal = g_systemState.digital.online;
             pzemOnlineVal = g_systemState.pzem.online;
@@ -795,70 +859,106 @@ void energyTimeTask(void* pvParameters) {
             sdOkVal = g_systemState.sd.cardPresent;
             sdTotalVal = g_systemState.sd.totalBytes;
             sdUsedVal = g_systemState.sd.usedBytes;
+
+            float voltageForEnergy = (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal)) ? pzemVoltageVal : 0.0f;
+            if (voltageForEnergy > 0.0f && deltaSeconds > 0.0f) {
+                g_systemState.energy.mainEnergyWh += ((double)voltageForEnergy * (double)smartNestLoadCurrent * (double)deltaSeconds) / 3600.0;
+                g_systemState.energy.digitalEnergyWh += ((double)voltageForEnergy * (double)rmsCurrentVal * (double)deltaSeconds) / 3600.0;
+            }
+            if (deltaSeconds > 0.0f) {
+                uint32_t runtimeDelta = (uint32_t)(deltaSeconds + 0.5f);
+                for (int i = 0; i < 6; i++) {
+                    if (g_systemState.smartNestRelayMask & (1 << i)) {
+                        g_systemState.energy.relayRuntimeSec[i] += runtimeDelta;
+                    }
+                }
+                if (g_systemState.digital.relayState) {
+                    g_systemState.energy.relayRuntimeSec[6] += runtimeDelta;
+                }
+            }
+            mainEnergyWhVal = g_systemState.energy.mainEnergyWh;
+            digitalEnergyWhVal = g_systemState.energy.digitalEnergyWh;
+            for (int i = 0; i < 7; i++) {
+                relayRuntimeVals[i] = g_systemState.energy.relayRuntimeSec[i];
+            }
             
             gotMutex = true;
             xSemaphoreGive(g_stateMutex);
         }
         
         if (gotMutex) {
-            // Periodical telemetry & logging every 10s
             if (now - lastTxTime >= 10000) {
                 lastTxTime = now;
                 
-                // Log Binary Record
                 bool isTimeValid = false;
                 uint32_t curEpoch = 0;
+                int8_t tzH = 5;
+                uint8_t tzM = 30;
                 if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     isTimeValid = g_systemState.time.timeValid;
                     if (isTimeValid) {
                         curEpoch = g_systemState.time.baseEpoch + (millis() - g_systemState.time.baseMillis) / 1000;
-                        g_systemState.sd.lastLoggedEpoch = curEpoch;
+                        tzH = g_systemState.time.tzHours;
+                        tzM = g_systemState.time.tzMins;
                     }
                     xSemaphoreGive(g_stateMutex);
                 }
                 
-                if (isTimeValid) {
-                    SdLogRecord rec;
+                if (isTimeValid && (smartNestLoadCurrent > 0.0f || rmsCurrentVal > 0.0f || mainEnergyWhVal > 0.0 || digitalEnergyWhVal > 0.0)) {
+                    EnergyLogSample rec;
                     rec.epoch = curEpoch;
+                    rec.tzHours = tzH;
+                    rec.tzMins = tzM;
                     rec.voltage = pzemVoltageVal;
-                    rec.acsCurrent = combinedCurrent;
-                    rec.pzemCurrent = pzemCurrentVal;
-                    rec.powerVA = apparentPower;
-                    rec.relayStates = 0;
-                    
-                    // overflow logic for sd queue
+                    rec.mainCurrent = smartNestLoadCurrent;
+                    rec.mainPowerW = pzemVoltageVal * smartNestLoadCurrent;
+                    rec.mainEnergyWh = mainEnergyWhVal;
+                    rec.digitalCurrent = rmsCurrentVal;
+                    rec.digitalPowerW = pzemVoltageVal * rmsCurrentVal;
+                    rec.digitalEnergyWh = digitalEnergyWhVal;
+                    rec.acCurrent = pzemCurrentVal;
+                    rec.acPowerW = pzemPowerVal;
+                    rec.acEnergyKWh = pzemEnergyVal;
+                    for (int i = 0; i < 7; i++) {
+                        rec.relayRuntimeSec[i] = relayRuntimeVals[i];
+                    }
+
                     if (xQueueSend(g_sdQueue, &rec, 0) != pdTRUE) {
                         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                             g_systemState.sd.droppedRecords++;
                             xSemaphoreGive(g_stateMutex);
                         }
-                        SdLogRecord discard;
+                        EnergyLogSample discard;
                         xQueueReceive(g_sdQueue, &discard, 0);
                         xQueueSend(g_sdQueue, &rec, 0);
                     }
                 }
                 
-                // Format sensor readings as null if unhealthy/offline
                 char vStr[16] = "null";
                 char piStr[16] = "null";
                 char ppStr[16] = "null";
-                if (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal) && !isnan(pzemCurrentVal) && !isnan(pzemPowerVal)) {
+                char peStr[16] = "null";
+                if (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal) && !isnan(pzemCurrentVal) && !isnan(pzemPowerVal) && !isnan(pzemEnergyVal)) {
                     snprintf(vStr, sizeof(vStr), "%.1f", pzemVoltageVal);
                     snprintf(piStr, sizeof(piStr), "%.3f", pzemCurrentVal);
                     snprintf(ppStr, sizeof(ppStr), "%.1f", pzemPowerVal);
+                    snprintf(peStr, sizeof(peStr), "%.3f", pzemEnergyVal);
                 }
                 
-                // Build and send telemetry (with SD stats + master lock + pzem health)
-                char tel[640];
+                char tel[768];
                 snprintf(tel, sizeof(tel),
-                         "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%s,\"pi\":%s,\"pp\":%s,"
-                         "\"d_wh\":%.1f,\"m_wh\":%.1f,\"l_wh\":%.1f,"
+                         "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%s,\"pi\":%s,\"pp\":%s,\"pe\":%s,"
+                         "\"me\":%.3f,\"de\":%.3f,"
+                         "\"rt\":[%u,%u,%u,%u,%u,%u,%u],"
                          "\"d_on\":%s,\"p_on\":%s,\"p_health\":%s,\"d_rssi\":%d,\"p_rssi\":%d,"
                          "\"d_relay\":%d,\"d_sw\":%d,\"d_lock\":%s,"
                          "\"sd_ok\":%s,\"sd_total\":%llu,\"sd_used\":%llu,"
                          "\"m_lock\":%s}",
-                         rmsCurrentVal, vStr, piStr, ppStr,
-                         dailyEnergyVal, monthlyEnergyVal, lifetimeEnergyVal,
+                         rmsCurrentVal, vStr, piStr, ppStr, peStr,
+                         mainEnergyWhVal / 1000.0, digitalEnergyWhVal / 1000.0,
+                         relayRuntimeVals[0], relayRuntimeVals[1], relayRuntimeVals[2],
+                         relayRuntimeVals[3], relayRuntimeVals[4], relayRuntimeVals[5],
+                         relayRuntimeVals[6],
                          digitalOnlineVal ? "true" : "false", pzemOnlineVal ? "true" : "false",
                          pzemHealthyVal ? "true" : "false",
                          rssiVal, pzemRssiVal,
@@ -875,89 +975,94 @@ void energyTimeTask(void* pvParameters) {
 }
 
 void sdLoggingTask(void* pvParameters) {
-    // SPI Init
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     bool sdOk = SD.begin(SD_CS);
     
     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         g_systemState.sd.cardPresent = sdOk;
-        g_systemState.sd.syncStatus = 0;
-        g_systemState.sd.lastSyncedEpoch = 0;
-        g_systemState.sd.lastLoggedEpoch = 0;
         g_systemState.sd.droppedRecords = 0;
         xSemaphoreGive(g_stateMutex);
     }
     
     if (sdOk) {
-        SD.mkdir("/logs");
-        
-        // Restore State
-        File stateFile = SD.open("/state.bin", FILE_READ);
-        if (stateFile) {
-            double savedDaily = 0, savedMonthly = 0, savedLifetime = 0;
-            uint32_t savedEpoch = 0;
-            if (stateFile.size() == 28) {
-                stateFile.read((uint8_t*)&savedDaily, 8);
-                stateFile.read((uint8_t*)&savedMonthly, 8);
-                stateFile.read((uint8_t*)&savedLifetime, 8);
-                stateFile.read((uint8_t*)&savedEpoch, 4);
-                
-                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    g_systemState.energy.dailyEnergy = savedDaily;
-                    g_systemState.energy.monthlyEnergy = savedMonthly;
-                    g_systemState.energy.lifetimeEnergy = savedLifetime;
-                    g_systemState.energy.lastSavedLifetime = savedLifetime;
-                    g_systemState.energy.lastCalcTime = savedEpoch;
-                    xSemaphoreGive(g_stateMutex);
-                    Serial.printf("[SD] Restored energy. Lifetime: %.2f Wh\n", savedLifetime);
+        SD.mkdir(SD_LOG_DIR);
+        char energyLogPath[96];
+        buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+
+        File logsDir = SD.open(SD_LOG_DIR);
+        if (logsDir && logsDir.isDirectory()) {
+            File entry = logsDir.openNextFile();
+            while (entry) {
+                const char* name = entry.name();
+                if (!entry.isDirectory() && name &&
+                    strcmp(name, SD_ENERGY_LOG_FILE) != 0 &&
+                    strcmp(name, SD_SYNC_STATE_FILE) != 0) {
+                    char stalePath[96];
+                    buildLogFilePath(stalePath, sizeof(stalePath), name);
+                    entry.close();
+                    SD.remove(stalePath);
+                    Serial.printf("[SD] Removed stale log file: %s\n", stalePath);
+                } else {
+                    entry.close();
                 }
+                entry = logsDir.openNextFile();
             }
-            stateFile.close();
+            logsDir.close();
         }
-        
-        // Restore Sync Pointer
-        File syncFile = SD.open("/sync.bin", FILE_READ);
-        if (syncFile) {
-            uint32_t savedSync = 0;
-            if (syncFile.size() == 4) {
-                syncFile.read((uint8_t*)&savedSync, 4);
-                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    g_systemState.sd.lastSyncedEpoch = savedSync;
-                    xSemaphoreGive(g_stateMutex);
-                    Serial.printf("[SD] Restored sync epoch: %u\n", savedSync);
-                }
+
+        if (!SD.exists(energyLogPath)) {
+            File newLog = SD.open(energyLogPath, FILE_WRITE);
+            if (newLog) {
+                newLog.println("record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s");
+                newLog.close();
             }
-            syncFile.close();
+        }
+        char syncPath[96];
+        buildSyncStatePath(syncPath, sizeof(syncPath));
+        uint32_t maxId = scanMaxEnergyRecordId(energyLogPath);
+        uint32_t ackedId = readUintFile(syncPath, 0);
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            g_systemState.sd.nextRecordId = maxId + 1;
+            g_systemState.sd.lastAckedRecordId = ackedId;
+            xSemaphoreGive(g_stateMutex);
         }
     }
     
-    uint32_t lastStateSaveTime = millis();
-    
     while (true) {
-        // Log incoming records
-        SdLogRecord rec;
+        EnergyLogSample rec;
         if (xQueueReceive(g_sdQueue, &rec, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (sdOk) {
-                // Determine filename (local time)
-                int8_t tzH = 5;
-                uint8_t tzM = 30;
-                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    tzH = g_systemState.time.tzHours;
-                    tzM = g_systemState.time.tzMins;
-                    xSemaphoreGive(g_stateMutex);
+                char energyLogPath[96];
+                char dateBuf[24];
+                buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+                formatLocalDateTime(rec.epoch, rec.tzHours, rec.tzMins, dateBuf, sizeof(dateBuf));
+
+                File logFile = SD.open(energyLogPath, FILE_APPEND);
+                if (!logFile) {
+                    logFile = SD.open(energyLogPath, FILE_WRITE);
+                    if (logFile) {
+                        logFile.println("record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s");
+                    }
                 }
-                
-                uint32_t localEpoch = rec.epoch + tzH * 3600 + tzM * 60;
-                int y, m, d, hh, mm, ss;
-                epochToDateTime(localEpoch, y, m, d, hh, mm, ss);
-                
-                char filename[32];
-                snprintf(filename, sizeof(filename), "/logs/%04d_%02d_%02d.dat", y, m, d);
-                
-                File logFile = SD.open(filename, FILE_WRITE);
+
                 if (logFile) {
-                    logFile.seek(logFile.size());
-                    logFile.write((uint8_t*)&rec, sizeof(rec));
+                    uint32_t recId = 0;
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        recId = g_systemState.sd.nextRecordId++;
+                        xSemaphoreGive(g_stateMutex);
+                    }
+                    if (recId == 0) {
+                        recId = scanMaxEnergyRecordId(energyLogPath) + 1;
+                    }
+                    logFile.printf("%u,%u,%s,%.1f,%.3f,%.2f,%.6f,%.3f,%.2f,%.6f,%.3f,%.2f,%.6f,%u,%u,%u,%u,%u,%u,%u\n",
+                                   recId, rec.epoch, dateBuf, rec.voltage,
+                                   rec.mainCurrent, rec.mainPowerW, rec.mainEnergyWh / 1000.0,
+                                   rec.digitalCurrent, rec.digitalPowerW, rec.digitalEnergyWh / 1000.0,
+                                   rec.acCurrent, rec.acPowerW, rec.acEnergyKWh,
+                                   rec.relayRuntimeSec[0], rec.relayRuntimeSec[1],
+                                   rec.relayRuntimeSec[2], rec.relayRuntimeSec[3],
+                                   rec.relayRuntimeSec[4], rec.relayRuntimeSec[5],
+                                   rec.relayRuntimeSec[6]);
                     logFile.close();
                 } else {
                     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -967,8 +1072,7 @@ void sdLoggingTask(void* pvParameters) {
                 }
             }
         }
-        
-        // --- Handle files_req (scan /logs directory on Core 1) ---
+
         bool wantFiles = false;
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wantFiles = g_systemState.filesRequest;
@@ -976,36 +1080,15 @@ void sdLoggingTask(void* pvParameters) {
             xSemaphoreGive(g_stateMutex);
         }
         if (wantFiles && sdOk) {
-            Serial.println("[SD] Scanning /logs directory...");
-            File logsDir = SD.open("/logs");
-            char jsonBuf[512];
-            int written = snprintf(jsonBuf, sizeof(jsonBuf), "{\"t\":\"files_res\",\"files\":[");
-            bool first = true;
-            if (logsDir && logsDir.isDirectory()) {
-                File entry = logsDir.openNextFile();
-                while (entry) {
-                    const char* name = entry.name();
-                    if (!entry.isDirectory() && name) {
-                        if (!first && written + 2 < (int)sizeof(jsonBuf)) {
-                            jsonBuf[written++] = ',';
-                        }
-                        int needed = snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "\"%s\"", name);
-                        if (written + needed < (int)sizeof(jsonBuf)) {
-                            written += needed;
-                            first = false;
-                        }
-                    }
-                    entry.close();
-                    entry = logsDir.openNextFile();
-                }
-                logsDir.close();
+            char energyLogPath[96];
+            buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+            if (SD.exists(energyLogPath)) {
+                enqueueUartTx("{\"t\":\"files_res\",\"files\":[\"energy_log.csv\"]}");
+            } else {
+                enqueueUartTx("{\"t\":\"files_res\",\"files\":[]}");
             }
-            snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "]}");
-            enqueueUartTx(jsonBuf);
-            Serial.printf("[SD] files_res sent (%d bytes)\n", (int)strlen(jsonBuf));
         }
-        
-        // --- Handle read_req (read 10 records at chunk offset on Core 1) ---
+
         bool wantRead = false;
         char readFname[64] = {0};
         int readChunkVal = 0;
@@ -1019,51 +1102,103 @@ void sdLoggingTask(void* pvParameters) {
             xSemaphoreGive(g_stateMutex);
         }
         if (wantRead && sdOk) {
-            char fullPath[80];
-            snprintf(fullPath, sizeof(fullPath), "/logs/%s", readFname);
-            Serial.printf("[SD] Reading %s chunk %d...\n", fullPath, readChunkVal);
-            
-            File readFile = SD.open(fullPath, FILE_READ);
-            if (readFile) {
-                int totalRecs = readFile.size() / sizeof(SdLogRecord);
-                int startRec = readChunkVal * 10;
-                char jsonBuf[768];
-                int written = snprintf(jsonBuf, sizeof(jsonBuf), 
-                    "{\"t\":\"read_res\",\"file\":\"%s\",\"chunk\":%d,\"total\":%d,\"recs\":[", 
-                    readFname, readChunkVal, totalRecs);
-                
-                if (startRec < totalRecs) {
-                    readFile.seek(startRec * sizeof(SdLogRecord));
+            char fullPath[96];
+            buildLogFilePath(fullPath, sizeof(fullPath), readFname);
+            if (strcmp(readFname, SD_ENERGY_LOG_FILE) != 0) {
+                enqueueUartTx("{\"t\":\"read_res\",\"file\":\"energy_log.csv\",\"chunk\":0,\"total\":0,\"lines\":[]}");
+            } else {
+                File readFile = SD.open(fullPath, FILE_READ);
+                if (readFile) {
+                    int lineIndex = -1; // header is -1
+                    int startLine = readChunkVal * 10;
+                    int totalLines = 0;
+                    char line[256] = {0};
+                    char jsonBuf[2048];
+                    int written = snprintf(jsonBuf, sizeof(jsonBuf),
+                                           "{\"t\":\"read_res\",\"file\":\"%s\",\"chunk\":%d,\"lines\":[",
+                                           SD_ENERGY_LOG_FILE, readChunkVal);
                     bool first = true;
-                    for (int i = 0; i < 10 && (startRec + i) < totalRecs; i++) {
-                        SdLogRecord r;
-                        if (readFile.read((uint8_t*)&r, sizeof(r)) == sizeof(r)) {
-                            char recBuf[128];
-                            int n = snprintf(recBuf, sizeof(recBuf),
-                                "%s{\"epoch\":%u,\"v\":%.1f,\"load\":%.2f,\"pi\":%.3f,\"pva\":%.1f}",
-                                first ? "" : ",",
-                                r.epoch, r.voltage, r.acsCurrent, r.pzemCurrent, r.powerVA);
-                            if (written + n + 5 < (int)sizeof(jsonBuf)) {
-                                strcpy(jsonBuf + written, recBuf);
-                                written += n;
-                                first = false;
+                    size_t idx = 0;
+
+                    while (readFile.available()) {
+                        char c = readFile.read();
+                        if (c == '\n') {
+                            line[idx] = '\0';
+                            if (lineIndex >= 0) {
+                                if (lineIndex >= startLine && lineIndex < startLine + 10) {
+                                    int n = snprintf(jsonBuf + written, sizeof(jsonBuf) - written,
+                                                     "%s\"%s\"", first ? "" : ",", line);
+                                    if (n > 0 && written + n < (int)sizeof(jsonBuf)) {
+                                        written += n;
+                                        first = false;
+                                    }
+                                }
+                                totalLines++;
                             }
+                            lineIndex++;
+                            idx = 0;
+                        } else if (c != '\r' && idx < sizeof(line) - 1) {
+                            line[idx++] = c;
                         }
                     }
+                    if (idx > 0 && lineIndex >= 0) {
+                        line[idx] = '\0';
+                        if (lineIndex >= startLine && lineIndex < startLine + 10) {
+                            int n = snprintf(jsonBuf + written, sizeof(jsonBuf) - written,
+                                             "%s\"%s\"", first ? "" : ",", line);
+                            if (n > 0 && written + n < (int)sizeof(jsonBuf)) {
+                                written += n;
+                            }
+                        }
+                        totalLines++;
+                    }
+                    readFile.close();
+                    snprintf(jsonBuf + written, sizeof(jsonBuf) - written,
+                             "],\"total\":%d}", totalLines);
+                    enqueueUartTx(jsonBuf);
+                } else {
+                    enqueueUartTx("{\"t\":\"read_res\",\"file\":\"energy_log.csv\",\"chunk\":0,\"total\":0,\"lines\":[]}");
                 }
-                snprintf(jsonBuf + written, sizeof(jsonBuf) - written, "]}");
-                readFile.close();
-                enqueueUartTx(jsonBuf);
-                Serial.printf("[SD] read_res sent for %s chunk %d\n", readFname, readChunkVal);
-            } else {
-                char errBuf[128];
-                snprintf(errBuf, sizeof(errBuf), "{\"t\":\"read_res\",\"file\":\"%s\",\"chunk\":%d,\"total\":0,\"recs\":[]}", readFname, readChunkVal);
-                enqueueUartTx(errBuf);
-                Serial.printf("[SD] read_req FAIL — file %s not found\n", fullPath);
             }
         }
-        
-        // --- Handle factory_reset (delete state files, reset counters on Core 1) ---
+
+        bool wantHistory = false;
+        uint32_t historyAfter = 0;
+        uint8_t historyLimit = 0;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wantHistory = g_systemState.historyRequest;
+            if (wantHistory) {
+                g_systemState.historyRequest = false;
+                historyAfter = g_systemState.historyAfterId;
+                historyLimit = g_systemState.historyLimit;
+            }
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (wantHistory && sdOk) {
+            sendHistoryResponse(historyAfter, historyLimit);
+        }
+
+        bool wantHistoryAck = false;
+        uint32_t historyAckLast = 0;
+        bool historyAckAdvanced = false;
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            wantHistoryAck = g_systemState.historyAckRequest;
+            if (wantHistoryAck) {
+                g_systemState.historyAckRequest = false;
+                historyAckLast = g_systemState.historyAckLastId;
+                if (historyAckLast > g_systemState.sd.lastAckedRecordId) {
+                    g_systemState.sd.lastAckedRecordId = historyAckLast;
+                    historyAckAdvanced = true;
+                }
+            }
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (wantHistoryAck && historyAckAdvanced && sdOk) {
+            char syncPath[96];
+            buildSyncStatePath(syncPath, sizeof(syncPath));
+            writeUintFile(syncPath, historyAckLast);
+        }
+
         bool wantReset = false;
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wantReset = g_systemState.factoryResetRequest;
@@ -1071,23 +1206,19 @@ void sdLoggingTask(void* pvParameters) {
             xSemaphoreGive(g_stateMutex);
         }
         if (wantReset && sdOk) {
-            Serial.println("[SD] FACTORY RESET — deleting /state.bin and /sync.bin...");
-            SD.remove("/state.bin");
-            SD.remove("/sync.bin");
+            Serial.println("[SD] FACTORY RESET — deleting /state.bin...");
             if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                g_systemState.energy.dailyEnergy = 0.0;
-                g_systemState.energy.monthlyEnergy = 0.0;
-                g_systemState.energy.lifetimeEnergy = 0.0;
-                g_systemState.energy.lastSavedLifetime = 0.0;
-                g_systemState.energy.lastCalcTime = 0;
-                g_systemState.energy.pendingSave = false;
-                g_systemState.sd.lastSyncedEpoch = 0;
+                memset(&g_systemState.energy, 0, sizeof(g_systemState.energy));
+                g_systemState.sd.lastAckedRecordId = 0;
+                g_systemState.sd.nextRecordId = 1;
                 xSemaphoreGive(g_stateMutex);
             }
-            Serial.println("[SD] Factory reset complete. Energy counters zeroed.");
+            char syncPath[96];
+            buildSyncStatePath(syncPath, sizeof(syncPath));
+            writeUintFile(syncPath, 0);
+            Serial.println("[ENERGY] Main/digital energy counters and relay runtimes reset.");
         }
-        
-        // --- Handle clear_logs (delete all files in /logs on Core 1) ---
+
         bool wantClearLogs = false;
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             wantClearLogs = g_systemState.clearLogsRequest;
@@ -1095,221 +1226,31 @@ void sdLoggingTask(void* pvParameters) {
             xSemaphoreGive(g_stateMutex);
         }
         if (wantClearLogs && sdOk) {
-            Serial.println("[SD] CLEAR LOGS — deleting all files in /logs...");
-            File logsDir = SD.open("/logs");
-            if (logsDir && logsDir.isDirectory()) {
-                File entry = logsDir.openNextFile();
-                while (entry) {
-                    char path[80];
-                    snprintf(path, sizeof(path), "/logs/%s", entry.name());
-                    entry.close();
-                    SD.remove(path);
-                    Serial.printf("[SD] Deleted: %s\n", path);
-                    entry = logsDir.openNextFile();
-                }
-                logsDir.close();
+            char energyLogPath[96];
+            buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+            SD.remove(energyLogPath);
+            File newLog = SD.open(energyLogPath, FILE_WRITE);
+            if (newLog) {
+                newLog.println("record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s");
+                newLog.close();
             }
-            Serial.println("[SD] All log files cleared.");
-        }
-        
-        // Check for state save triggers
-        uint32_t now = millis();
-        bool pendingSave = false;
-        double currentLifetime = 0;
-        double lastSavedLifetime = 0;
-        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            pendingSave = g_systemState.energy.pendingSave;
-            currentLifetime = g_systemState.energy.lifetimeEnergy;
-            lastSavedLifetime = g_systemState.energy.lastSavedLifetime;
-            xSemaphoreGive(g_stateMutex);
-        }
-        
-        bool saveTriggered = (pendingSave && (now - lastStateSaveTime >= 300000)) || 
-                             ((currentLifetime - lastSavedLifetime) > 20.0);
-        
-        if (sdOk && saveTriggered) {
-            lastStateSaveTime = now;
-            File stateFile = SD.open("/state.bin", FILE_WRITE);
-            if (stateFile) {
-                double d = 0, m = 0, l = 0;
-                uint32_t curEpoch = 0;
-                bool gotMutex = false;
-                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    d = g_systemState.energy.dailyEnergy;
-                    m = g_systemState.energy.monthlyEnergy;
-                    l = g_systemState.energy.lifetimeEnergy;
-                    if (g_systemState.time.timeValid) {
-                        curEpoch = g_systemState.time.baseEpoch + (millis() - g_systemState.time.baseMillis) / 1000;
-                    }
-                    g_systemState.energy.pendingSave = false;
-                    g_systemState.energy.lastSavedLifetime = l;
-                    xSemaphoreGive(g_stateMutex);
-                    gotMutex = true;
-                }
-                if (gotMutex) {
-                    stateFile.write((uint8_t*)&d, 8);
-                    stateFile.write((uint8_t*)&m, 8);
-                    stateFile.write((uint8_t*)&l, 8);
-                    stateFile.write((uint8_t*)&curEpoch, 4);
-                    stateFile.close();
-                    Serial.printf("[SD] Saved state: lifetime %.2f Wh\n", l);
-                } else {
-                    stateFile.close();
-                }
+            char syncPath[96];
+            buildSyncStatePath(syncPath, sizeof(syncPath));
+            writeUintFile(syncPath, 0);
+            if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                g_systemState.sd.lastAckedRecordId = 0;
+                g_systemState.sd.nextRecordId = 1;
+                xSemaphoreGive(g_stateMutex);
             }
+            Serial.println("[SD] Energy log cleared.");
         }
-        
-        // Backfill loop (process one batch)
-        bool cloudOnline = false;
-        uint32_t lastSyncedEpoch = 0;
-        uint32_t lastLoggedEpoch = 0;
-        int8_t tzH_bf = 5;
-        uint8_t tzM_bf = 30;
-        bool gotBfMutex = false;
-        
+
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            cloudOnline = g_systemState.cloudOnline;
-            lastSyncedEpoch = g_systemState.sd.lastSyncedEpoch;
-            lastLoggedEpoch = g_systemState.sd.lastLoggedEpoch;
-            tzH_bf = g_systemState.time.tzHours;
-            tzM_bf = g_systemState.time.tzMins;
             if (sdOk) {
                 g_systemState.sd.totalBytes = SD.totalBytes();
                 g_systemState.sd.usedBytes = SD.usedBytes();
             }
-            gotBfMutex = true;
             xSemaphoreGive(g_stateMutex);
-        }
-        
-        if (gotBfMutex && sdOk && cloudOnline && (lastSyncedEpoch < lastLoggedEpoch)) {
-            uint32_t searchEpoch = lastSyncedEpoch + 1;
-            uint32_t searchLocalEpoch = searchEpoch + tzH_bf * 3600 + tzM_bf * 60;
-            int y, m, d, hh, mm, ss;
-            epochToDateTime(searchLocalEpoch, y, m, d, hh, mm, ss);
-            
-            char filename[32];
-            snprintf(filename, sizeof(filename), "/logs/%04d_%02d_%02d.dat", y, m, d);
-            
-            if (!SD.exists(filename)) {
-                // Advance past this day start
-                uint32_t nextLocalDayStart = ((searchLocalEpoch / 86400) + 1) * 86400;
-                uint32_t nextUtcDayStart = nextLocalDayStart - tzH_bf * 3600 - tzM_bf * 60;
-                
-                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    if (nextUtcDayStart < lastLoggedEpoch) {
-                        g_systemState.sd.lastSyncedEpoch = nextUtcDayStart - 1;
-                    } else {
-                        g_systemState.sd.lastSyncedEpoch = lastLoggedEpoch;
-                    }
-                    uint32_t updatedEpoch = g_systemState.sd.lastSyncedEpoch;
-                    g_systemState.sd.syncStatus = (updatedEpoch >= lastLoggedEpoch) ? 0 : 1;
-                    xSemaphoreGive(g_stateMutex);
-                    
-                    File sFile = SD.open("/sync.bin", FILE_WRITE);
-                    if (sFile) {
-                        sFile.write((uint8_t*)&updatedEpoch, 4);
-                        sFile.close();
-                    }
-                }
-            } else {
-                File logFile = SD.open(filename, FILE_READ);
-                if (logFile) {
-                    int firstRecIdx = findFirstRecordAfter(logFile, lastSyncedEpoch);
-                    SdLogRecord batchRecs[10];
-                    int count = 0;
-                    if (firstRecIdx != -1) {
-                        if (logFile.seek(firstRecIdx * 21)) {
-                            while (logFile.available() >= sizeof(SdLogRecord) && count < 10) {
-                                logFile.read((uint8_t*)&batchRecs[count], sizeof(SdLogRecord));
-                                count++;
-                            }
-                        }
-                    }
-                    logFile.close();
-                    
-                    if (count > 0) {
-                        static uint32_t batchNum = 1;
-                        char jsonBuf[768];
-                        int written = snprintf(jsonBuf, sizeof(jsonBuf), "{\"t\":\"hist\",\"batch\":%u,\"recs\":[", batchNum);
-                        
-                        for (int i = 0; i < count; i++) {
-                            char recBuf[128];
-                            snprintf(recBuf, sizeof(recBuf),
-                                     "{\"epoch\":%u,\"v\":%.1f,\"load\":%.2f,\"pi\":%.3f,\"powerVA\":%.1f}%s",
-                                     batchRecs[i].epoch, batchRecs[i].voltage, batchRecs[i].acsCurrent,
-                                     batchRecs[i].pzemCurrent, batchRecs[i].powerVA,
-                                     (i < count - 1) ? "," : "");
-                            if (written + strlen(recBuf) + 5 < sizeof(jsonBuf)) {
-                                    strcpy(jsonBuf + written, recBuf);
-                                    written += strlen(recBuf);
-                            }
-                        }
-                        strcat(jsonBuf, "]}");
-                        
-                        // Send and wait for hist_ack
-                        UartTxItem txItem;
-                        strncpy(txItem.json, jsonBuf, sizeof(txItem.json) - 1);
-                        txItem.json[sizeof(txItem.json) - 1] = '\0';
-                        
-                        int retry = 0;
-                        bool success = false;
-                        while (retry < 3) {
-                            xSemaphoreTake(g_histAckSem, 0); // Drain stale latch
-                            if (xQueueSend(g_uartTxQueue, &txItem, 0) == pdTRUE) {
-                                if (xSemaphoreTake(g_histAckSem, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                                    success = true;
-                                    break;
-                                }
-                            } else {
-                                vTaskDelay(pdMS_TO_TICKS(100));
-                            }
-                            retry++;
-                        }
-                        
-                        if (success) {
-                            if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                uint32_t updatedEpoch = g_systemState.sd.lastSyncedEpoch;
-                                g_systemState.sd.syncStatus = (updatedEpoch >= lastLoggedEpoch) ? 0 : 1;
-                                xSemaphoreGive(g_stateMutex);
-                                
-                                File sFile = SD.open("/sync.bin", FILE_WRITE);
-                                if (sFile) {
-                                    sFile.write((uint8_t*)&updatedEpoch, 4);
-                                    sFile.close();
-                                }
-                                batchNum++;
-                            }
-                        } else {
-                            if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                g_systemState.sd.syncStatus = 2;
-                                xSemaphoreGive(g_stateMutex);
-                            }
-                            vTaskDelay(pdMS_TO_TICKS(30000)); // Sleep 30 seconds
-                        }
-                    } else {
-                        // All records in file processed. Advance sync pointer to end of day.
-                        uint32_t nextLocalDayStart = ((searchLocalEpoch / 86400) + 1) * 86400;
-                        uint32_t nextUtcDayStart = nextLocalDayStart - tzH_bf * 3600 - tzM_bf * 60;
-                        
-                        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            if (nextUtcDayStart < lastLoggedEpoch) {
-                                g_systemState.sd.lastSyncedEpoch = nextUtcDayStart - 1;
-                            } else {
-                                g_systemState.sd.lastSyncedEpoch = lastLoggedEpoch;
-                            }
-                            uint32_t updatedEpoch = g_systemState.sd.lastSyncedEpoch;
-                            g_systemState.sd.syncStatus = (updatedEpoch >= lastLoggedEpoch) ? 0 : 1;
-                            xSemaphoreGive(g_stateMutex);
-                            
-                            File sFile = SD.open("/sync.bin", FILE_WRITE);
-                            if (sFile) {
-                                sFile.write((uint8_t*)&updatedEpoch, 4);
-                                sFile.close();
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -1358,11 +1299,10 @@ void setup() {
     g_stateMutex = xSemaphoreCreateMutex();
     g_espNowQueue = xQueueCreate(10, sizeof(EspNowPacket));
     g_uartTxQueue = xQueueCreate(15, sizeof(UartTxItem));
-    g_sdQueue = xQueueCreate(30, sizeof(SdLogRecord));
+    g_sdQueue = xQueueCreate(30, sizeof(EnergyLogSample));
     g_switchQueue = xQueueCreate(10, sizeof(SwitchEvent));
-    g_histAckSem = xSemaphoreCreateBinary();
     
-    if (!g_stateMutex || !g_espNowQueue || !g_uartTxQueue || !g_sdQueue || !g_switchQueue || !g_histAckSem) {
+    if (!g_stateMutex || !g_espNowQueue || !g_uartTxQueue || !g_sdQueue || !g_switchQueue) {
         Serial.println("[ERROR] Failed to create FreeRTOS primitives");
         delay(1000);
         ESP.restart();
@@ -1370,7 +1310,6 @@ void setup() {
     
     // Initialize system state
     memset(&g_systemState, 0, sizeof(g_systemState));
-    loadControlState();
     
     // WiFi Station mode before ESP-NOW to prevent boot looping
     WiFi.mode(WIFI_STA);
@@ -1403,7 +1342,6 @@ void setup() {
     if (esp_now_add_peer(&peer2) != ESP_OK) {
         Serial.println("[ERROR] Failed to add PZEM Board peer");
     }
-    g_applyDigitalControl = true;
     
     // Launch FreeRTOS Tasks
     // Core 0
@@ -1422,5 +1360,3 @@ void setup() {
 void loop() {
     vTaskDelay(portMAX_DELAY);
 }
-
-
