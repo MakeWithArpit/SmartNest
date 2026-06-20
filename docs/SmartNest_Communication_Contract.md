@@ -16,9 +16,15 @@ Default MQTT base topic is `smartnest`, but it can be changed from the SmartNest
 | Device | Main responsibility | Communication |
 |---|---|---|
 | SmartNest ESP32 | WiFi, MQTT, local relay 1-6, Serial Monitor commands, UART link to Master | MQTT, UART2, Serial Monitor |
-| Master ESP32 | ESP-NOW coordinator, SD logging, energy calculation, relay 7 recovery state | UART2, ESP-NOW, SD |
+| Master ESP32 | ESP-NOW coordinator, SD logging, energy calculation, relay 7 telemetry bridge | UART2, ESP-NOW, SD |
 | Digital Board ESP32 | Relay 7, digital manual switch, ACS current sensing, overcurrent lock | ESP-NOW |
 | PZEM ESP32 | PZEM-004T telemetry and energy reset/reboot command handling | ESP-NOW |
+
+SmartNest ESP32 local sensors:
+
+| Sensor | Pin | Data |
+|---|---:|---|
+| DHT11 | GPIO 23 / D23 | Temperature in Celsius and relative humidity |
 
 ## Relay Numbering
 
@@ -48,6 +54,22 @@ struct DigitalSlavePacket {
   float rmsCurrent;
   uint8_t relayState;
   uint8_t switchState;
+  uint8_t lockState;
+};
+```
+
+For command results, the Digital Board sends `DigitalCmdAckPacket`.
+
+```cpp
+struct DigitalCmdAckPacket {
+  uint8_t type;                 // 0x12
+  uint8_t cmdType;
+  uint8_t accepted;
+  uint8_t reason;
+  uint8_t relayState;
+  uint8_t relayLockState;
+  uint8_t masterLockState;
+  uint8_t overcurrentLockState;
 };
 ```
 
@@ -57,6 +79,7 @@ struct DigitalSlavePacket {
 | `rmsCurrent` | `float` | RMS current in amperes. Telemetry packet sends `0.0` when relay is OFF |
 | `relayState` | `uint8_t` | `1` relay ON, `0` relay OFF |
 | `switchState` | `uint8_t` | `1` manual switch active/LOW, `0` inactive |
+| `lockState` | `uint8_t` | `1` relay/master lock active, `0` unlocked |
 
 Send timing:
 
@@ -79,11 +102,13 @@ struct CmdPacket {
 | Command type | Command | Behavior |
 |---:|---|---|
 | `0x01` | ACK ping | Updates master contact time and sends `DigitalSlavePacket` type `0x11` |
-| `0x02` | `relay_on` | Turns relay ON unless `masterLock` or `overcurrentLock` is active |
+| `0x02` | `relay_on` | Turns relay ON unless `relayLock`, `masterLock`, or `overcurrentLock` is active |
 | `0x03` | `relay_off` | Turns relay OFF |
-| `0x04` | `masterLock ON` | Sets lock ON and turns relay OFF |
-| `0x05` | `masterLock OFF` | Clears lock |
+| `0x04` | `relay_lock` | Locks Digital Board relay and turns it OFF |
+| `0x05` | `relay_unlock` | Clears Digital Board relay lock |
 | `0x06` | `reboot` | Restarts the Digital Board ESP32 |
+| `0x08` | `masterLock ON` | Sets master lock ON and turns relay OFF |
+| `0x09` | `masterLock OFF` | Clears master lock |
 
 Protection behavior:
 
@@ -92,6 +117,8 @@ Protection behavior:
 | `currentAmperes >= 6.0A` | `overcurrentLock = true`, relay forced OFF |
 | Overcurrent recovery | Lock clears after current stays below `5.5A` for 3 checks, about 600 ms |
 | Relay ON command while locked | Ignored |
+| Relay/lock/master-lock recovery | Digital Board stores its own relay, relay-lock, and master-lock state in local NVS memory |
+| Command acknowledgement | Digital Board sends command result packet type `0x12` to Master after relay/lock/master-lock/reboot commands |
 
 ### Digital Board RGB LED Codes
 
@@ -102,6 +129,7 @@ Priority order is top to bottom.
 | White | Blink every 500 ms | Boot / no ACK received from Master yet |
 | Red | Blink every 300 ms | Overcurrent lock active |
 | Cyan | Solid | Master lock active |
+| Yellow | Solid | Relay lock active |
 | Green | Solid | Relay ON |
 | Magenta | Blink every 1 second | No Master contact for more than 60 seconds |
 | Blue | Solid | Normal connected state, relay OFF |
@@ -190,21 +218,26 @@ Master UART pins:
 | `{"t":"ntp","epoch":1710000000,"tz_h":5,"tz_m":30}` | Time sync |
 | `{"t":"acs","i":1.23}` | SmartNest local ACS/load current |
 | `{"t":"cloud","up":true}` | MQTT/cloud online status |
-| `{"t":"hist_ack","batch":1,"upto":1710000000}` | Acknowledge historical batch upload |
 | `{"t":"files_req"}` | Request SD log file list |
-| `{"t":"read_req","file":"2026_06_19.dat","chunk":0}` | Read 10 SD log records from file chunk |
-| `{"t":"factory_reset"}` | Reset saved energy/sync state on Master SD |
+| `{"t":"read_req","file":"energy_log.csv","chunk":0}` | Read 10 energy-log CSV rows from file chunk |
+| `{"t":"factory_reset"}` | Reset saved energy state on Master SD |
 | `{"t":"clear_logs"}` | Delete SD log files |
 
 State recovery note:
 
-The Master stores recoverable control state in NVS before applying it to the Digital Board:
+Recoverable control state is owned by the ESP that executes the command:
 
-- `masterLock`
-- Digital Board desired relay state
-- Digital Board desired lock state
+- Digital Board relay state, relay lock, and master lock are stored in the Digital Board ESP32 local NVS memory.
+- SmartNest local relay and lock state stays on the SmartNest ESP32.
+- Master ESP32 does not store relay/lock/master-lock commands on SD card or replay them from SD.
 
 One-shot commands such as `reboot` and `energy_reset` are not persisted for replay.
+
+Current-sensor ownership:
+
+- SmartNest ESP32 ACS712 measures only the total current drawn by local relay 1-6 loads. SmartNest sends this value to Master as `{"t":"acs","i":1.23}`.
+- Digital Board ACS712 measures only the Digital Board relay 7 load. It is sent to Master as Digital Board telemetry `rmsCurrent`.
+- Master keeps both readings separate and integrates main-board and digital-board energy with PZEM voltage as the common voltage reference.
 
 ### JSON Sent By Master To SmartNest
 
@@ -219,9 +252,7 @@ Sent every 10 seconds.
   "v": 230.0,
   "pi": 0.123,
   "pp": 28.3,
-  "d_wh": 10.0,
-  "m_wh": 120.0,
-  "l_wh": 500.0,
+  "pe": 1.235,
   "d_on": true,
   "p_on": true,
   "p_health": true,
@@ -242,11 +273,9 @@ Sent every 10 seconds.
 | `t` | Message type: `tel` |
 | `acs` | Digital Board ACS current in amperes |
 | `v` | PZEM voltage; may be `null` if PZEM unhealthy/offline |
-| `pi` | PZEM current; may be `null` |
-| `pp` | PZEM power; may be `null` |
-| `d_wh` | Daily energy in Wh |
-| `m_wh` | Monthly energy in Wh |
-| `l_wh` | Lifetime energy in Wh |
+| `pi` | Air-conditioner current from PZEM; may be `null` |
+| `pp` | Air-conditioner power from PZEM; may be `null` |
+| `pe` | Air-conditioner energy from the PZEM energy register in kWh; may be `null` |
 | `d_on` | Digital Board online |
 | `p_on` | PZEM board online |
 | `p_health` | PZEM sensor health |
@@ -277,6 +306,22 @@ Sent every 10 seconds.
 {"t":"lock_ack","val":true}
 ```
 
+#### Digital Command Acknowledgement: `t = "cmd_ack"`
+
+```json
+{"t":"cmd_ack","tgt":"d1","cmd_type":2,"ok":false,"reason":1,"relay":0,"relay_lock":1,"master_lock":0,"oc_lock":0}
+```
+
+| Key | Meaning |
+|---|---|
+| `cmd_type` | ESP-NOW command type sent to Digital Board |
+| `ok` | `true` if command was accepted |
+| `reason` | `0` none, `1` relay lock, `2` master lock, `3` overcurrent lock |
+| `relay` | Digital Board relay state after command |
+| `relay_lock` | Digital Board relay lock state |
+| `master_lock` | Digital Board master lock state |
+| `oc_lock` | Digital Board overcurrent lock state |
+
 #### Slave Online/Offline Events
 
 ```json
@@ -288,36 +333,12 @@ Sent every 10 seconds.
 |---|---|
 | `dev` | `d1`, `pzem` |
 
-#### Historical Batch: `t = "hist"`
-
-Master sends this when cloud is online and SD has unsynced records.
-
-```json
-{
-  "t": "hist",
-  "batch": 1,
-  "recs": [
-    {
-      "epoch": 1710000000,
-      "v": 230.0,
-      "load": 1.25,
-      "pi": 0.120,
-      "powerVA": 287.5
-    }
-  ]
-}
-```
-
-SmartNest publishes each record to MQTT and then replies:
-
-```json
-{"t":"hist_ack","batch":1,"upto":1710000000}
-```
-
 #### SD File List Response: `t = "files_res"`
 
+Master stores one CSV energy log under SD folder `/SmartNestLogs`.
+
 ```json
-{"t":"files_res","files":["2026_06_19.dat","2026_06_20.dat"]}
+{"t":"files_res","files":["energy_log.csv"]}
 ```
 
 #### SD File Read Response: `t = "read_res"`
@@ -325,20 +346,35 @@ SmartNest publishes each record to MQTT and then replies:
 ```json
 {
   "t": "read_res",
-  "file": "2026_06_19.dat",
+  "file": "energy_log.csv",
   "chunk": 0,
-  "total": 25,
-  "recs": [
-    {
-      "epoch": 1710000000,
-      "v": 230.0,
-      "load": 1.25,
-      "pi": 0.120,
-      "pva": 287.5
-    }
+  "lines": [
+    "1710000000,2024-03-09 21:30:00,230.1,1.250,287.63,0.120400,0.520,119.65,0.040150,12,0,44,0,0,0,18"
   ]
 }
 ```
+
+The CSV header is:
+
+```csv
+epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s
+```
+
+Logging rules:
+
+| Field | Meaning |
+|---|---|
+| `epoch` | UTC timestamp |
+| `date` | Local date/time string |
+| `main_current` | SmartNest local relay 1-6 ACS current |
+| `main_power_w` | Main board calculated power: PZEM voltage x main current |
+| `main_energy_kwh` | Integrated main board energy |
+| `digital_current` | Digital Board relay 7 ACS current |
+| `digital_power_w` | Digital board calculated power: PZEM voltage x digital current |
+| `digital_energy_kwh` | Integrated digital board energy |
+| `r1_on_s` to `r7_on_s` | Relay ON runtime counters in seconds |
+
+Master updates energy every second and writes SD snapshots every 10 seconds when there is measured current or accumulated energy. PZEM voltage is used as the common voltage reference.
 
 ## SmartNest Serial Monitor Commands
 
@@ -353,15 +389,14 @@ Serial baud: `115200`.
 | `RELAY <1-7> TOGGLE` | Toggle relay |
 | `LOCK <1-7> ON` | Lock relay |
 | `LOCK <1-7> OFF` | Unlock relay |
-| `SHUTDOWN ON` | Master shutdown ON: local relays OFF, relay 7 OFF and locked |
-| `SHUTDOWN OFF` | Master shutdown OFF: relay 7 unlocked |
 | `MASTERLOCK ON` | Global master lock ON |
 | `MASTERLOCK OFF` | Global master lock OFF |
 | `SLAVE D1 reboot` | Reboot Digital Board ESP32 |
 | `SLAVE PZEM reboot` | Reboot PZEM ESP32 |
 | `SLAVE PZEM energy_reset` | Reset PZEM energy |
+| `SD INFO` | Print latest SD status, total bytes, used bytes, free bytes, and used percent |
 | `LOGS LIST` | Request Master SD log file list |
-| `LOGS VIEW <file> <chunk>` | Request 10 records from SD log file |
+| `LOGS VIEW energy_log.csv <chunk>` | Request 10 rows from SD energy log |
 | `RESET WIFI` | Clear SmartNest WiFi credentials and restart |
 | `RESET MQTT` | Reset MQTT configuration |
 | `RESET ENERGY` | Request Master energy reset |
@@ -379,23 +414,60 @@ Serial baud: `115200`.
 | `MQTT SET KEEPALIVE <seconds>` | Set MQTT keepalive |
 | `MQTT RESET` | Reset MQTT config to defaults |
 
+## SmartNest Local Dashboard
+
+When SmartNest is connected to Wi-Fi, it starts a minimal authenticated dashboard on port `80`.
+
+Default login:
+
+| Field | Value |
+|---|---|
+| User ID | `admin` |
+| Password | `smartnest` |
+
+Access:
+
+```text
+http://smart-nest.local/
+```
+
+If mDNS is unavailable, use the IP printed by provisioning or shown in router DHCP clients.
+
+Dashboard routes:
+
+| Route | Purpose |
+|---|---|
+| `/` | Dashboard UI |
+| `/api/status` | Current SmartNest status JSON |
+| `/api/command` | POST `cmd=<serial command>` to run the same command path as Serial Monitor |
+| `/api/sd` | Current SD status text |
+| `/api/mqtt` | GET current MQTT config, POST updated MQTT config |
+| `/api/logs/list` | Request Master SD log file list |
+| `/api/logs/clear` | Request Master SD current log clear |
+| `/api/logs/energy.csv` | Download `energy_log.csv` through Master UART chunk reads |
+
+The CSV download fetches `energy_log.csv` from the Master SD card in 10-row chunks. The firmware caps one download at `100` chunks to avoid large RAM allocation on the SmartNest ESP32.
+
+Dashboard login uses a short-lived session token stored in browser `sessionStorage`. Closing the tab removes the browser-side token, and the dashboard also sends a logout request during page unload.
+
 ### SmartNest `STATUS` JSON
 
 ```json
 {
   "relays": [false, false, false, false, false, false],
   "locks": [false, false, false, false, false, false],
-  "shutdown": false,
   "current": 0.00,
   "rssi": -55,
   "ssid": "WiFiName",
   "acs": 0.00,
   "load": 0.00,
-  "v": 230.0,
-  "pw": 0.0,
-  "daily": 0.000,
-  "monthly": 0.000,
-  "lifetime": 0.000,
+  "voltage": 230.0,
+  "ac_current": 0.123,
+  "ac_power": 28.3,
+  "ac_energy": 1.235,
+  "main_energy": 0.120,
+  "digital_energy": 0.040,
+  "relay_runtime": [12, 0, 44, 0, 0, 0, 18],
   "d_on": true,
   "p_on": true,
   "d_rssi": -55,
@@ -408,6 +480,9 @@ Serial baud: `115200`.
   "sd_total": 3965190144,
   "sd_used": 1048576,
   "p_health": true,
+  "temp_c": 28.4,
+  "humidity": 61.0,
+  "dht_ok": true,
   "mqtt_status": 2,
   "uptime": 123456,
   "time": "2026-06-19 22:30:00"
@@ -449,9 +524,14 @@ Published after MQTT connect and after relevant commands.
 | `<base>/relay/6/state` | `true` / `false` | yes | Digital Board relay 7 state |
 | `<base>/relay/0/locked` to `<base>/relay/5/locked` | `true` / `false` | yes | SmartNest local relay lock |
 | `<base>/relay/6/locked` | `true` / `false` | yes | Digital Board relay lock |
-| `<base>/shutdown` | `true` / `false` | yes | Master shutdown state |
 | `<base>/slave/d1/online` | `true` / `false` | yes | Digital Board online |
 | `<base>/slave/pzem/online` | `true` / `false` | yes | PZEM board online |
+
+#### Command Feedback Topics
+
+| Topic | Payload | Retained | Meaning |
+|---|---|---:|---|
+| `<base>/relay/6/cmd_ack` | JSON | no | Last Digital Board command acknowledgement result, including reject reason |
 
 #### Live Telemetry Topics
 
@@ -461,11 +541,13 @@ Published on telemetry updates and approximately every `30` seconds while MQTT i
 |---|---|---:|---|
 | `<base>/sensor/voltage` | `230.4` | no | PZEM voltage |
 | `<base>/sensor/acs` | `0.52` | no | Digital Board ACS current |
-| `<base>/sensor/load` | `1.25` | no | SmartNest local combined ACS/load current |
-| `<base>/sensor/power` | `287.5` | no | PZEM power |
-| `<base>/energy/daily` | `0.125` | no | Daily energy in kWh |
-| `<base>/energy/monthly` | `4.250` | no | Monthly energy in kWh |
-| `<base>/energy/lifetime` | `18.905` | no | Lifetime energy in kWh |
+| `<base>/sensor/load` | `1.25` | no | SmartNest local ACS current for relay 1-6 load |
+| `<base>/sensor/power` | `287.5` | no | Air-conditioner PZEM power |
+| `<base>/sensor/ac_current` | `1.234` | no | Air-conditioner PZEM current |
+| `<base>/sensor/ac_energy` | `18.905` | no | Air-conditioner PZEM energy in kWh |
+| `<base>/sensor/temperature` | `28.4` | no | SmartNest DHT11 temperature in Celsius |
+| `<base>/sensor/humidity` | `61.0` | no | SmartNest DHT11 relative humidity percent |
+| `<base>/sensor/dht_ok` | `true` | no | DHT11 last-read health |
 | `<base>/switch/6/state` | `true` | no | Digital Board manual switch state |
 | `<base>/status` | JSON | no | Heartbeat/status |
 
@@ -475,27 +557,10 @@ Published on telemetry updates and approximately every `30` seconds while MQTT i
 {
   "uptime": 123456,
   "ssid": "WiFiName",
-  "rssi": -55
-}
-```
-
-#### Historical Data Topic
-
-Current code publishes historical records to a hardcoded topic:
-
-| Topic | Payload | Retained | Note |
-|---|---|---:|---|
-| `smartnest/history` | JSON record | no | This currently does not use configurable `<base>` |
-
-Payload:
-
-```json
-{
-  "epoch": 1710000000,
-  "v": 230.0,
-  "load": 1.25,
-  "pi": 0.120,
-  "powerVA": 287.5
+  "rssi": -55,
+  "temp_c": 28.4,
+  "humidity": 61.0,
+  "dht_ok": true
 }
 ```
 
@@ -509,7 +574,6 @@ SmartNest subscribes to these topics after MQTT connects.
 | `<base>/relay/6/set` | `true` / `false` | Set Digital Board relay ON/OFF |
 | `<base>/relay/0/lock` to `<base>/relay/5/lock` | `true` / `false` | Lock/unlock local relay |
 | `<base>/relay/6/lock` | `true` / `false` | Lock/unlock Digital Board relay |
-| `<base>/cmd/shutdown` | `true` / `false` | Master shutdown ON/OFF |
 | `<base>/cmd/slave/d1` | `reboot` | Reboot Digital Board |
 | `<base>/cmd/slave/pzem` | `reboot` | Reboot PZEM ESP32 |
 | `<base>/cmd/slave/pzem` | `energy_reset` | Reset PZEM energy register |
@@ -537,13 +601,6 @@ Topic: smartnest/relay/6/lock
 Payload: true
 ```
 
-Enable shutdown:
-
-```text
-Topic: smartnest/cmd/shutdown
-Payload: true
-```
-
 Reboot PZEM ESP32:
 
 ```text
@@ -564,7 +621,5 @@ Payload: energy_reset
 - MQTT relay indexes are zero-based. UI labels should translate relay 1-7 to MQTT indexes 0-6.
 - Retained topics should be used by the cloud dashboard for initial state hydration.
 - Live telemetry topics are not retained, so the cloud should store incoming values if historical graphs are needed.
-- `smartnest/history` is currently hardcoded. If the MQTT base topic is changed, live topics move to the new base, but history remains on `smartnest/history` until firmware is updated.
 - `MASTERLOCK` is available through Serial Monitor and UART (`{"t":"lock","val":true/false}`), but there is no MQTT topic for master lock in the current firmware.
 - PZEM voltage/current/power may be `null` in Master UART telemetry when the PZEM board is offline/unhealthy. MQTT publish code converts current SmartNest state to strings, so cloud should also tolerate `0.0` values.
-
