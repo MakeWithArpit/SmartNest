@@ -44,6 +44,8 @@ static float acs712ZeroMv = 2500.0f;
 #define NVS_PASS_KEY "wifi_pass"
 #define NVS_PROV_KEY "provisioned"
 #define CTRL_NVS_NAMESPACE "relay_ctrl"
+#define DASHBOARD_NVS_NAMESPACE "dashboard"
+#define DASHBOARD_PASS_KEY "dash_pass"
 #define DASHBOARD_USER "admin"
 #define DASHBOARD_PASS "smartnest"
 #define DASHBOARD_SESSION_MS 900000UL
@@ -587,6 +589,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <div class="card"><h3>Slave</h3><div class="row btnrow"><button onclick="cmd('SLAVE D1 reboot')">Digital Reboot</button><button onclick="cmd('SLAVE PZEM reboot')">PZEM Reboot</button><button class="danger" onclick="cmd('SLAVE PZEM energy_reset')">Energy Reset</button></div></div>
 <div class="card"><h3>SD Logs</h3><div class="row btnrow"><button onclick="apiText('/api/logs/list')">List</button><button class="danger" onclick="apiText('/api/logs/clear',{method:'POST'})">Clear</button><button onclick="downloadCsv()">Download CSV</button></div></div>
 <div class="card"><h3>System</h3><div class="row two"><button onclick="apiText('/api/sd')">SD Info</button><button onclick="apiText('/api/status?pretty=1')">Status</button></div></div>
+<div class="card"><h3>Password</h3><div class="row"><input id="oldPass" type="password" placeholder="Old password" autocomplete="current-password"><input id="newPass" type="password" placeholder="New password" autocomplete="new-password"><input id="newPass2" type="password" placeholder="Confirm new password" autocomplete="new-password"><button onclick="changePassword()">Change Password</button></div></div>
 <div class="card wide"><h3>MQTT Settings</h3><div class="mqttgrid"><select id="mqttEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select><input id="mqttBroker" placeholder="Broker"><input id="mqttPort" placeholder="Port" inputmode="numeric"><input id="mqttClient" placeholder="Client ID"><input id="mqttUser" placeholder="Username"><input id="mqttPass" placeholder="Password"><input id="mqttTopic" placeholder="Base topic"><input id="mqttKeepalive" placeholder="Keepalive seconds" inputmode="numeric"></div><div class="row btnrow" style="margin-top:8px"><button onclick="loadMqtt()">Load MQTT</button><button onclick="saveMqtt()">Save MQTT</button><button class="danger" onclick="cmd('RESET MQTT').then(loadMqtt)">Reset MQTT</button></div></div>
 <div class="card wide"><h3>Command Output</h3><pre id="out"></pre></div>
 </section></div>
@@ -600,11 +603,12 @@ async function doLogin(){let u=document.getElementById('user').value,p=document.
 async function logout(){let t=token();sessionStorage.removeItem('sn_token');if(t)navigator.sendBeacon('/api/logout?token='+encodeURIComponent(t));app.classList.add('hidden');loginPanel.classList.remove('hidden')}
 async function refresh(){let r=await fetch('/api/status',{cache:'no-store',headers:ah()});if(r.status===401){logout();return}let s=await r.json();stamp.textContent=s.time+' | uptime '+Math.floor(s.uptime/1000)+'s';
 metrics.innerHTML=cell('Temperature',s.dht_ok?s.temp_c+' C':'N/A',s.dht_ok?'ok':'bad')+cell('Humidity',s.dht_ok?s.humidity+' %':'N/A',s.dht_ok?'ok':'bad')+cell('Main board current',s.load+' A')+cell('Main board energy',s.main_energy+' kWh')+cell('Digital board current',s.acs+' A')+cell('Digital board energy',s.digital_energy+' kWh')+cell('AC current',s.ac_current+' A')+cell('AC power',s.ac_power+' W')+cell('AC energy',s.ac_energy+' kWh')+cell('Voltage',s.voltage+' V')+cell('SD',s.sd_ok?'OK':'ERROR',s.sd_ok?'ok':'bad')+cell('SD free',bytes((s.sd_total||0)-(s.sd_used||0)))+cell('Digital board',s.d_on?'ONLINE':'OFFLINE',s.d_on?'ok':'bad')+cell('PZEM board',s.p_on?'ONLINE':'OFFLINE',s.p_on?'ok':'bad')+cell('Master lock',b(s.m_lock),s.m_lock?'bad':'ok');
-let q1=quality(s.rssi),q2=quality(s.d_rssi),q3=quality(s.p_rssi);rssi.innerHTML=cell('Router to SmartNest',s.rssi+' dBm '+q1[0],q1[1])+cell('Digital Board RSSI',s.d_rssi+' dBm '+q2[0],q2[1])+cell('PZEM Board RSSI',s.p_rssi+' dBm '+q3[0],q3[1]);
-let h='';for(let i=0;i<6;i++)h+=`<div class="relay"><b>Relay ${i+1}</b><div>State: ${b(s.relays[i])}</div><div>Lock: ${b(s.locks[i])}</div><div>Runtime: ${s.relay_runtime[i]}s</div></div>`;h+=`<div class="relay"><b>Relay 7</b><div>State: ${b(s.d_relay)}</div><div>Lock: ${b(s.d_lock)}</div><div>Runtime: ${s.relay_runtime[6]}s</div></div>`;relays.innerHTML=h}
+let q1=quality(s.rssi),q2=quality(s.d_rssi),q3=quality(s.p_rssi);rssi.innerHTML=cell('Router to SmartNest',s.rssi+' dBm '+q1[0],q1[1])+cell('Digital Board RSSI',s.d_on?s.d_rssi+' dBm '+q2[0]:'N/A',s.d_on?q2[1]:'bad')+cell('PZEM Board RSSI',s.p_on?s.p_rssi+' dBm '+q3[0]:'N/A',s.p_on?q3[1]:'bad');
+let h='';for(let i=0;i<6;i++){let locked=s.m_lock||s.locks[i];h+=`<div class="relay"><b>Relay ${i+1}</b><div>State: ${b(s.relays[i])}</div><div>Lock: ${b(locked)}</div><div>Runtime: ${s.relay_runtime[i]}s</div></div>`}let dLocked=s.m_lock||s.d_lock;h+=`<div class="relay"><b>Relay 7</b><div>State: ${b(s.d_relay)}</div><div>Lock: ${b(dLocked)}</div><div>Runtime: ${s.relay_runtime[6]}s</div></div>`;relays.innerHTML=h}
 async function cmd(c){c=(c||'').trim();if(!c)return;out.textContent='Sending: '+c;let d=new URLSearchParams();d.set('cmd',c);let r=await fetch('/api/command',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});out.textContent=await r.text();setTimeout(refresh,500)}
 async function apiText(url,opt={}){opt.headers={...(opt.headers||{}),...ah()};let r=await fetch(url,opt);out.textContent=await r.text();setTimeout(refresh,500)}
 async function downloadCsv(){let r=await fetch('/api/logs/energy.csv',{headers:ah()});let blob=await r.blob();let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='energy_log.csv';a.click();URL.revokeObjectURL(a.href)}
+async function changePassword(){let d=new URLSearchParams();d.set('old',oldPass.value);d.set('new',newPass.value);d.set('confirm',newPass2.value);let r=await fetch('/api/password',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});out.textContent=await r.text();oldPass.value='';newPass.value='';newPass2.value='';if(r.ok)setTimeout(logout,800)}
 async function loadMqtt(){let r=await fetch('/api/mqtt',{headers:ah(),cache:'no-store'});if(!r.ok){out.textContent=await r.text();return}let m=await r.json();mqttEnabled.value=m.enabled?'1':'0';mqttBroker.value=m.broker||'';mqttPort.value=m.port||'';mqttClient.value=m.client||'';mqttUser.value=m.user||'';mqttPass.value=m.pass||'';mqttTopic.value=m.topic||'';mqttKeepalive.value=m.keepalive||'';out.textContent='MQTT settings loaded.'}
 async function saveMqtt(){let d=new URLSearchParams();d.set('enabled',mqttEnabled.value);d.set('broker',mqttBroker.value);d.set('port',mqttPort.value);d.set('client',mqttClient.value);d.set('user',mqttUser.value);d.set('pass',mqttPass.value);d.set('topic',mqttTopic.value);d.set('keepalive',mqttKeepalive.value);let r=await fetch('/api/mqtt',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});out.textContent=await r.text();setTimeout(refresh,500)}
 if(token()){loginPanel.classList.add('hidden');app.classList.remove('hidden');refresh();loadMqtt()}window.addEventListener('beforeunload',()=>{let t=token();if(t)navigator.sendBeacon('/api/logout?token='+encodeURIComponent(t))});setInterval(()=>{if(token())refresh()},5000);
@@ -632,6 +636,21 @@ static String getDashboardToken(AsyncWebServerRequest *req) {
   if (req->hasParam("token"))
     return req->getParam("token")->value();
   return "";
+}
+
+static String getDashboardPassword() {
+  Preferences prefs;
+  prefs.begin(DASHBOARD_NVS_NAMESPACE, true);
+  String password = prefs.getString(DASHBOARD_PASS_KEY, DASHBOARD_PASS);
+  prefs.end();
+  return password;
+}
+
+static void saveDashboardPassword(const String &password) {
+  Preferences prefs;
+  prefs.begin(DASHBOARD_NVS_NAMESPACE, false);
+  prefs.putString(DASHBOARD_PASS_KEY, password);
+  prefs.end();
 }
 
 static bool dashboardAuth(AsyncWebServerRequest *req) {
@@ -703,7 +722,7 @@ static void setupDashboardRoutes() {
   pProvServer->on("/api/login", HTTP_POST, [](AsyncWebServerRequest *req) {
     String user = req->hasParam("user", true) ? req->getParam("user", true)->value() : "";
     String pass = req->hasParam("pass", true) ? req->getParam("pass", true)->value() : "";
-    if (user != DASHBOARD_USER || pass != DASHBOARD_PASS) {
+    if (user != DASHBOARD_USER || pass != getDashboardPassword()) {
       req->send(401, "text/plain", "ERR: invalid login");
       return;
     }
@@ -719,6 +738,33 @@ static void setupDashboardRoutes() {
       g_dashboardTokenUntil = 0;
     }
     req->send(200, "text/plain", "OK");
+  });
+
+  pProvServer->on("/api/password", HTTP_POST, [](AsyncWebServerRequest *req) {
+    if (!dashboardAuth(req))
+      return;
+
+    String oldPass = req->hasParam("old", true) ? req->getParam("old", true)->value() : "";
+    String newPass = req->hasParam("new", true) ? req->getParam("new", true)->value() : "";
+    String confirmPass = req->hasParam("confirm", true) ? req->getParam("confirm", true)->value() : "";
+
+    if (oldPass != getDashboardPassword()) {
+      req->send(403, "text/plain", "ERR: old password is incorrect");
+      return;
+    }
+    if (newPass.length() < 4 || newPass.length() > 63) {
+      req->send(400, "text/plain", "ERR: new password must be 4-63 characters");
+      return;
+    }
+    if (newPass != confirmPass) {
+      req->send(400, "text/plain", "ERR: new password confirmation does not match");
+      return;
+    }
+
+    saveDashboardPassword(newPass);
+    g_dashboardToken = "";
+    g_dashboardTokenUntil = 0;
+    req->send(200, "text/plain", "Password changed. Login again.");
   });
 
   pProvServer->on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req) {

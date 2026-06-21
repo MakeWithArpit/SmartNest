@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <Preferences.h>
 
 struct __attribute__((packed)) CmdPacket {
@@ -36,6 +37,7 @@ struct __attribute__((packed)) DigitalCmdAckPacket {
 
 // Global State Variables
 uint8_t masterMacAddress[] = {0x88, 0x57, 0x21, 0xB1, 0xD3, 0x74};
+uint8_t localDigitalMac[] = {0x14, 0x08, 0x08, 0xA4, 0x94, 0x1C};
 
 bool overcurrentLock = false;
 bool relayLock = false;
@@ -363,7 +365,14 @@ void setup() {
   setLEDColor(true, true, true);
 
   WiFi.mode(WIFI_STA);
+  esp_err_t macResult = esp_wifi_set_mac(WIFI_IF_STA, localDigitalMac);
+  if (macResult != ESP_OK) {
+    Serial.printf("[DigitalBoard] Failed to set STA MAC err=%d\n",
+                  (int)macResult);
+  }
   WiFi.disconnect();
+  Serial.print("[DigitalBoard] STA MAC: ");
+  Serial.println(WiFi.macAddress());
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("Error initializing ESP-NOW");

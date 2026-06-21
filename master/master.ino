@@ -11,6 +11,7 @@
 #include <math.h>
 
 // Configuration & Constants
+const uint8_t MASTER_MAC[] = {0x88, 0x57, 0x21, 0xB1, 0xD3, 0x74};
 const uint8_t SLAVE1_MAC[] = {0x14, 0x08, 0x08, 0xA4, 0x94, 0x1C}; // Digital Slave
 const uint8_t SLAVE2_MAC[] = {0x78, 0x21, 0x84, 0x9C, 0x98, 0x4C}; // PZEM Slave
 
@@ -144,10 +145,27 @@ struct __attribute__((packed)) CmdPacket {
     uint8_t type;
 };
 
-void sendDigitalCommand(uint8_t type) {
+void logEspNowSendResult(const char* target, uint8_t type, esp_err_t result) {
+    if (result == ESP_OK) {
+        Serial.printf("[Master] ESP-NOW queued -> %s type=0x%02X\n", target, type);
+    } else {
+        Serial.printf("[Master] ESP-NOW send failed -> %s type=0x%02X err=%d\n",
+                      target, type, (int)result);
+    }
+}
+
+esp_err_t sendEspNowCommand(const uint8_t* mac, const char* target, uint8_t type, bool logOk) {
     CmdPacket cp;
     cp.type = type;
-    esp_now_send(SLAVE1_MAC, (uint8_t*)&cp, sizeof(cp));
+    esp_err_t result = esp_now_send(mac, (uint8_t*)&cp, sizeof(cp));
+    if (logOk || result != ESP_OK) {
+        logEspNowSendResult(target, type, result);
+    }
+    return result;
+}
+
+void sendDigitalCommand(uint8_t type) {
+    sendEspNowCommand(SLAVE1_MAC, "d1", type, true);
 }
 
 void setDesiredDigitalRelay(bool relay) {
@@ -331,13 +349,13 @@ void sendHistoryResponse(uint32_t afterId, uint8_t limit) {
         limit = SD_HISTORY_MAX_BATCH;
     }
 
-    char json[2048];
+    static char json[2048];
     int written = snprintf(json, sizeof(json), "{\"t\":\"hist_res\",\"records\":[");
     bool first = true;
     bool header = true;
     uint8_t count = 0;
     uint32_t lastId = cursor;
-    char line[320];
+    static char line[320];
     size_t idx = 0;
 
     while (f.available() && count < limit) {
@@ -345,7 +363,7 @@ void sendHistoryResponse(uint32_t afterId, uint8_t limit) {
         if (c == '\n') {
             line[idx] = '\0';
             if (!header && idx > 0) {
-                char work[320];
+                static char work[320];
                 strncpy(work, line, sizeof(work) - 1);
                 work[sizeof(work) - 1] = '\0';
                 char* fields[20] = {0};
@@ -416,10 +434,15 @@ void onReceive(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 
 // UART output helper
 void enqueueUartTx(const char* jsonStr) {
-    UartTxItem item;
-    strncpy(item.json, jsonStr, sizeof(item.json) - 1);
-    item.json[sizeof(item.json) - 1] = '\0';
-    xQueueSend(g_uartTxQueue, &item, 0);
+    UartTxItem* item = (UartTxItem*)pvPortMalloc(sizeof(UartTxItem));
+    if (!item) {
+        Serial.println("[Master] UART TX enqueue failed - out of heap");
+        return;
+    }
+    strncpy(item->json, jsonStr, sizeof(item->json) - 1);
+    item->json[sizeof(item->json) - 1] = '\0';
+    xQueueSend(g_uartTxQueue, item, 0);
+    vPortFree(item);
 }
 
 // Core 0 Tasks
@@ -461,11 +484,13 @@ void espNowTask(void* pvParameters) {
                         g_systemState.digital.switchState = p->switchState;
                         g_systemState.digital.locked = p->lockState != 0;
                         g_systemState.digital.rssi = pkt.rssi;
-                        g_systemState.digital.lastSeenTime = millis();
-                        g_systemState.digital.online = true;
+                        if (pktType == 0x11) {
+                            g_systemState.digital.lastSeenTime = millis();
+                            g_systemState.digital.online = true;
+                        }
                         xSemaphoreGive(g_stateMutex);
 
-                        if (wasOffline) {
+                        if (pktType == 0x11 && wasOffline) {
                             char buf[64];
                             snprintf(buf, sizeof(buf), "{\"t\":\"on\",\"dev\":\"d1\"}");
                             enqueueUartTx(buf);
@@ -507,11 +532,13 @@ void espNowTask(void* pvParameters) {
                             g_systemState.pzem.energy = p->energy;
                             g_systemState.pzem.sensorHealthy = !isnan(p->voltage) && !isnan(p->current) && !isnan(p->power);
                             g_systemState.pzem.rssi = pkt.rssi;
-                            g_systemState.pzem.lastSeenTime = millis();
-                            g_systemState.pzem.online = true;
+                            if (p->type == 0x21) {
+                                g_systemState.pzem.lastSeenTime = millis();
+                                g_systemState.pzem.online = true;
+                            }
                             xSemaphoreGive(g_stateMutex);
                             
-                            if (wasOffline) {
+                            if (p->type == 0x21 && wasOffline) {
                                 char buf[64];
                                 snprintf(buf, sizeof(buf), "{\"t\":\"on\",\"dev\":\"pzem\"}");
                                 enqueueUartTx(buf);
@@ -527,7 +554,7 @@ void espNowTask(void* pvParameters) {
 void uartTask(void* pvParameters) {
     char rxLine[256];
     int rxIndex = 0;
-    UartTxItem txItem;
+    static UartTxItem txItem;
     
     // HardwareSerial on UART2
     HardwareSerial MasterUart(2);
@@ -597,9 +624,7 @@ void uartTask(void* pvParameters) {
                         }
                         
                         if (typeVal != 0 && targetMac != NULL) {
-                            CmdPacket cp;
-                            cp.type = typeVal;
-                            esp_now_send(targetMac, (uint8_t*)&cp, sizeof(cp));
+                            sendEspNowCommand(targetMac, isD1 ? "d1" : "pzem", typeVal, true);
                             Serial.printf("[Master] CMD -> tgt=%s cmd=%s type=0x%02X\n", tgt, cmd, typeVal);
                         }
                     }
@@ -770,6 +795,13 @@ void switchPollTask(void* pvParameters) {
     bool pinStates[6] = {false};
     bool lastDebouncedStates[6] = {false};
     uint32_t stableStartTimes[6] = {0};
+
+    for (int i = 0; i < 6; i++) {
+        bool active = (digitalRead(SWITCH_PINS[i]) == HIGH);
+        pinStates[i] = active;
+        lastDebouncedStates[i] = active;
+        stableStartTimes[i] = millis();
+    }
     
     while (true) {
         uint32_t now = millis();
@@ -1112,8 +1144,9 @@ void sdLoggingTask(void* pvParameters) {
                     int lineIndex = -1; // header is -1
                     int startLine = readChunkVal * 10;
                     int totalLines = 0;
-                    char line[256] = {0};
-                    char jsonBuf[2048];
+                    static char line[256];
+                    static char jsonBuf[2048];
+                    line[0] = '\0';
                     int written = snprintf(jsonBuf, sizeof(jsonBuf),
                                            "{\"t\":\"read_res\",\"file\":\"%s\",\"chunk\":%d,\"lines\":[",
                                            SD_ENERGY_LOG_FILE, readChunkVal);
@@ -1313,7 +1346,13 @@ void setup() {
     
     // WiFi Station mode before ESP-NOW to prevent boot looping
     WiFi.mode(WIFI_STA);
+    esp_err_t macResult = esp_wifi_set_mac(WIFI_IF_STA, MASTER_MAC);
+    if (macResult != ESP_OK) {
+        Serial.printf("[ERROR] Failed to set Master STA MAC err=%d\n", (int)macResult);
+    }
     WiFi.disconnect();
+    Serial.print("[WIFI] Master STA MAC: ");
+    Serial.println(WiFi.macAddress());
     delay(100);
     
     if (esp_now_init() != ESP_OK) {
@@ -1351,7 +1390,7 @@ void setup() {
     
     // Core 1
     xTaskCreatePinnedToCore(energyTimeTask, "energyTimeTask", 4096, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(sdLoggingTask, "sdLoggingTask", 8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(sdLoggingTask, "sdLoggingTask", 12288, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(healthTask, "healthTask", 2048, NULL, 1, NULL, 1);
     
     Serial.println("[SYSTEM] Master Initialization Successful. Tasks started.");
