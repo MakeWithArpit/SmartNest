@@ -4,6 +4,7 @@
 #include <HardwareSerial.h>
 #include <SD.h>
 #include <SPI.h>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -24,8 +25,17 @@ const int SWITCH_PINS[6] = {33, 32, 26, 27, 14, 13};
 #define SD_SCK  18
 #define SD_LOG_DIR "/SmartNestLogs"
 #define SD_ENERGY_LOG_FILE "energy_log.csv"
+#define SD_ENERGY_TMP_FILE "energy_log.tmp"
+#define SD_ENERGY_BAK_FILE "energy_log.bak"
 #define SD_SYNC_STATE_FILE "sync_state.txt"
+#define SD_ENERGY_STATE_FILE "energy_state.txt"
 #define SD_HISTORY_MAX_BATCH 10
+#define ENERGY_DEFAULT_VOLTAGE 220.0f
+
+const char ENERGY_LOG_HEADER[] =
+    "record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,"
+    "digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,"
+    "ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s";
 
 // Hardware Structures & Centralized State
 struct DigitalBoardState {
@@ -70,6 +80,9 @@ struct EnergyMeterState {
     double mainEnergyWh;
     double digitalEnergyWh;
     uint32_t relayRuntimeSec[7];
+    uint32_t dayKey;
+    bool dayKeyValid;
+    bool loadedFromSd;
 };
 
 struct SystemData {
@@ -81,7 +94,6 @@ struct SystemData {
     float smartNestAcsCurrentA; // SmartNest local six-relay ACS current
     uint8_t smartNestRelayMask;
     bool  cloudOnline;
-    bool  masterLock;          // Global lock — all relays OFF, ignores commands
     bool  desiredDigitalRelay;
     bool  desiredDigitalLocked;
     // SD log access flags (set by uartTask on Core 0, consumed by sdLoggingTask on Core 1)
@@ -96,6 +108,8 @@ struct SystemData {
     uint8_t historyLimit;
     bool  historyAckRequest;
     uint32_t historyAckLastId;
+    bool  energyStateSaveRequest;
+    char  resetReason[24];
 };
 
 SemaphoreHandle_t g_stateMutex = NULL;
@@ -181,23 +195,12 @@ void setDesiredDigitalRelay(bool relay) {
 void setDesiredDigitalLock(bool locked) {
     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         g_systemState.desiredDigitalLocked = locked;
-        g_systemState.digital.locked = g_systemState.masterLock || locked;
+        g_systemState.digital.locked = locked;
         xSemaphoreGive(g_stateMutex);
     }
 
     sendDigitalCommand(locked ? 0x04 : 0x05);
     Serial.printf("[Master] Digital relay lock command forwarded: %s\n", locked ? "ON" : "OFF");
-}
-
-void setDesiredMasterLock(bool locked) {
-    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        g_systemState.masterLock = locked;
-        g_systemState.digital.locked = locked || g_systemState.desiredDigitalLocked;
-        xSemaphoreGive(g_stateMutex);
-    }
-
-    sendDigitalCommand(locked ? 0x08 : 0x09);
-    Serial.printf("[Master] Master lock command forwarded: %s\n", locked ? "ON" : "OFF");
 }
 
 struct __attribute__((packed)) DigitalSlavePacket {
@@ -225,6 +228,7 @@ struct __attribute__((packed)) PzemSlavePacket {
     float   current;
     float   power;
     float   energy;
+    uint8_t healthy;
 };
 
 // Date / Time parsing helper
@@ -269,6 +273,10 @@ void buildEnergyLogPath(char* out, size_t outSize) {
 
 void buildSyncStatePath(char* out, size_t outSize) {
     buildLogFilePath(out, outSize, SD_SYNC_STATE_FILE);
+}
+
+void buildEnergyStatePath(char* out, size_t outSize) {
+    buildLogFilePath(out, outSize, SD_ENERGY_STATE_FILE);
 }
 
 uint32_t readUintFile(const char* path, uint32_t fallback) {
@@ -330,6 +338,170 @@ uint32_t scanMaxEnergyRecordId(const char* path) {
     return maxId;
 }
 
+bool readEnergyStateFile(const char* path, EnergyMeterState &stateOut) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) {
+        return false;
+    }
+    memset(&stateOut, 0, sizeof(stateOut));
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        int eq = line.indexOf('=');
+        if (eq <= 0) {
+            continue;
+        }
+        String key = line.substring(0, eq);
+        String val = line.substring(eq + 1);
+        if (key == "dayKey") {
+            stateOut.dayKey = (uint32_t)strtoul(val.c_str(), NULL, 10);
+            stateOut.dayKeyValid = stateOut.dayKey > 0;
+        } else if (key == "mainEnergyWh") {
+            stateOut.mainEnergyWh = strtod(val.c_str(), NULL);
+        } else if (key == "digitalEnergyWh") {
+            stateOut.digitalEnergyWh = strtod(val.c_str(), NULL);
+        } else if (key.startsWith("r")) {
+            int idx = key.substring(1).toInt();
+            if (idx >= 1 && idx <= 7) {
+                stateOut.relayRuntimeSec[idx - 1] = (uint32_t)strtoul(val.c_str(), NULL, 10);
+            }
+        }
+    }
+    f.close();
+    return stateOut.dayKeyValid;
+}
+
+void writeEnergyStateFile(const char* path) {
+    EnergyMeterState snap;
+    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;
+    }
+    snap = g_systemState.energy;
+    xSemaphoreGive(g_stateMutex);
+
+    SD.remove(path);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.println("[SD] energy_state write failed");
+        return;
+    }
+    f.printf("dayKey=%u\n", snap.dayKey);
+    f.printf("mainEnergyWh=%.6f\n", snap.mainEnergyWh);
+    f.printf("digitalEnergyWh=%.6f\n", snap.digitalEnergyWh);
+    for (int i = 0; i < 7; i++) {
+        f.printf("r%d=%u\n", i + 1, snap.relayRuntimeSec[i]);
+    }
+    f.close();
+}
+
+uint32_t localDayKey(uint32_t epoch, int8_t tzH, uint8_t tzM) {
+    uint32_t localEpoch = epoch + tzH * 3600 + tzM * 60;
+    return localEpoch / 86400UL;
+}
+
+const char *resetReasonToString(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "POWERON";
+        case ESP_RST_EXT: return "EXT";
+        case ESP_RST_SW: return "SW";
+        case ESP_RST_PANIC: return "PANIC";
+        case ESP_RST_INT_WDT: return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT: return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT";
+        case ESP_RST_SDIO: return "SDIO";
+        default: return "UNKNOWN";
+    }
+}
+
+bool purgeAckedEnergyRows(uint32_t lastAckedId) {
+    char energyLogPath[96];
+    char tmpPath[96];
+    char bakPath[96];
+    buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+    buildLogFilePath(tmpPath, sizeof(tmpPath), SD_ENERGY_TMP_FILE);
+    buildLogFilePath(bakPath, sizeof(bakPath), SD_ENERGY_BAK_FILE);
+
+    if (!SD.exists(energyLogPath)) {
+        File fresh = SD.open(energyLogPath, FILE_WRITE);
+        if (fresh) {
+            fresh.println(ENERGY_LOG_HEADER);
+            fresh.close();
+            return true;
+        }
+        Serial.println("[SD] Purge skipped: cannot create energy log");
+        return false;
+    }
+
+    SD.remove(tmpPath);
+    File src = SD.open(energyLogPath, FILE_READ);
+    File dst = SD.open(tmpPath, FILE_WRITE);
+    if (!src || !dst) {
+        if (src) src.close();
+        if (dst) dst.close();
+        SD.remove(tmpPath);
+        Serial.println("[SD] Purge failed: open error");
+        return false;
+    }
+
+    dst.println(ENERGY_LOG_HEADER);
+    bool header = true;
+    uint32_t kept = 0;
+    uint32_t removed = 0;
+    static char line[320];
+    size_t idx = 0;
+
+    while (src.available()) {
+        char c = src.read();
+        if (c == '\n') {
+            line[idx] = '\0';
+            if (!header && idx > 0) {
+                uint32_t id = (uint32_t)strtoul(line, NULL, 10);
+                if (id > lastAckedId) {
+                    dst.println(line);
+                    kept++;
+                } else {
+                    removed++;
+                }
+            }
+            header = false;
+            idx = 0;
+        } else if (c != '\r' && idx < sizeof(line) - 1) {
+            line[idx++] = c;
+        }
+    }
+    if (!header && idx > 0) {
+        line[idx] = '\0';
+        uint32_t id = (uint32_t)strtoul(line, NULL, 10);
+        if (id > lastAckedId) {
+            dst.println(line);
+            kept++;
+        } else {
+            removed++;
+        }
+    }
+    src.close();
+    dst.close();
+
+    SD.remove(bakPath);
+    if (!SD.rename(energyLogPath, bakPath)) {
+        SD.remove(tmpPath);
+        Serial.println("[SD] Purge failed: backup rename error");
+        return false;
+    }
+    if (!SD.rename(tmpPath, energyLogPath)) {
+        SD.rename(bakPath, energyLogPath);
+        SD.remove(tmpPath);
+        Serial.println("[SD] Purge failed: temp rename error, old log restored");
+        return false;
+    }
+    SD.remove(bakPath);
+    Serial.printf("[SD] Purged acked rows <=%u removed=%u kept=%u\n",
+                  lastAckedId, removed, kept);
+    return true;
+}
+
 void sendHistoryResponse(uint32_t afterId, uint8_t limit) {
     char energyLogPath[96];
     buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
@@ -382,7 +554,7 @@ void sendHistoryResponse(uint32_t afterId, uint8_t limit) {
                             "\"main_current\":%s,\"main_power_w\":%s,\"main_energy_kwh\":%s,"
                             "\"digital_current\":%s,\"digital_power_w\":%s,\"digital_energy_kwh\":%s,"
                             "\"ac_current\":%s,\"ac_power_w\":%s,\"ac_energy_kwh\":%s,"
-                            "\"runtimes\":[%s,%s,%s,%s,%s,%s,%s]}",
+                            "\"runtimes_sec\":[%s,%s,%s,%s,%s,%s,%s]}",
                             first ? "" : ",", id, strtoul(fields[1], NULL, 10), fields[2],
                             fields[3], fields[4], fields[5], fields[6], fields[7],
                             fields[8], fields[9], fields[10], fields[11], fields[12],
@@ -500,8 +672,7 @@ void espNowTask(void* pvParameters) {
                     DigitalCmdAckPacket* p = (DigitalCmdAckPacket*)pkt.data;
                     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         g_systemState.digital.relayState = p->relayState;
-                        g_systemState.digital.locked = (p->relayLockState != 0) || (p->masterLockState != 0);
-                        g_systemState.masterLock = p->masterLockState != 0;
+                        g_systemState.digital.locked = p->relayLockState != 0;
                         g_systemState.desiredDigitalLocked = p->relayLockState != 0;
                         g_systemState.digital.rssi = pkt.rssi;
                         g_systemState.digital.lastSeenTime = millis();
@@ -521,7 +692,8 @@ void espNowTask(void* pvParameters) {
                                   p->reason);
                 }
             } else if (isSlave2) {
-                if (pkt.len == sizeof(PzemSlavePacket)) {
+                const int legacyPzemPacketSize = 1 + (int)(sizeof(float) * 4);
+                if (pkt.len == sizeof(PzemSlavePacket) || pkt.len == legacyPzemPacketSize) {
                     PzemSlavePacket* p = (PzemSlavePacket*)pkt.data;
                     if (p->type == 0x20 || p->type == 0x21) {
                         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -530,7 +702,10 @@ void espNowTask(void* pvParameters) {
                             g_systemState.pzem.current = p->current;
                             g_systemState.pzem.power = p->power;
                             g_systemState.pzem.energy = p->energy;
-                            g_systemState.pzem.sensorHealthy = !isnan(p->voltage) && !isnan(p->current) && !isnan(p->power);
+                            bool packetHealthy = (pkt.len == sizeof(PzemSlavePacket)) ? (p->healthy != 0) : true;
+                            bool voltageValid = !isnan(p->voltage) && p->voltage >= 80.0f && p->voltage <= 280.0f;
+                            g_systemState.pzem.sensorHealthy =
+                                packetHealthy && voltageValid && !isnan(p->current) && !isnan(p->power);
                             g_systemState.pzem.rssi = pkt.rssi;
                             if (p->type == 0x21) {
                                 g_systemState.pzem.lastSeenTime = millis();
@@ -690,20 +865,18 @@ void uartTask(void* pvParameters) {
                         }
                     }
                 }
-                // Master Lock: {"t":"lock","val":true/false}
+                // Legacy SmartNest master lock alias: apply to Digital Board relay lock only.
                 else if (pLock) {
                     char* valPtr = strstr(rxLine, "\"val\":");
                     if (valPtr) {
                         bool lockVal = (strncmp(valPtr + 6, "true", 4) == 0);
-                        Serial.printf("[LOCK] Lock command received from SmartNest: %s\n", lockVal ? "ON" : "OFF");
-                        setDesiredMasterLock(lockVal);
-                        Serial.printf("[LOCK] g_systemState.masterLock updated: %s\n", lockVal ? "ON" : "OFF");
+                        Serial.printf("[LOCK] Legacy lock command received from SmartNest: %s\n", lockVal ? "ON" : "OFF");
+                        setDesiredDigitalLock(lockVal);
                         
-                        // Send lock_ack back to SmartNest
                         char ackBuf[64];
                         snprintf(ackBuf, sizeof(ackBuf), "{\"t\":\"lock_ack\",\"val\":%s}", lockVal ? "true" : "false");
                         enqueueUartTx(ackBuf);
-                        Serial.println("[LOCK] lock_ack sent to SmartNest");
+                        Serial.println("[LOCK] legacy lock_ack sent to SmartNest");
                     }
                 }
                 // SD Log file listing: {"t":"files_req"}
@@ -860,15 +1033,24 @@ void energyTimeTask(void* pvParameters) {
         float pzemCurrentVal = 0.0f;
         float pzemPowerVal = 0.0f;
         float pzemVoltageVal = 0.0f;
+        float energyVoltageVal = 0.0f;
         float pzemEnergyVal = 0.0f;
         float smartNestLoadCurrent = 0.0f;
-        bool masterLockVal = false;
         double mainEnergyWhVal = 0.0;
         double digitalEnergyWhVal = 0.0;
         uint32_t relayRuntimeVals[7] = {0};
         bool sdOkVal = false;
+        bool voltageEstimatedVal = false;
+        bool isTimeValid = false;
+        uint32_t curEpoch = 0;
+        int8_t tzH = 5;
+        uint8_t tzM = 30;
+        bool queueDayEndSample = false;
+        EnergyLogSample dayEndSample;
+        memset(&dayEndSample, 0, sizeof(dayEndSample));
         uint64_t sdTotalVal = 0;
         uint64_t sdUsedVal = 0;
+        char resetReasonVal[24] = "";
         bool gotMutex = false;
         
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -882,18 +1064,28 @@ void energyTimeTask(void* pvParameters) {
             digitalOnlineVal = g_systemState.digital.online;
             pzemOnlineVal = g_systemState.pzem.online;
             pzemHealthyVal = g_systemState.pzem.sensorHealthy;
+            isTimeValid = g_systemState.time.timeValid;
+            if (isTimeValid) {
+                curEpoch = g_systemState.time.baseEpoch + (millis() - g_systemState.time.baseMillis) / 1000;
+                tzH = g_systemState.time.tzHours;
+                tzM = g_systemState.time.tzMins;
+            }
             rssiVal = g_systemState.digital.rssi;
             pzemRssiVal = g_systemState.pzem.rssi;
             relayStateVal = g_systemState.digital.relayState;
             switchStateVal = g_systemState.digital.switchState;
             lockedVal = g_systemState.digital.locked;
-            masterLockVal = g_systemState.masterLock;
             sdOkVal = g_systemState.sd.cardPresent;
             sdTotalVal = g_systemState.sd.totalBytes;
             sdUsedVal = g_systemState.sd.usedBytes;
+            strncpy(resetReasonVal, g_systemState.resetReason, sizeof(resetReasonVal) - 1);
 
-            float voltageForEnergy = (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal)) ? pzemVoltageVal : 0.0f;
-            if (voltageForEnergy > 0.0f && deltaSeconds > 0.0f) {
+            bool voltageValid = pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal) &&
+                                pzemVoltageVal >= 80.0f && pzemVoltageVal <= 280.0f;
+            float voltageForEnergy = voltageValid ? pzemVoltageVal : ENERGY_DEFAULT_VOLTAGE;
+            energyVoltageVal = voltageForEnergy;
+            voltageEstimatedVal = !voltageValid;
+            if (deltaSeconds > 0.0f) {
                 g_systemState.energy.mainEnergyWh += ((double)voltageForEnergy * (double)smartNestLoadCurrent * (double)deltaSeconds) / 3600.0;
                 g_systemState.energy.digitalEnergyWh += ((double)voltageForEnergy * (double)rmsCurrentVal * (double)deltaSeconds) / 3600.0;
             }
@@ -908,6 +1100,44 @@ void energyTimeTask(void* pvParameters) {
                     g_systemState.energy.relayRuntimeSec[6] += runtimeDelta;
                 }
             }
+            if (isTimeValid) {
+                uint32_t currentDayKey = localDayKey(curEpoch, tzH, tzM);
+                if (!g_systemState.energy.dayKeyValid) {
+                    if (g_systemState.energy.loadedFromSd && g_systemState.energy.dayKey == currentDayKey) {
+                        Serial.printf("[ENERGY] Restored same-day SD state dayKey=%u\n", currentDayKey);
+                    } else if (g_systemState.energy.loadedFromSd && g_systemState.energy.dayKey < currentDayKey) {
+                        memset(&g_systemState.energy, 0, sizeof(g_systemState.energy));
+                        Serial.printf("[ENERGY] Saved state was older day; starting fresh dayKey=%u\n", currentDayKey);
+                    }
+                    g_systemState.energy.dayKey = currentDayKey;
+                    g_systemState.energy.dayKeyValid = true;
+                    g_systemState.energyStateSaveRequest = true;
+                } else if (currentDayKey != g_systemState.energy.dayKey) {
+                    dayEndSample.epoch = curEpoch > 0 ? curEpoch - 1 : curEpoch;
+                    dayEndSample.tzHours = tzH;
+                    dayEndSample.tzMins = tzM;
+                    dayEndSample.voltage = pzemVoltageVal;
+                    dayEndSample.mainCurrent = smartNestLoadCurrent;
+                    dayEndSample.mainPowerW = voltageForEnergy * smartNestLoadCurrent;
+                    dayEndSample.mainEnergyWh = g_systemState.energy.mainEnergyWh;
+                    dayEndSample.digitalCurrent = rmsCurrentVal;
+                    dayEndSample.digitalPowerW = voltageForEnergy * rmsCurrentVal;
+                    dayEndSample.digitalEnergyWh = g_systemState.energy.digitalEnergyWh;
+                    dayEndSample.acCurrent = pzemCurrentVal;
+                    dayEndSample.acPowerW = pzemPowerVal;
+                    dayEndSample.acEnergyKWh = pzemEnergyVal;
+                    for (int i = 0; i < 7; i++) {
+                        dayEndSample.relayRuntimeSec[i] = g_systemState.energy.relayRuntimeSec[i];
+                    }
+                    queueDayEndSample = true;
+                    memset(&g_systemState.energy, 0, sizeof(g_systemState.energy));
+                    g_systemState.energy.dayKey = currentDayKey;
+                    g_systemState.energy.dayKeyValid = true;
+                    g_systemState.energyStateSaveRequest = true;
+                    Serial.printf("[ENERGY] Local day changed; daily counters reset oldDay=%u newDay=%u\n",
+                                  dayEndSample.epoch, currentDayKey);
+                }
+            }
             mainEnergyWhVal = g_systemState.energy.mainEnergyWh;
             digitalEnergyWhVal = g_systemState.energy.digitalEnergyWh;
             for (int i = 0; i < 7; i++) {
@@ -919,23 +1149,14 @@ void energyTimeTask(void* pvParameters) {
         }
         
         if (gotMutex) {
+            if (queueDayEndSample) {
+                if (xQueueSend(g_sdQueue, &dayEndSample, 0) != pdTRUE) {
+                    Serial.println("[ENERGY] Day-end SD sample queue full; final sample dropped");
+                }
+            }
             if (now - lastTxTime >= 10000) {
                 lastTxTime = now;
-                
-                bool isTimeValid = false;
-                uint32_t curEpoch = 0;
-                int8_t tzH = 5;
-                uint8_t tzM = 30;
-                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    isTimeValid = g_systemState.time.timeValid;
-                    if (isTimeValid) {
-                        curEpoch = g_systemState.time.baseEpoch + (millis() - g_systemState.time.baseMillis) / 1000;
-                        tzH = g_systemState.time.tzHours;
-                        tzM = g_systemState.time.tzMins;
-                    }
-                    xSemaphoreGive(g_stateMutex);
-                }
-                
+
                 if (isTimeValid && (smartNestLoadCurrent > 0.0f || rmsCurrentVal > 0.0f || mainEnergyWhVal > 0.0 || digitalEnergyWhVal > 0.0)) {
                     EnergyLogSample rec;
                     rec.epoch = curEpoch;
@@ -943,10 +1164,10 @@ void energyTimeTask(void* pvParameters) {
                     rec.tzMins = tzM;
                     rec.voltage = pzemVoltageVal;
                     rec.mainCurrent = smartNestLoadCurrent;
-                    rec.mainPowerW = pzemVoltageVal * smartNestLoadCurrent;
+                    rec.mainPowerW = energyVoltageVal * smartNestLoadCurrent;
                     rec.mainEnergyWh = mainEnergyWhVal;
                     rec.digitalCurrent = rmsCurrentVal;
-                    rec.digitalPowerW = pzemVoltageVal * rmsCurrentVal;
+                    rec.digitalPowerW = energyVoltageVal * rmsCurrentVal;
                     rec.digitalEnergyWh = digitalEnergyWhVal;
                     rec.acCurrent = pzemCurrentVal;
                     rec.acPowerW = pzemPowerVal;
@@ -970,7 +1191,9 @@ void energyTimeTask(void* pvParameters) {
                 char piStr[16] = "null";
                 char ppStr[16] = "null";
                 char peStr[16] = "null";
-                if (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal) && !isnan(pzemCurrentVal) && !isnan(pzemPowerVal) && !isnan(pzemEnergyVal)) {
+                if (pzemOnlineVal && pzemHealthyVal && !isnan(pzemVoltageVal) &&
+                    pzemVoltageVal >= 80.0f && pzemVoltageVal <= 280.0f &&
+                    !isnan(pzemCurrentVal) && !isnan(pzemPowerVal) && !isnan(pzemEnergyVal)) {
                     snprintf(vStr, sizeof(vStr), "%.1f", pzemVoltageVal);
                     snprintf(piStr, sizeof(piStr), "%.3f", pzemCurrentVal);
                     snprintf(ppStr, sizeof(ppStr), "%.1f", pzemPowerVal);
@@ -979,14 +1202,15 @@ void energyTimeTask(void* pvParameters) {
                 
                 char tel[768];
                 snprintf(tel, sizeof(tel),
-                         "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%s,\"pi\":%s,\"pp\":%s,\"pe\":%s,"
+                         "{\"t\":\"tel\",\"acs\":%.2f,\"v\":%s,\"ev\":%.1f,\"ve\":%s,\"pi\":%s,\"pp\":%s,\"pe\":%s,"
                          "\"me\":%.3f,\"de\":%.3f,"
                          "\"rt\":[%u,%u,%u,%u,%u,%u,%u],"
                          "\"d_on\":%s,\"p_on\":%s,\"p_health\":%s,\"d_rssi\":%d,\"p_rssi\":%d,"
                          "\"d_relay\":%d,\"d_sw\":%d,\"d_lock\":%s,"
                          "\"sd_ok\":%s,\"sd_total\":%llu,\"sd_used\":%llu,"
-                         "\"m_lock\":%s}",
-                         rmsCurrentVal, vStr, piStr, ppStr, peStr,
+                         "\"reset_reason\":\"%s\",\"m_lock\":false}",
+                         rmsCurrentVal, vStr, energyVoltageVal, voltageEstimatedVal ? "true" : "false",
+                         piStr, ppStr, peStr,
                          mainEnergyWhVal / 1000.0, digitalEnergyWhVal / 1000.0,
                          relayRuntimeVals[0], relayRuntimeVals[1], relayRuntimeVals[2],
                          relayRuntimeVals[3], relayRuntimeVals[4], relayRuntimeVals[5],
@@ -998,7 +1222,7 @@ void energyTimeTask(void* pvParameters) {
                          lockedVal ? "true" : "false",
                          sdOkVal ? "true" : "false",
                          (unsigned long long)sdTotalVal, (unsigned long long)sdUsedVal,
-                         masterLockVal ? "true" : "false");
+                         resetReasonVal);
                 
                 enqueueUartTx(tel);
             }
@@ -1009,6 +1233,7 @@ void energyTimeTask(void* pvParameters) {
 void sdLoggingTask(void* pvParameters) {
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     bool sdOk = SD.begin(SD_CS);
+    uint32_t lastEnergyStateSaveMs = 0;
     
     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         g_systemState.sd.cardPresent = sdOk;
@@ -1019,7 +1244,21 @@ void sdLoggingTask(void* pvParameters) {
     if (sdOk) {
         SD.mkdir(SD_LOG_DIR);
         char energyLogPath[96];
+        char tmpPath[96];
+        char bakPath[96];
         buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+        buildLogFilePath(tmpPath, sizeof(tmpPath), SD_ENERGY_TMP_FILE);
+        buildLogFilePath(bakPath, sizeof(bakPath), SD_ENERGY_BAK_FILE);
+
+        if (!SD.exists(energyLogPath) && SD.exists(bakPath)) {
+            if (SD.rename(bakPath, energyLogPath)) {
+                Serial.println("[SD] Recovered energy log from backup");
+            }
+        }
+        if (SD.exists(energyLogPath) && SD.exists(bakPath)) {
+            SD.remove(bakPath);
+        }
+        SD.remove(tmpPath);
 
         File logsDir = SD.open(SD_LOG_DIR);
         if (logsDir && logsDir.isDirectory()) {
@@ -1028,7 +1267,9 @@ void sdLoggingTask(void* pvParameters) {
                 const char* name = entry.name();
                 if (!entry.isDirectory() && name &&
                     strcmp(name, SD_ENERGY_LOG_FILE) != 0 &&
-                    strcmp(name, SD_SYNC_STATE_FILE) != 0) {
+                    strcmp(name, SD_ENERGY_BAK_FILE) != 0 &&
+                    strcmp(name, SD_SYNC_STATE_FILE) != 0 &&
+                    strcmp(name, SD_ENERGY_STATE_FILE) != 0) {
                     char stalePath[96];
                     buildLogFilePath(stalePath, sizeof(stalePath), name);
                     entry.close();
@@ -1045,17 +1286,29 @@ void sdLoggingTask(void* pvParameters) {
         if (!SD.exists(energyLogPath)) {
             File newLog = SD.open(energyLogPath, FILE_WRITE);
             if (newLog) {
-                newLog.println("record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s");
+                newLog.println(ENERGY_LOG_HEADER);
                 newLog.close();
             }
         }
         char syncPath[96];
         buildSyncStatePath(syncPath, sizeof(syncPath));
+        char energyStatePath[96];
+        buildEnergyStatePath(energyStatePath, sizeof(energyStatePath));
+        EnergyMeterState savedEnergy;
+        bool hasSavedEnergy = readEnergyStateFile(energyStatePath, savedEnergy);
         uint32_t maxId = scanMaxEnergyRecordId(energyLogPath);
         uint32_t ackedId = readUintFile(syncPath, 0);
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_systemState.sd.nextRecordId = maxId + 1;
+            g_systemState.sd.nextRecordId = (maxId > ackedId ? maxId : ackedId) + 1;
             g_systemState.sd.lastAckedRecordId = ackedId;
+            if (hasSavedEnergy) {
+                g_systemState.energy = savedEnergy;
+                g_systemState.energy.loadedFromSd = true;
+                g_systemState.energy.dayKeyValid = false;
+                Serial.printf("[SD] Loaded energy_state dayKey=%u mainWh=%.3f digitalWh=%.3f\n",
+                              savedEnergy.dayKey, savedEnergy.mainEnergyWh,
+                              savedEnergy.digitalEnergyWh);
+            }
             xSemaphoreGive(g_stateMutex);
         }
     }
@@ -1073,7 +1326,7 @@ void sdLoggingTask(void* pvParameters) {
                 if (!logFile) {
                     logFile = SD.open(energyLogPath, FILE_WRITE);
                     if (logFile) {
-                        logFile.println("record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s");
+                        logFile.println(ENERGY_LOG_HEADER);
                     }
                 }
 
@@ -1096,6 +1349,10 @@ void sdLoggingTask(void* pvParameters) {
                                    rec.relayRuntimeSec[4], rec.relayRuntimeSec[5],
                                    rec.relayRuntimeSec[6]);
                     logFile.close();
+                    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        g_systemState.energyStateSaveRequest = true;
+                        xSemaphoreGive(g_stateMutex);
+                    }
                 } else {
                     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         g_systemState.sd.droppedRecords++;
@@ -1230,6 +1487,18 @@ void sdLoggingTask(void* pvParameters) {
             char syncPath[96];
             buildSyncStatePath(syncPath, sizeof(syncPath));
             writeUintFile(syncPath, historyAckLast);
+            if (purgeAckedEnergyRows(historyAckLast)) {
+                char energyLogPath[96];
+                buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
+                uint32_t maxId = scanMaxEnergyRecordId(energyLogPath);
+                if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    uint32_t minNext = (maxId > historyAckLast ? maxId : historyAckLast) + 1;
+                    if (g_systemState.sd.nextRecordId < minNext) {
+                        g_systemState.sd.nextRecordId = minNext;
+                    }
+                    xSemaphoreGive(g_stateMutex);
+                }
+            }
         }
 
         bool wantReset = false;
@@ -1249,6 +1518,9 @@ void sdLoggingTask(void* pvParameters) {
             char syncPath[96];
             buildSyncStatePath(syncPath, sizeof(syncPath));
             writeUintFile(syncPath, 0);
+            char energyStatePath[96];
+            buildEnergyStatePath(energyStatePath, sizeof(energyStatePath));
+            SD.remove(energyStatePath);
             Serial.println("[ENERGY] Main/digital energy counters and relay runtimes reset.");
         }
 
@@ -1264,15 +1536,19 @@ void sdLoggingTask(void* pvParameters) {
             SD.remove(energyLogPath);
             File newLog = SD.open(energyLogPath, FILE_WRITE);
             if (newLog) {
-                newLog.println("record_id,epoch,date,voltage,main_current,main_power_w,main_energy_kwh,digital_current,digital_power_w,digital_energy_kwh,ac_current,ac_power_w,ac_energy_kwh,r1_on_s,r2_on_s,r3_on_s,r4_on_s,r5_on_s,r6_on_s,r7_on_s");
+                newLog.println(ENERGY_LOG_HEADER);
                 newLog.close();
             }
             char syncPath[96];
             buildSyncStatePath(syncPath, sizeof(syncPath));
             writeUintFile(syncPath, 0);
+            char energyStatePath[96];
+            buildEnergyStatePath(energyStatePath, sizeof(energyStatePath));
+            SD.remove(energyStatePath);
             if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 g_systemState.sd.lastAckedRecordId = 0;
                 g_systemState.sd.nextRecordId = 1;
+                memset(&g_systemState.energy, 0, sizeof(g_systemState.energy));
                 xSemaphoreGive(g_stateMutex);
             }
             Serial.println("[SD] Energy log cleared.");
@@ -1284,6 +1560,22 @@ void sdLoggingTask(void* pvParameters) {
                 g_systemState.sd.usedBytes = SD.usedBytes();
             }
             xSemaphoreGive(g_stateMutex);
+        }
+
+        bool saveEnergyState = false;
+        uint32_t nowMs = millis();
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (g_systemState.energyStateSaveRequest || nowMs - lastEnergyStateSaveMs >= 60000UL) {
+                g_systemState.energyStateSaveRequest = false;
+                saveEnergyState = true;
+            }
+            xSemaphoreGive(g_stateMutex);
+        }
+        if (saveEnergyState && sdOk) {
+            char energyStatePath[96];
+            buildEnergyStatePath(energyStatePath, sizeof(energyStatePath));
+            writeEnergyStateFile(energyStatePath);
+            lastEnergyStateSaveMs = nowMs;
         }
     }
 }
@@ -1327,6 +1619,8 @@ void healthTask(void* pvParameters) {
 void setup() {
     Serial.begin(115200);
     Serial.println("\n[SYSTEM] Master Initializing...");
+    const char *resetReason = resetReasonToString(esp_reset_reason());
+    Serial.printf("[RESET] Master reset_reason=%s\n", resetReason);
     
     // Create mutex & queues
     g_stateMutex = xSemaphoreCreateMutex();
@@ -1343,6 +1637,7 @@ void setup() {
     
     // Initialize system state
     memset(&g_systemState, 0, sizeof(g_systemState));
+    strncpy(g_systemState.resetReason, resetReason, sizeof(g_systemState.resetReason) - 1);
     
     // WiFi Station mode before ESP-NOW to prevent boot looping
     WiFi.mode(WIFI_STA);

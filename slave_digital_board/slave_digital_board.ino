@@ -41,7 +41,6 @@ uint8_t localDigitalMac[] = {0x14, 0x08, 0x08, 0xA4, 0x94, 0x1C};
 
 bool overcurrentLock = false;
 bool relayLock = false;
-bool masterLock = false;
 bool relayCondition = false;
 bool relayOutputState = false;
 float currentAmperes = 0.0f;
@@ -73,11 +72,11 @@ void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 void saveControlState() {
   controlPrefs.putBool("relay", relayCondition);
   controlPrefs.putBool("rLock", relayLock);
-  controlPrefs.putBool("mLock", masterLock);
+  controlPrefs.remove("mLock");
 }
 
 void applyRelayHardware() {
-  bool actualRelay = relayCondition && !relayLock && !masterLock && !overcurrentLock;
+  bool actualRelay = relayCondition && !relayLock && !overcurrentLock;
   digitalWrite(RELAY_PIN, actualRelay ? LOW : HIGH);
   relayOutputState = actualRelay;
 }
@@ -86,20 +85,20 @@ void loadControlState() {
   controlPrefs.begin("d1_ctrl", false);
   relayCondition = controlPrefs.getBool("relay", false);
   relayLock = controlPrefs.getBool("rLock", false);
-  masterLock = controlPrefs.getBool("mLock", false);
+  if (controlPrefs.isKey("mLock")) {
+    controlPrefs.remove("mLock");
+    Serial.println("[DigitalBoard] Cleared legacy mLock NVS key");
+  }
   applyRelayHardware();
-  Serial.printf("[DigitalBoard] Loaded state: relay=%s relayLock=%s masterLock=%s\n",
-                relayCondition ? "ON" : "OFF", relayLock ? "ON" : "OFF",
-                masterLock ? "ON" : "OFF");
+  Serial.printf("[DigitalBoard] Loaded state: relay=%s relayLock=%s\n",
+                relayCondition ? "ON" : "OFF", relayLock ? "ON" : "OFF");
 }
 
 // Relay Control
 uint8_t currentLockReason() {
-  if (relayLock || masterLock || overcurrentLock) {
+  if (relayLock || overcurrentLock) {
     if (relayLock)
       return 1;
-    if (masterLock)
-      return 2;
     return 3;
   }
   return 0;
@@ -113,7 +112,7 @@ void sendCommandAck(uint8_t cmdType, bool accepted, uint8_t reason) {
   pkt.reason = reason;
   pkt.relayState = relayOutputState ? 1 : 0;
   pkt.relayLockState = relayLock ? 1 : 0;
-  pkt.masterLockState = masterLock ? 1 : 0;
+  pkt.masterLockState = 0; // Legacy/deprecated field kept for packet compatibility.
   pkt.overcurrentLockState = overcurrentLock ? 1 : 0;
   esp_now_send(masterMacAddress, (uint8_t *)&pkt, sizeof(pkt));
 }
@@ -122,8 +121,8 @@ bool relayOn() {
   uint8_t reason = currentLockReason();
   if (reason != 0) {
     Serial.printf(
-        "[DigitalBoard] relayOn() blocked - relayLock=%d masterLock=%d overcurrentLock=%d\n",
-        relayLock, masterLock, overcurrentLock);
+        "[DigitalBoard] relayOn() blocked - relayLock=%d overcurrentLock=%d\n",
+        relayLock, overcurrentLock);
     return false;
   }
   relayCondition = true;
@@ -156,16 +155,6 @@ void setRelayLock(bool locked) {
   saveControlState();
   applyRelayHardware();
   Serial.printf("[DigitalBoard] Relay lock -> %s\n", locked ? "ON" : "OFF");
-}
-
-void setMasterLock(bool locked) {
-  masterLock = locked;
-  if (masterLock) {
-    relayCondition = false;
-  }
-  saveControlState();
-  applyRelayHardware();
-  Serial.printf("[DigitalBoard] Master lock -> %s\n", locked ? "ON" : "OFF");
 }
 
 // 1 kHz non-blocking current sampler
@@ -262,7 +251,7 @@ void checkManualSwitch() {
       lastDebouncedState = rawState;
 
       if (rawState == HIGH) {
-        if (relayLock || masterLock || overcurrentLock) {
+        if (relayLock || overcurrentLock) {
           Serial.println("[DigitalBoard] Switch ON ignored — locked");
         } else {
           Serial.println("[DigitalBoard] Switch toggled ON");
@@ -302,9 +291,6 @@ void updateLEDState() {
       ledState = !ledState;
     }
     setLEDColor(ledState, false, false);
-  } else if (masterLock) {
-    // Master Lock: Cyan solid
-    setLEDColor(false, true, true);
   } else if (relayLock) {
     // Relay Lock: Yellow solid
     setLEDColor(true, true, false);
@@ -331,7 +317,7 @@ void sendSlaveData() {
   pkt.rmsCurrent = relayOutputState ? currentAmperes : 0.0f;
   pkt.relayState = relayOutputState ? 1 : 0;
   pkt.switchState = (digitalRead(MANUAL_SWITCH_PIN) == LOW) ? 1 : 0;
-  pkt.lockState = (relayLock || masterLock) ? 1 : 0;
+  pkt.lockState = relayLock ? 1 : 0;
   esp_now_send(masterMacAddress, (uint8_t *)&pkt, sizeof(pkt));
 }
 
@@ -341,7 +327,7 @@ void sendAckReply() {
   pkt.rmsCurrent = relayOutputState ? currentAmperes : 0.0f;
   pkt.relayState = relayOutputState ? 1 : 0;
   pkt.switchState = 0;
-  pkt.lockState = (relayLock || masterLock) ? 1 : 0;
+  pkt.lockState = relayLock ? 1 : 0;
   esp_now_send(masterMacAddress, (uint8_t *)&pkt, sizeof(pkt));
 }
 
@@ -455,13 +441,13 @@ void loop() {
         ESP.restart();
         break;
       case 0x08:
-        Serial.println("[DigitalBoard] CMD: masterLock ON");
-        setMasterLock(true);
+        Serial.println("[DigitalBoard] CMD: legacy masterLock ON -> relay_lock");
+        setRelayLock(true);
         sendCommandAck(cmdType, true, 0);
         break;
       case 0x09:
-        Serial.println("[DigitalBoard] CMD: masterLock OFF");
-        setMasterLock(false);
+        Serial.println("[DigitalBoard] CMD: legacy masterLock OFF -> relay_unlock");
+        setRelayLock(false);
         sendCommandAck(cmdType, true, 0);
         break;
       }
@@ -486,10 +472,10 @@ void loop() {
   static unsigned long lastStatusLogTime = 0;
   if (millis() - lastStatusLogTime >= 5000) {
     lastStatusLogTime = millis();
-    Serial.printf("[DigitalBoard] RMS: %.2fA | Relay: %s | MasterLock: %s | "
-                  "RelayLock: %s | OC-Lock: %s\n",
+    Serial.printf("[DigitalBoard] RMS: %.2fA | Relay: %s | RelayLock: %s | "
+                  "OC-Lock: %s\n",
                   currentAmperes, relayOutputState ? "ON" : "OFF",
-                  masterLock ? "YES" : "NO", relayLock ? "YES" : "NO",
+                  relayLock ? "YES" : "NO",
                   overcurrentLock ? "YES" : "NO");
   }
 

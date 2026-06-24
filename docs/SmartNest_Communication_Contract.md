@@ -147,6 +147,7 @@ struct PzemSlavePacket {
   float current;
   float power;
   float energy;
+  uint8_t healthy;
 };
 ```
 
@@ -157,6 +158,7 @@ struct PzemSlavePacket {
 | `current` | `float` | PZEM current |
 | `power` | `float` | PZEM power |
 | `energy` | `float` | PZEM energy register value |
+| `healthy` | `uint8_t` | `1` when all PZEM reads were valid, `0` after any read failure/NaN |
 
 Send timing:
 
@@ -168,7 +170,7 @@ Send timing:
 
 Sensor health behavior:
 
-If any PZEM reading returns `NaN`, the PZEM board marks `pzemHealthy = false`, logs a warning, replaces invalid values with `0.0`, and still sends a packet so the Master knows the board is alive.
+If any PZEM reading returns `NaN`, the PZEM board marks `pzemHealthy = false`, logs a warning, sets `healthy = 0`, replaces invalid values with `0.0`, and still sends a packet so the Master knows the board is alive. Master treats the packet as unhealthy unless `healthy = 1` and voltage is in the valid 80V-280V range.
 
 ### ESP-NOW Commands Received From Master
 
@@ -465,6 +467,8 @@ Dashboard login uses a short-lived session token stored in browser `sessionStora
   "acs": 0.00,
   "load": 0.00,
   "voltage": 230.0,
+  "energy_voltage": 230.0,
+  "voltage_estimated": false,
   "ac_current": 0.123,
   "ac_power": 28.3,
   "ac_energy": 1.235,
@@ -487,6 +491,7 @@ Dashboard login uses a short-lived session token stored in browser `sessionStora
   "humidity": 61.0,
   "dht_ok": true,
   "mqtt_status": 2,
+  "reset_reason": "POWERON",
   "uptime": 123456,
   "time": "2026-06-19 22:30:00"
 }
@@ -523,7 +528,7 @@ The MQTT contract is now split into three sections:
 - `cmd`: cloud commands and SmartNest command acknowledgements.
 - `history`: SD-backed records intended for cloud database storage.
 
-During migration, older relay/sensor topics continue to publish/subscribe for compatibility.
+Older relay/sensor/slave compatibility topics are removed. Use only the JSON live, command, and history topics below.
 
 #### Live Topics
 
@@ -593,7 +598,7 @@ History batch example:
       "ac_current": 1.234,
       "ac_power_w": 287.50,
       "ac_energy_kwh": 18.905000,
-      "runtimes": [12, 0, 44, 0, 0, 0, 18]
+      "runtimes_sec": [12, 0, 44, 0, 0, 0, 18]
     }
   ]
 }
@@ -607,112 +612,13 @@ Cloud ACK example:
 
 SmartNest requests history from Master over UART, publishes a batch, and only advances Master sync state after cloud ACK.
 
-#### Retained State Topics
+#### Removed Compatibility Topics
 
-Published after MQTT connect and after relevant commands.
-
-| Topic | Payload | Retained | Meaning |
-|---|---|---:|---|
-| `<base>/relay/0/state` to `<base>/relay/5/state` | `true` / `false` | yes | SmartNest local relay state |
-| `<base>/relay/6/state` | `true` / `false` | yes | Digital Board relay 7 state |
-| `<base>/relay/0/locked` to `<base>/relay/5/locked` | `true` / `false` | yes | SmartNest local relay lock |
-| `<base>/relay/6/locked` | `true` / `false` | yes | Digital Board relay lock |
-| `<base>/slave/d1/online` | `true` / `false` | yes | Digital Board online |
-| `<base>/slave/pzem/online` | `true` / `false` | yes | PZEM board online |
-
-#### Command Feedback Topics
-
-| Topic | Payload | Retained | Meaning |
-|---|---|---:|---|
-| `<base>/relay/6/cmd_ack` | JSON | no | Last Digital Board command acknowledgement result, including reject reason |
-
-#### Live Telemetry Topics
-
-Published on telemetry updates and approximately every `30` seconds while MQTT is connected.
-
-| Topic | Payload example | Retained | Meaning |
-|---|---|---:|---|
-| `<base>/sensor/voltage` | `230.4` | no | PZEM voltage |
-| `<base>/sensor/acs` | `0.52` | no | Digital Board ACS current |
-| `<base>/sensor/load` | `1.25` | no | SmartNest local ACS current for relay 1-6 load |
-| `<base>/sensor/power` | `287.5` | no | Air-conditioner PZEM power |
-| `<base>/sensor/ac_current` | `1.234` | no | Air-conditioner PZEM current |
-| `<base>/sensor/ac_energy` | `18.905` | no | Air-conditioner PZEM energy in kWh |
-| `<base>/sensor/temperature` | `28.4` | no | SmartNest DHT11 temperature in Celsius |
-| `<base>/sensor/humidity` | `61.0` | no | SmartNest DHT11 relative humidity percent |
-| `<base>/sensor/dht_ok` | `true` | no | DHT11 last-read health |
-| `<base>/switch/6/state` | `true` | no | Digital Board manual switch state |
-| `<base>/status` | JSON | no | Heartbeat/status |
-
-`<base>/status` payload:
-
-```json
-{
-  "uptime": 123456,
-  "ssid": "WiFiName",
-  "rssi": -55,
-  "temp_c": 28.4,
-  "humidity": 61.0,
-  "dht_ok": true
-}
-```
-
-### MQTT Command Topics Subscribed By SmartNest
-
-SmartNest subscribes to these topics after MQTT connects.
-
-| Topic | Payload | Action |
-|---|---|---|
-| `<base>/relay/0/set` to `<base>/relay/5/set` | `true` / `false` | Set local relay ON/OFF |
-| `<base>/relay/6/set` | `true` / `false` | Set Digital Board relay ON/OFF |
-| `<base>/relay/0/lock` to `<base>/relay/5/lock` | `true` / `false` | Lock/unlock local relay |
-| `<base>/relay/6/lock` | `true` / `false` | Lock/unlock Digital Board relay |
-| `<base>/cmd/slave/d1` | `reboot` | Reboot Digital Board |
-| `<base>/cmd/slave/pzem` | `reboot` | Reboot PZEM ESP32 |
-| `<base>/cmd/slave/pzem` | `energy_reset` | Reset PZEM energy register |
-
-### MQTT Command Payload Examples
-
-Turn local relay 1 ON:
-
-```text
-Topic: smartnest/relay/0/set
-Payload: true
-```
-
-Turn relay 7 OFF:
-
-```text
-Topic: smartnest/relay/6/set
-Payload: false
-```
-
-Lock relay 7:
-
-```text
-Topic: smartnest/relay/6/lock
-Payload: true
-```
-
-Reboot PZEM ESP32:
-
-```text
-Topic: smartnest/cmd/slave/pzem
-Payload: reboot
-```
-
-Reset PZEM energy:
-
-```text
-Topic: smartnest/cmd/slave/pzem
-Payload: energy_reset
-```
+The firmware must not publish or subscribe old retained relay state, scalar sensor, slave online, switch state, status, or old command topics. Removed examples include `<base>/sensor/#`, `<base>/relay/#`, `<base>/slave/#`, `<base>/switch/6/state`, `<base>/status`, and `<base>/cmd/slave/#`.
 
 ### Notes For Cloud Implementation
 
-- Payload matching is strict in the current firmware for MQTT commands. Use lowercase `true`, `false`, `reboot`, and `energy_reset`.
-- MQTT relay indexes are zero-based. UI labels should translate relay 1-7 to MQTT indexes 0-6.
-- Retained topics should be used by the cloud dashboard for initial state hydration.
+- Use JSON command payloads on `<base>/cmd/request`; relay numbers are 1-7.
 - Live telemetry topics are not retained, so the cloud should store incoming values if historical graphs are needed.
-- `MASTERLOCK` is available through Serial Monitor and UART (`{"t":"lock","val":true/false}`), but there is no MQTT topic for master lock in the current firmware.
+- `master_lock` is a JSON command type, not a separate MQTT topic.
 - PZEM voltage/current/power may be `null` in Master UART telemetry when the PZEM board is offline/unhealthy. MQTT publish code converts current SmartNest state to strings, so cloud should also tolerate `0.0` values.

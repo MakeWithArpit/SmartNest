@@ -102,7 +102,7 @@ Pass criteria:
   - Main board current and energy
   - Digital board current and energy
   - AC current, power, and energy
-  - Voltage
+  - Voltage only once; fallback/default energy voltage is marked `est`
   - SD status/free space
   - Digital/PZEM online status
   - Master lock state
@@ -175,7 +175,8 @@ Pass criteria:
 
 - Dashboard shows temperature and humidity.
 - `/api/status` includes `temp_c`, `humidity`, and `dht_ok`.
-- MQTT live sensors include `temperature_c`, `humidity_pct`, and `dht_ok`.
+- MQTT live sensors include `temperature_c` and `humidity_pct`.
+- MQTT live status includes `dht_ok`.
 
 ### SmartNest ACS712
 
@@ -346,16 +347,15 @@ Pass criteria:
 - Unsent history records upload after reconnect.
 - No duplicate database rows if cloud stores by `id`.
 
-## 17. Compatibility Topic Verification
-
-Old topics should still work during migration.
+## 17. Removed Compatibility Topic Verification
 
 Subscribe:
 
 ```text
-<base>/sensor/voltage
-<base>/relay/0/state
-<base>/relay/6/state
+<base>/sensor/#
+<base>/relay/#
+<base>/slave/#
+<base>/status
 ```
 
 Publish:
@@ -367,10 +367,10 @@ Payload: true
 
 Pass criteria:
 
-- Old sensor topics still publish.
-- Old relay state topics still publish retained state.
-- Old relay command topics still control relays.
-- New `<base>/cmd/ack` may emit legacy command ACK with generated command id.
+- Old sensor, relay, slave, and status topics do not publish.
+- Old relay command topics do not control relays.
+- Commands work through `<base>/cmd/request` only.
+- ACKs publish through `<base>/cmd/ack` only.
 
 ## 18. Reset Verification
 
@@ -417,5 +417,5 @@ The system is ready when:
 - Relay 7 ACK/timeout behavior works.
 - Historic records are SD-first and cloud-ACKed.
 - Offline MQTT does not lose history data.
-- Old MQTT topics still work during migration.
+- Old MQTT compatibility topics do not publish or control relays.
 - Documentation matches actual topics and payloads.

@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 
 struct __attribute__((packed)) CmdPacket {
   uint8_t type;
@@ -13,6 +14,7 @@ struct __attribute__((packed)) PzemSlavePacket {
   float current;
   float power;
   float energy;
+  uint8_t healthy;
 };
 
 // Pins
@@ -55,6 +57,22 @@ bool rebootRequested = false;
 uint32_t rebootTime = 0;
 
 uint32_t lastTelemetrySentTime = 0;
+
+const char *resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+  case ESP_RST_POWERON: return "POWERON";
+  case ESP_RST_EXT: return "EXT";
+  case ESP_RST_SW: return "SW";
+  case ESP_RST_PANIC: return "PANIC";
+  case ESP_RST_INT_WDT: return "INT_WDT";
+  case ESP_RST_TASK_WDT: return "TASK_WDT";
+  case ESP_RST_WDT: return "WDT";
+  case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+  case ESP_RST_BROWNOUT: return "BROWNOUT";
+  case ESP_RST_SDIO: return "SDIO";
+  default: return "UNKNOWN";
+  }
+}
 
 // RGB LED Control
 void setRGBColor(bool red, bool green, bool blue) {
@@ -138,6 +156,7 @@ void sendPzemPacket(uint8_t pktType) {
   pkt.current = i;
   pkt.power = p;
   pkt.energy = e;
+  pkt.healthy = pzemHealthy ? 1 : 0;
 
   if (espNowInitialized) {
     esp_err_t result = esp_now_send(masterMAC, (uint8_t *)&pkt, sizeof(pkt));
@@ -202,6 +221,8 @@ void handleIncomingPackets() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[SYSTEM START] PZEM Slave Initializing...");
+  Serial.printf("[RESET] PZEM reset_reason=%s\n",
+                resetReasonToString(esp_reset_reason()));
 
   // Initialize Serial2 for PZEM-004T connection with pins 16 (RX) and 17 (TX)
   Serial2.begin(9600, SERIAL_8N1, 16, 17);

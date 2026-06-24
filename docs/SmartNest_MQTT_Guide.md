@@ -16,7 +16,7 @@ SmartNest MQTT is divided into three sections.
 | Commands | `<base>/cmd/...` | Cloud-to-device commands and command result ACKs | Yes |
 | Historic data | `<base>/history/...` | SD-backed records for cloud database storage | Yes, batch ACK |
 
-Old topics such as `<base>/sensor/...`, `<base>/relay/...`, and `<base>/cmd/slave/...` are kept for migration compatibility.
+Old topics such as `<base>/sensor/...`, `<base>/relay/...`, `<base>/slave/...`, `<base>/status`, and `<base>/cmd/slave/...` are removed.
 
 ## Connection Defaults
 
@@ -56,7 +56,8 @@ Example:
   "digital_online": true,
   "pzem_online": true,
   "pzem_health": true,
-  "dht_ok": true
+  "dht_ok": true,
+  "reset_reason": "POWERON"
 }
 ```
 
@@ -67,6 +68,8 @@ Example:
 ```json
 {
   "voltage": 230.1,
+  "energy_voltage": 230.1,
+  "voltage_estimated": false,
   "main_current": 1.25,
   "digital_current": 0.52,
   "ac_current": 1.234,
@@ -75,8 +78,7 @@ Example:
   "main_energy_kwh": 0.120,
   "digital_energy_kwh": 0.040,
   "temperature_c": 28.4,
-  "humidity_pct": 61.0,
-  "dht_ok": true
+  "humidity_pct": 61.0
 }
 ```
 
@@ -97,7 +99,7 @@ Example:
   "locks": [false, false, false, false, false, false, false],
   "master_lock": false,
   "digital_switch": true,
-  "runtime": [12, 0, 44, 0, 0, 0, 18]
+  "runtime_sec": [12, 0, 44, 0, 0, 0, 18]
 }
 ```
 
@@ -207,7 +209,7 @@ Cloud acknowledges:
       "ac_current": 1.234,
       "ac_power_w": 287.50,
       "ac_energy_kwh": 18.905000,
-      "runtimes": [12, 0, 44, 0, 0, 0, 18]
+      "runtimes_sec": [12, 0, 44, 0, 0, 0, 18]
     }
   ]
 }
@@ -242,45 +244,9 @@ Important rules:
 - Master advances sync state only after ACK.
 - If MQTT/cloud is offline, SD keeps records for later upload.
 
-## Compatibility Topics
+## Removed Compatibility Topics
 
-These old topics remain available during migration.
-
-### Retained State
-
-| Topic | Payload | Retained |
-|---|---|---:|
-| `<base>/relay/0/state` to `<base>/relay/5/state` | `true` / `false` | yes |
-| `<base>/relay/6/state` | `true` / `false` | yes |
-| `<base>/relay/0/locked` to `<base>/relay/5/locked` | `true` / `false` | yes |
-| `<base>/relay/6/locked` | `true` / `false` | yes |
-| `<base>/slave/d1/online` | `true` / `false` | yes |
-| `<base>/slave/pzem/online` | `true` / `false` | yes |
-
-### Old Live Sensor Topics
-
-| Topic | Meaning |
-|---|---|
-| `<base>/sensor/voltage` | PZEM voltage |
-| `<base>/sensor/acs` | Digital Board current |
-| `<base>/sensor/load` | SmartNest local current |
-| `<base>/sensor/power` | AC/PZEM power |
-| `<base>/sensor/ac_current` | AC/PZEM current |
-| `<base>/sensor/ac_energy` | AC/PZEM energy |
-| `<base>/sensor/temperature` | DHT11 temperature |
-| `<base>/sensor/humidity` | DHT11 humidity |
-| `<base>/sensor/dht_ok` | DHT11 health |
-| `<base>/switch/6/state` | Digital Board switch state |
-| `<base>/status` | Basic heartbeat/status |
-
-### Old Command Topics
-
-| Topic | Payload | Meaning |
-|---|---|---|
-| `<base>/relay/0/set` to `<base>/relay/6/set` | `true` / `false` | Set relay |
-| `<base>/relay/0/lock` to `<base>/relay/6/lock` | `true` / `false` | Lock relay |
-| `<base>/cmd/slave/d1` | `reboot` | Reboot Digital Board |
-| `<base>/cmd/slave/pzem` | `reboot` / `energy_reset` | Reboot PZEM or reset PZEM energy |
+Old `<base>/sensor/...`, `<base>/relay/...`, `<base>/slave/...`, `<base>/switch/...`, `<base>/status`, and `<base>/cmd/slave/...` topics are not published or subscribed. Use only live JSON topics, `<base>/cmd/request`, `<base>/cmd/ack`, and history batch/ACK topics.
 
 ## Cloud Implementation Notes
 
@@ -290,4 +256,3 @@ These old topics remain available during migration.
 - Store history records by `id`; use idempotent upsert to avoid duplicates.
 - Send `<base>/history/ack` only after records are safely stored in the cloud database.
 - Treat live data as volatile; do not use it as permanent history.
-- Use retained compatibility state topics only for initial UI hydration during migration.
