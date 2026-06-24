@@ -58,7 +58,7 @@ static float acs712ZeroMv = 2500.0f;
 #define MQTT_USERNAME ""
 #define MQTT_PASSWORD ""
 #define MQTT_KEEPALIVE_S 60
-#define MQTT_BASE_TOPIC "smartnest"
+#define MQTT_BASE_TOPIC "smartnest/SmartNest_001"
 #define MQTT_HISTORY_BATCH_LIMIT 6
 #define MQTT_HISTORY_RETRY_MS 15000
 #define MQTT_HISTORY_MAX_PAYLOAD_BYTES 2800
@@ -94,10 +94,8 @@ void saveMqttConfig() {
   prefs.putBool("enabled", g_mqttConfig.enabled);
   prefs.putString("broker", String(g_mqttConfig.broker));
   prefs.putInt("port", g_mqttConfig.port);
-  prefs.putString("clientId", String(g_mqttConfig.clientId));
   prefs.putString("username", String(g_mqttConfig.username));
   prefs.putString("password", String(g_mqttConfig.password));
-  prefs.putString("baseTopic", String(g_mqttConfig.baseTopic));
   prefs.putInt("keepAlive", g_mqttConfig.keepAlive);
   prefs.end();
   Serial.println("[MQTT] Configuration saved to NVS Preferences");
@@ -114,8 +112,7 @@ void loadMqttConfig() {
 
   g_mqttConfig.port = prefs.getInt("port", MQTT_BROKER_PORT);
 
-  String clientId = prefs.getString("clientId", MQTT_CLIENT_ID);
-  strncpy(g_mqttConfig.clientId, clientId.c_str(),
+  strncpy(g_mqttConfig.clientId, MQTT_CLIENT_ID,
           sizeof(g_mqttConfig.clientId) - 1);
   g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
 
@@ -129,8 +126,7 @@ void loadMqttConfig() {
           sizeof(g_mqttConfig.password) - 1);
   g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
 
-  String baseTopic = prefs.getString("baseTopic", MQTT_BASE_TOPIC);
-  strncpy(g_mqttConfig.baseTopic, baseTopic.c_str(),
+  strncpy(g_mqttConfig.baseTopic, MQTT_BASE_TOPIC,
           sizeof(g_mqttConfig.baseTopic) - 1);
   g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
 
@@ -177,6 +173,8 @@ struct SystemState {
   float pzemCurrentA;
   float pzemPowerW;
   double acEnergyKWh;
+  double pzemRawEnergyKWh;
+  double acDayStartKWh;
   double mainEnergyKWh;
   double digitalEnergyKWh;
   uint32_t relayRuntimeSec[7];
@@ -200,6 +198,7 @@ struct SystemState {
   float humidityPct;
   bool dhtHealthy;
   char resetReason[24];
+  char timeSource[12];
 };
 
 const int RELAY_PINS[NUM_RELAYS] = {RELAY_1_PIN, RELAY_2_PIN, RELAY_3_PIN,
@@ -662,7 +661,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SmartNest Dashboard</title>
 <style>
-*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f6f8;color:#111827}.wrap{max-width:1120px;margin:0 auto;padding:18px}header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}h1{font-size:24px;margin:0;}h3{margin:0 0 10px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}.card{background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:12px;min-width:0}.label{font-size:12px;color:#5b6472}.val{font-size:21px;font-weight:700;margin-top:4px}.ok{color:#087443}.warn{color:#b54708}.bad{color:#b42318}.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:10px}button,select,input{font:inherit;border-radius:6px;min-width:0}button{border:0;background:#174ea6;color:#fff;font-weight:700;min-height:50px;padding:9px 10px;cursor:pointer;white-space:normal;line-height:1.15}button.secondary{background:#eef2f7;color:#111827;border:1px solid #c8d0dc}button.danger{background:#b42318}select,input{border:1px solid #c8d0dc;padding:9px;width:100%;background:#fff;min-height:40px}.row{display:grid;gap:8px;align-items:stretch}.cmdrow{grid-template-columns:minmax(120px,1.4fr) minmax(92px,1fr) minmax(68px,.6fr)}.btnrow{grid-template-columns:repeat(3,minmax(0,1fr))}.two{grid-template-columns:repeat(2,minmax(0,1fr))}.mqttgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.wide{grid-column:1/-1}pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;color:#d7e1f2;border-radius:8px;padding:12px;min-height:240px;max-height:520px;overflow:auto}.relays{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.relay{border:1px solid #d9dee7;border-radius:8px;padding:10px;background:#fff}.relay b{display:block;margin-bottom:8px}.mini{font-size:12px;color:#5b6472}.topbtn{width:auto;min-height:40px}.login{max-width:360px;margin:12vh auto}.hidden{display:none}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:#f4f6f8;color:#111827}.wrap{max-width:1120px;margin:0 auto;padding:18px}header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px}h1{font-size:24px;margin:0;}h3{margin:0 0 10px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px}.card{background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:12px;min-width:0}.label{font-size:12px;color:#5b6472}.val{font-size:21px;font-weight:700;margin-top:4px}.ok{color:#087443}.warn{color:#b54708}.bad{color:#b42318}.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:10px}button,select,input{font:inherit;border-radius:6px;min-width:0}button{border:0;background:#174ea6;color:#fff;font-weight:700;min-height:50px;padding:9px 10px;cursor:pointer;white-space:normal;line-height:1.15}button.secondary{background:#eef2f7;color:#111827;border:1px solid #c8d0dc}button.danger{background:#b42318}select,input{border:1px solid #c8d0dc;padding:9px;width:100%;background:#fff;min-height:40px}.row{display:grid;gap:8px;align-items:stretch}.cmdrow{grid-template-columns:minmax(120px,1.4fr) minmax(92px,1fr) minmax(68px,.6fr)}.btnrow{grid-template-columns:repeat(3,minmax(0,1fr))}.two{grid-template-columns:repeat(2,minmax(0,1fr))}.mqttgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.readonlybox{border:1px solid #c8d0dc;border-radius:6px;background:#eef2f7;padding:9px;min-height:40px;word-break:break-word}.topiclist{display:grid;gap:4px;margin-top:8px}.topiclist div{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;background:#f8fafc;border:1px solid #d9dee7;border-radius:6px;padding:7px;word-break:break-word}.wide{grid-column:1/-1}pre{white-space:pre-wrap;word-break:break-word;background:#0b1220;color:#d7e1f2;border-radius:8px;padding:12px;min-height:240px;max-height:520px;overflow:auto}.relays{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}.relay{border:1px solid #d9dee7;border-radius:8px;padding:10px;background:#fff}.relay b{display:block;margin-bottom:8px}.mini{font-size:12px;color:#5b6472}.topbtn{width:auto;min-height:40px}.login{max-width:360px;margin:12vh auto}.hidden{display:none}
 </style></head><body>
 <div id="loginPanel" class="login card"><h1 style="text-align:center;">SmartNest</h1><br><form id="loginForm"><input id="user" placeholder="User ID" autocomplete="username"><input id="pass" type="password" placeholder="Password" autocomplete="current-password" style="margin-top:8px"><button id="loginBtn" style="width:100%;margin-top:10px" type="submit">Login</button></form><div id="loginMsg" class="mini"></div></div>
 <div id="app" class="wrap hidden">
@@ -678,7 +677,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <div class="card"><h3>Slave</h3><div class="row btnrow"><button onclick="cmd('SLAVE D1 reboot')">Digital Reboot</button><button onclick="cmd('SLAVE PZEM reboot')">PZEM Reboot</button><button class="danger" onclick="cmd('SLAVE PZEM energy_reset')">Energy Reset</button></div></div>
 <div class="card"><h3>System</h3><div class="row two"><button onclick="apiText('/api/sd')">SD Info</button><button onclick="apiText('/api/status?pretty=1')">Status</button></div></div>
 <div class="card"><h3>Password</h3><div class="row"><input id="oldPass" type="password" placeholder="Old password" autocomplete="current-password"><input id="newPass" type="password" placeholder="New password" autocomplete="new-password"><input id="newPass2" type="password" placeholder="Confirm new password" autocomplete="new-password"><button onclick="changePassword()">Change Password</button></div></div>
-<div class="card wide"><h3>MQTT Settings</h3><div class="mqttgrid"><select id="mqttEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select><input id="mqttBroker" placeholder="Broker"><input id="mqttPort" placeholder="Port" inputmode="numeric"><input id="mqttClient" placeholder="Client ID"><input id="mqttUser" placeholder="Username"><input id="mqttPass" placeholder="Password"><input id="mqttTopic" placeholder="Base topic"><input id="mqttKeepalive" placeholder="Keepalive seconds" inputmode="numeric"></div><div class="row btnrow" style="margin-top:8px"><button onclick="loadMqtt()">Load MQTT</button><button onclick="saveMqtt()">Save MQTT</button><button class="danger" onclick="cmd('RESET MQTT').then(loadMqtt)">Reset MQTT</button></div></div>
+<div class="card wide"><h3>MQTT Settings</h3><div class="mqttgrid"><select id="mqttEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select><input id="mqttBroker" placeholder="Broker"><input id="mqttPort" placeholder="Port" inputmode="numeric"><input id="mqttUser" placeholder="Username"><input id="mqttPass" placeholder="Password"><input id="mqttKeepalive" placeholder="Keepalive seconds" inputmode="numeric"></div><div style="margin-top:8px"><div class="label">Client ID</div><div id="mqttClient" class="readonlybox"></div><div class="label" style="margin-top:8px">Base topic</div><div id="mqttTopic" class="readonlybox"></div><div class="label" style="margin-top:8px">Publish topics</div><div id="mqttPublishTopics" class="topiclist"></div><div class="label" style="margin-top:8px">Subscribe topics</div><div id="mqttSubscribeTopics" class="topiclist"></div></div><div class="row btnrow" style="margin-top:8px"><button onclick="loadMqtt()">Load MQTT</button><button onclick="saveMqtt()">Save MQTT</button><button class="danger" onclick="cmd('RESET MQTT').then(loadMqtt)">Reset MQTT</button></div></div>
 <div class="card wide"><h3>Command Output</h3><pre id="out"></pre></div>
 </section></div>
 <script>
@@ -697,7 +696,7 @@ async function doLogin(){if(loginBusy)return;let loginButton=document.getElement
 document.getElementById('loginForm').addEventListener('submit',e=>{e.preventDefault();doLogin()});
 async function logout(){let t=token();sessionStorage.removeItem('sn_token');if(t)navigator.sendBeacon('/api/logout?token='+encodeURIComponent(t));app.classList.add('hidden');loginPanel.classList.remove('hidden')}
 async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store',headers:ah()});if(r.status===401){logout();return null}if(!r.ok){out.textContent='Status error: HTTP '+r.status;return null}let s=await r.json();stamp.textContent=(s.time||'N/A')+' | uptime '+Math.floor((Number(s.uptime)||0)/1000)+'s';
-metrics.innerHTML=cell('Temperature',s.dht_ok?num(s.temp_c,' C',1):'N/A',s.dht_ok?'ok':'bad')+cell('Humidity',s.dht_ok?num(s.humidity,' %',1):'N/A',s.dht_ok?'ok':'bad')+cell('Main board current',num(s.load,' A',2))+cell('Main board energy',num(s.main_energy,' kWh',3))+cell('Digital board current',num(s.acs,' A',2))+cell('Digital board energy',num(s.digital_energy,' kWh',3))+cell('AC current',num(s.ac_current,' A',3))+cell('AC power',num(s.ac_power,' W',1))+cell('AC energy',num(s.ac_energy,' kWh',3))+cell('Voltage',displayVoltage(s),s.voltage_estimated===true?'warn':'ok')+cell('SD',s.sd_ok?'OK':'ERROR',s.sd_ok?'ok':'bad')+cell('SD free',bytes((Number(s.sd_total)||0)-(Number(s.sd_used)||0)))+cell('Digital board',s.d_on?'ONLINE':'OFFLINE',s.d_on?'ok':'bad')+cell('PZEM board',s.p_on?'ONLINE':'OFFLINE',s.p_on?'ok':'bad')+cell('All locked',b(s.m_lock),s.m_lock?'bad':'ok');
+metrics.innerHTML=cell('Temperature',s.dht_ok?num(s.temp_c,' C',1):'N/A',s.dht_ok?'ok':'bad')+cell('Humidity',s.dht_ok?num(s.humidity,' %',1):'N/A',s.dht_ok?'ok':'bad')+cell('Main board current',num(s.load,' A',2))+cell('Main board energy',num(s.main_energy,' kWh',3))+cell('Digital board current',num(s.acs,' A',2))+cell('Digital board energy',num(s.digital_energy,' kWh',3))+cell('AC current',num(s.ac_current,' A',3))+cell('AC power',num(s.ac_power,' W',1))+cell('AC daily energy',num(s.ac_energy,' kWh',3))+cell('PZEM cumulative',num(s.pzem_energy_cumulative,' kWh',3))+cell('Time source',s.time_source||'N/A',s.time_source==='ESTIMATED'?'warn':'ok')+cell('Voltage',displayVoltage(s),s.voltage_estimated===true?'warn':'ok')+cell('SD',s.sd_ok?'OK':'ERROR',s.sd_ok?'ok':'bad')+cell('SD free',bytes((Number(s.sd_total)||0)-(Number(s.sd_used)||0)))+cell('Digital board',s.d_on?'ONLINE':'OFFLINE',s.d_on?'ok':'bad')+cell('PZEM board',s.p_on?'ONLINE':'OFFLINE',s.p_on?'ok':'bad')+cell('All locked',b(s.m_lock),s.m_lock?'bad':'ok');
 let q1=quality(s.rssi),q2=quality(s.d_rssi),q3=quality(s.p_rssi);rssi.innerHTML=cell('Router to SmartNest',num(s.rssi,' dBm')+' '+q1[0],q1[1])+cell('Digital Board RSSI',s.d_on?num(s.d_rssi,' dBm')+' '+q2[0]:'N/A',s.d_on?q2[1]:'bad')+cell('PZEM Board RSSI',s.p_on?num(s.p_rssi,' dBm')+' '+q3[0]:'N/A',s.p_on?q3[1]:'bad');
 let h='';for(let i=0;i<6;i++){let locked=arr(s.locks,i);h+=`<div class="relay"><b>Relay ${i+1}</b><div>State: ${b(arr(s.relays,i))}</div><div>Lock: ${b(locked)}</div><div>Runtime: ${num(arr(s.relay_runtime,i,0),'s')}</div></div>`}let dLocked=s.d_lock;h+=`<div class="relay"><b>Relay 7</b><div>State: ${b(s.d_relay)}</div><div>Lock: ${b(dLocked)}</div><div>Runtime: ${num(arr(s.relay_runtime,6,0),'s')}</div></div>`;relays.innerHTML=h;return s}catch(e){out.textContent='Status unavailable: '+e.message;return null}}
 async function cmd(c){c=(c||'').trim();if(!c)return false;out.textContent='Sending: '+c;try{let d=new URLSearchParams();d.set('cmd',c);let r=await fetch('/api/command',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});if(r.status===401){logout();return false}out.textContent=await r.text();setTimeout(refresh,500);return r.ok}catch(e){out.textContent='Command failed: '+e.message;return false}}
@@ -705,8 +704,9 @@ async function allLocalRelays(on){if(allSeq)return;let s=await refresh();if(!s)r
 async function allRelayLocks(locked){if(allSeq)return;allSeq=true;allOnBtn.disabled=true;allOffBtn.disabled=true;lockAllBtn.disabled=true;unlockAllBtn.disabled=true;try{for(let i=1;i<=7;i++){let ok=await cmd('LOCK '+i+' '+(locked?'ON':'OFF'));if(!ok)break;if(i<7)await sleep(400)}}finally{allSeq=false;allOnBtn.disabled=false;allOffBtn.disabled=false;lockAllBtn.disabled=false;unlockAllBtn.disabled=false;refresh()}}
 async function apiText(url,opt={}){try{opt.headers={...(opt.headers||{}),...ah()};let r=await fetch(url,opt);if(r.status===401){logout();return}out.textContent=await r.text();setTimeout(refresh,500)}catch(e){out.textContent='Request failed: '+e.message}}
 async function changePassword(){let d=new URLSearchParams();d.set('old',oldPass.value);d.set('new',newPass.value);d.set('confirm',newPass2.value);let r=await fetch('/api/password',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});out.textContent=await r.text();oldPass.value='';newPass.value='';newPass2.value='';if(r.ok)setTimeout(logout,800)}
-async function loadMqtt(){try{let r=await fetch('/api/mqtt',{headers:ah(),cache:'no-store'});if(r.status===401){logout();return}if(!r.ok){out.textContent=await r.text();return}let m=await r.json();mqttEnabled.value=m.enabled?'1':'0';mqttBroker.value=m.broker||'';mqttPort.value=m.port||'';mqttClient.value=m.client||'';mqttUser.value=m.user||'';mqttPass.value=m.pass||'';mqttTopic.value=m.topic||'';mqttKeepalive.value=m.keepalive||'';out.textContent='MQTT settings loaded.'}catch(e){out.textContent='MQTT load failed: '+e.message}}
-async function saveMqtt(){try{let d=new URLSearchParams();d.set('enabled',mqttEnabled.value);d.set('broker',mqttBroker.value);d.set('port',mqttPort.value);d.set('client',mqttClient.value);d.set('user',mqttUser.value);d.set('pass',mqttPass.value);d.set('topic',mqttTopic.value);d.set('keepalive',mqttKeepalive.value);let r=await fetch('/api/mqtt',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});if(r.status===401){logout();return}out.textContent=await r.text();setTimeout(refresh,500)}catch(e){out.textContent='MQTT save failed: '+e.message}}
+function topicItems(a){return(Array.isArray(a)?a:[]).map(t=>`<div>${t}</div>`).join('')}
+async function loadMqtt(){try{let r=await fetch('/api/mqtt',{headers:ah(),cache:'no-store'});if(r.status===401){logout();return}if(!r.ok){out.textContent=await r.text();return}let m=await r.json();mqttEnabled.value=m.enabled?'1':'0';mqttBroker.value=m.broker||'';mqttPort.value=m.port||'';mqttClient.textContent=m.client||'';mqttUser.value=m.user||'';mqttPass.value=m.pass||'';mqttTopic.textContent=m.baseTopic||m.topic||'';mqttPublishTopics.innerHTML=topicItems(m.publish_topics);mqttSubscribeTopics.innerHTML=topicItems(m.subscribe_topics);mqttKeepalive.value=m.keepalive||'';out.textContent='MQTT settings loaded.'}catch(e){out.textContent='MQTT load failed: '+e.message}}
+async function saveMqtt(){try{let d=new URLSearchParams();d.set('enabled',mqttEnabled.value);d.set('broker',mqttBroker.value);d.set('port',mqttPort.value);d.set('user',mqttUser.value);d.set('pass',mqttPass.value);d.set('keepalive',mqttKeepalive.value);let r=await fetch('/api/mqtt',{method:'POST',headers:{...ah(),'Content-Type':'application/x-www-form-urlencoded'},body:d});if(r.status===401){logout();return}out.textContent=await r.text();loadMqtt();setTimeout(refresh,500)}catch(e){out.textContent='MQTT save failed: '+e.message}}
 if(token()){loginPanel.classList.add('hidden');app.classList.remove('hidden');refresh();loadMqtt()}setInterval(()=>{if(token())refresh()},5000);
 </script></body></html>
 )rawliteral";
@@ -797,6 +797,7 @@ static String jsonEscape(const String &value) {
 }
 
 static String buildMqttConfigJSON() {
+  String base = String(g_mqttConfig.baseTopic);
   String json = "{";
   json += "\"enabled\":" + String(g_mqttConfig.enabled ? "true" : "false") + ",";
   json += "\"broker\":\"" + jsonEscape(g_mqttConfig.broker) + "\",";
@@ -805,6 +806,20 @@ static String buildMqttConfigJSON() {
   json += "\"user\":\"" + jsonEscape(g_mqttConfig.username) + "\",";
   json += "\"pass\":\"" + jsonEscape(g_mqttConfig.password) + "\",";
   json += "\"topic\":\"" + jsonEscape(g_mqttConfig.baseTopic) + "\",";
+  json += "\"baseTopic\":\"" + jsonEscape(g_mqttConfig.baseTopic) + "\",";
+  json += "\"client_readonly\":true,";
+  json += "\"topic_readonly\":true,";
+  json += "\"publish_topics\":[";
+  json += "\"" + jsonEscape(base + "/live/sensors") + "\",";
+  json += "\"" + jsonEscape(base + "/live/relays") + "\",";
+  json += "\"" + jsonEscape(base + "/live/status") + "\",";
+  json += "\"" + jsonEscape(base + "/history/batch") + "\",";
+  json += "\"" + jsonEscape(base + "/cmd/ack") + "\"";
+  json += "],";
+  json += "\"subscribe_topics\":[";
+  json += "\"" + jsonEscape(base + "/cmd/request") + "\",";
+  json += "\"" + jsonEscape(base + "/history/ack") + "\"";
+  json += "],";
   json += "\"keepalive\":" + String(g_mqttConfig.keepAlive);
   json += "}";
   return json;
@@ -896,6 +911,14 @@ static void setupDashboardRoutes() {
       req->send(200, "text/plain", formatSdInfoText());
       return;
     }
+    if (upper.startsWith("MQTT SET TOPIC ")) {
+      req->send(400, "text/plain", "ERR: MQTT topic is fixed/read-only");
+      return;
+    }
+    if (upper.startsWith("MQTT SET CLIENT ")) {
+      req->send(400, "text/plain", "ERR: MQTT client ID is fixed/read-only");
+      return;
+    }
     handleSerialCommand(cmd);
     req->send(200, "text/plain", "OK: " + cmd);
   });
@@ -922,15 +945,31 @@ static void setupDashboardRoutes() {
     String client = req->hasParam("client", true) ? req->getParam("client", true)->value() : "";
     String user = req->hasParam("user", true) ? req->getParam("user", true)->value() : "";
     String pass = req->hasParam("pass", true) ? req->getParam("pass", true)->value() : "";
-    String topic = req->hasParam("topic", true) ? req->getParam("topic", true)->value() : "";
     int keepalive = req->hasParam("keepalive", true) ? req->getParam("keepalive", true)->value().toInt() : 0;
 
     broker.trim();
     client.trim();
-    topic.trim();
+    if (req->hasParam("client", true) && client != String(g_mqttConfig.clientId)) {
+      req->send(400, "text/plain", "ERR: MQTT client ID is read-only");
+      return;
+    }
+    if (req->hasParam("topic", true)) {
+      String topic = req->getParam("topic", true)->value();
+      topic.trim();
+      if (topic != String(g_mqttConfig.baseTopic)) {
+        req->send(400, "text/plain", "ERR: MQTT topic is read-only");
+        return;
+      }
+    }
+    if (req->hasParam("baseTopic", true)) {
+      String baseTopic = req->getParam("baseTopic", true)->value();
+      baseTopic.trim();
+      if (baseTopic != String(g_mqttConfig.baseTopic)) {
+        req->send(400, "text/plain", "ERR: MQTT topic is read-only");
+        return;
+      }
+    }
     if (broker.length() == 0 || broker.length() >= (int)sizeof(g_mqttConfig.broker) ||
-        client.length() == 0 || client.length() >= (int)sizeof(g_mqttConfig.clientId) ||
-        topic.length() == 0 || topic.length() >= (int)sizeof(g_mqttConfig.baseTopic) ||
         port <= 0 || port > 65535 || keepalive <= 0 || keepalive > 3600 ||
         user.length() >= (int)sizeof(g_mqttConfig.username) ||
         pass.length() >= (int)sizeof(g_mqttConfig.password)) {
@@ -943,14 +982,10 @@ static void setupDashboardRoutes() {
     g_mqttConfig.keepAlive = keepalive;
     strncpy(g_mqttConfig.broker, broker.c_str(), sizeof(g_mqttConfig.broker) - 1);
     g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
-    strncpy(g_mqttConfig.clientId, client.c_str(), sizeof(g_mqttConfig.clientId) - 1);
-    g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
     strncpy(g_mqttConfig.username, user.c_str(), sizeof(g_mqttConfig.username) - 1);
     g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
     strncpy(g_mqttConfig.password, pass.c_str(), sizeof(g_mqttConfig.password) - 1);
     g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
-    strncpy(g_mqttConfig.baseTopic, topic.c_str(), sizeof(g_mqttConfig.baseTopic) - 1);
-    g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
     saveMqttConfig();
     g_mqttConfigChanged = true;
     req->send(200, "text/plain", "MQTT settings saved.");
@@ -1393,12 +1428,13 @@ void publishLiveData() {
     String sensors = "{";
     sensors += "\"voltage\":" + String(sysState.pzemVoltage, 1) + ",";
     sensors += "\"energy_voltage\":" + String(sysState.energyVoltage, 1) + ",";
-    sensors += "\"voltage_estimated\":" + mqttBool(sysState.voltageEstimated) + ",";
     sensors += "\"main_current\":" + String(sysState.currentAmps, 2) + ",";
     sensors += "\"digital_current\":" + String(sysState.acsCurrentA, 2) + ",";
     sensors += "\"ac_current\":" + String(sysState.pzemCurrentA, 3) + ",";
     sensors += "\"ac_power\":" + String(sysState.pzemPowerW, 1) + ",";
     sensors += "\"ac_energy_kwh\":" + String(sysState.acEnergyKWh, 3) + ",";
+    sensors += "\"pzem_cumulative_energy_kwh\":" + String(sysState.pzemRawEnergyKWh, 3) + ",";
+    sensors += "\"ac_day_start_kwh\":" + String(sysState.acDayStartKWh, 3) + ",";
     sensors += "\"main_energy_kwh\":" + String(sysState.mainEnergyKWh, 3) + ",";
     sensors += "\"digital_energy_kwh\":" + String(sysState.digitalEnergyKWh, 3) + ",";
     sensors += "\"temperature_c\":" + String(sysState.temperatureC, 1) + ",";
@@ -1444,6 +1480,8 @@ void publishLiveData() {
     status += "\"pzem_online\":" + mqttBool(sysState.pzemSlaveOnline) + ",";
     status += "\"pzem_health\":" + mqttBool(sysState.pzemSensorHealthy) + ",";
     status += "\"dht_ok\":" + mqttBool(sysState.dhtHealthy) + ",";
+    status += "\"voltage_estimated\":" + mqttBool(sysState.voltageEstimated) + ",";
+    status += "\"time_source\":\"" + jsonEscape(sysState.timeSource) + "\",";
     status += "\"reset_reason\":\"" + jsonEscape(sysState.resetReason) + "\"";
     status += "}";
 
@@ -1627,6 +1665,8 @@ void uartCommTask(void *pvParameters) {
                 sysState.pzemCurrentA = doc["pi"];
                 sysState.pzemPowerW = doc["pp"];
                 sysState.acEnergyKWh = doc["pe"] | 0.0;
+                sysState.pzemRawEnergyKWh = doc["pe_raw"] | sysState.pzemRawEnergyKWh;
+                sysState.acDayStartKWh = doc["pe_start"] | sysState.acDayStartKWh;
                 sysState.mainEnergyKWh = doc["me"] | 0.0;
                 sysState.digitalEnergyKWh = doc["de"] | 0.0;
                 JsonArray runtime = doc["rt"].as<JsonArray>();
@@ -1650,6 +1690,11 @@ void uartCommTask(void *pvParameters) {
                 if (strlen(masterResetReason) > 0) {
                   strncpy(sysState.resetReason, masterResetReason, sizeof(sysState.resetReason) - 1);
                   sysState.resetReason[sizeof(sysState.resetReason) - 1] = '\0';
+                }
+                const char *timeSource = doc["tsrc"] | "";
+                if (strlen(timeSource) > 0) {
+                  strncpy(sysState.timeSource, timeSource, sizeof(sysState.timeSource) - 1);
+                  sysState.timeSource[sizeof(sysState.timeSource) - 1] = '\0';
                 }
                 xSemaphoreGive(stateMutex);
               }
@@ -1841,9 +1886,11 @@ static String buildStatusJSON() {
   bool voltageEstimated = false;
   int rssi = 0, dRssi = 0, pRssi = 0, mqttStatus = 0;
   char ssid[33] = "";
+  char timeSource[12] = "";
   float current = 0.0f, acs = 0.0f, voltage = 0.0f, energyVoltage = 0.0f, acCurrent = 0.0f;
   float acPower = 0.0f, tempC = 0.0f, humidity = 0.0f;
-  double acEnergy = 0.0, mainEnergy = 0.0, digitalEnergy = 0.0;
+  double acEnergy = 0.0, rawPzemEnergy = 0.0, acDayStart = 0.0;
+  double mainEnergy = 0.0, digitalEnergy = 0.0;
   uint32_t runtime[7] = {0};
   uint64_t sdTotal = 0, sdUsed = 0;
 
@@ -1865,6 +1912,8 @@ static String buildStatusJSON() {
     acCurrent = sysState.pzemCurrentA;
     acPower = sysState.pzemPowerW;
     acEnergy = sysState.acEnergyKWh;
+    rawPzemEnergy = sysState.pzemRawEnergyKWh;
+    acDayStart = sysState.acDayStartKWh;
     mainEnergy = sysState.mainEnergyKWh;
     digitalEnergy = sysState.digitalEnergyKWh;
     dOn = sysState.digitalSlaveOnline;
@@ -1886,6 +1935,7 @@ static String buildStatusJSON() {
     humidity = sysState.humidityPct;
     dhtOk = sysState.dhtHealthy;
     mqttStatus = sysState.mqttStatus;
+    strncpy(timeSource, sysState.timeSource, sizeof(timeSource) - 1);
     xSemaphoreGive(stateMutex);
   } else {
     Serial.println("[STATUS] state mutex timeout, using default snapshot");
@@ -1916,6 +1966,8 @@ static String buildStatusJSON() {
   json += "\"ac_current\":" + String(acCurrent, 3) + ",";
   json += "\"ac_power\":" + String(acPower, 1) + ",";
   json += "\"ac_energy\":" + String(acEnergy, 3) + ",";
+  json += "\"pzem_energy_cumulative\":" + String(rawPzemEnergy, 3) + ",";
+  json += "\"ac_day_start_energy\":" + String(acDayStart, 3) + ",";
   json += "\"main_energy\":" + String(mainEnergy, 3) + ",";
   json += "\"digital_energy\":" + String(digitalEnergy, 3) + ",";
   json += "\"relay_runtime\":[";
@@ -1941,6 +1993,7 @@ static String buildStatusJSON() {
   json += "\"humidity\":" + String(humidity, 1) + ",";
   json += "\"dht_ok\":" + String(dhtOk ? "true" : "false") + ",";
   json += "\"mqtt_status\":" + String(mqttStatus) + ",";
+  json += "\"time_source\":\"" + jsonEscape(timeSource) + "\",";
   json += "\"reset_reason\":\"" + jsonEscape(g_resetReason) + "\"";
   json += ",\"uptime\":" + String(millis());
   json += ",\"time\":\"" + getFormattedTime() + "\"}";
@@ -2008,10 +2061,10 @@ static void printHelp() {
   Serial.println("MQTT ENABLE ON|OFF");
   Serial.println("MQTT SET BROKER <host>");
   Serial.println("MQTT SET PORT <port>");
-  Serial.println("MQTT SET CLIENT <clientId>");
+  Serial.println("MQTT SET CLIENT <clientId> (read-only; rejected)");
   Serial.println("MQTT SET USER <username>");
   Serial.println("MQTT SET PASS <password>");
-  Serial.println("MQTT SET TOPIC <baseTopic>");
+  Serial.println("MQTT SET TOPIC <baseTopic> (read-only; rejected)");
   Serial.println("MQTT SET KEEPALIVE <seconds>");
   Serial.println("MQTT RESET");
   Serial.println();
@@ -2139,8 +2192,8 @@ static void handleMqttCommand(const String &cmdRaw, const String &cmdUpper) {
   } else if (cmdUpper.startsWith("MQTT SET PORT ")) {
     g_mqttConfig.port = cmdUpper.substring(14).toInt();
   } else if (cmdUpper.startsWith("MQTT SET CLIENT ")) {
-    strncpy(g_mqttConfig.clientId, cmdRaw.substring(16).c_str(), sizeof(g_mqttConfig.clientId) - 1);
-    g_mqttConfig.clientId[sizeof(g_mqttConfig.clientId) - 1] = '\0';
+    Serial.println("ERR: MQTT client ID is fixed/read-only");
+    return;
   } else if (cmdUpper.startsWith("MQTT SET USER ")) {
     strncpy(g_mqttConfig.username, cmdRaw.substring(14).c_str(), sizeof(g_mqttConfig.username) - 1);
     g_mqttConfig.username[sizeof(g_mqttConfig.username) - 1] = '\0';
@@ -2148,8 +2201,8 @@ static void handleMqttCommand(const String &cmdRaw, const String &cmdUpper) {
     strncpy(g_mqttConfig.password, cmdRaw.substring(14).c_str(), sizeof(g_mqttConfig.password) - 1);
     g_mqttConfig.password[sizeof(g_mqttConfig.password) - 1] = '\0';
   } else if (cmdUpper.startsWith("MQTT SET TOPIC ")) {
-    strncpy(g_mqttConfig.baseTopic, cmdRaw.substring(15).c_str(), sizeof(g_mqttConfig.baseTopic) - 1);
-    g_mqttConfig.baseTopic[sizeof(g_mqttConfig.baseTopic) - 1] = '\0';
+    Serial.println("ERR: MQTT topic is fixed/read-only");
+    return;
   } else if (cmdUpper.startsWith("MQTT SET KEEPALIVE ")) {
     g_mqttConfig.keepAlive = cmdUpper.substring(19).toInt();
   } else {
@@ -2257,6 +2310,7 @@ void setup() {
 
   memset(&sysState, 0, sizeof(SystemState));
   strncpy(sysState.resetReason, g_resetReason.c_str(), sizeof(sysState.resetReason) - 1);
+  strncpy(sysState.timeSource, "NONE", sizeof(sysState.timeSource) - 1);
   loadMqttConfig();
 
   stateMutex = xSemaphoreCreateMutex();

@@ -9,7 +9,7 @@ This document describes the communication interfaces used by the SmartNest syste
 - Digital Board ESP32: relay, manual switch, ACS current sensing.
 - PZEM ESP32: voltage/current/power/energy sensing.
 
-Default MQTT base topic is `smartnest`, but it can be changed from the SmartNest Serial Monitor with `MQTT SET TOPIC <baseTopic>`. In this document, `<base>` means the configured MQTT base topic.
+Default MQTT base topic is `smartnest/SmartNest_001`. The base topic and MQTT client ID are firmware-fixed and read-only; the dashboard and `/api/mqtt` report them but do not allow changing them. `MQTT SET TOPIC <baseTopic>` and `MQTT SET CLIENT <clientId>` are rejected. In this document, `<base>` means the fixed MQTT base topic.
 
 ## Device Roles
 
@@ -19,6 +19,15 @@ Default MQTT base topic is `smartnest`, but it can be changed from the SmartNest
 | Master ESP32 | ESP-NOW coordinator, SD logging, energy calculation, relay 7 telemetry bridge | UART2, ESP-NOW, SD |
 | Digital Board ESP32 | Relay 7, digital manual switch, ACS current sensing, overcurrent lock | ESP-NOW |
 | PZEM ESP32 | PZEM-004T telemetry and energy reset/reboot command handling | ESP-NOW |
+
+Master time-source priority:
+
+1. NTP epoch received from SmartNest over UART.
+2. DS3231 RTC over I2C when NTP is not available.
+3. Soft time from `millis()` after a valid NTP/RTC time was already established.
+4. SD-restored estimated time only as a last resort.
+
+The Master syncs DS3231 whenever valid NTP is received. DS3231 uses the ESP32 default I2C pins: SDA `GPIO 21`, SCL `GPIO 22`.
 
 SmartNest ESP32 local sensors:
 
@@ -257,6 +266,9 @@ Sent every 10 seconds.
   "pi": 0.123,
   "pp": 28.3,
   "pe": 1.235,
+  "pe_raw": 101.235,
+  "pe_start": 100.000,
+  "tsrc": "NTP",
   "d_on": true,
   "p_on": true,
   "p_health": true,
@@ -279,7 +291,10 @@ Sent every 10 seconds.
 | `v` | PZEM voltage; may be `null` if PZEM unhealthy/offline |
 | `pi` | Air-conditioner current from PZEM; may be `null` |
 | `pp` | Air-conditioner power from PZEM; may be `null` |
-| `pe` | Air-conditioner energy from the PZEM energy register in kWh; may be `null` |
+| `pe` | Air-conditioner daily energy in kWh, calculated in software as PZEM cumulative energy minus AC day-start energy; may be `null` |
+| `pe_raw` | Raw PZEM cumulative energy register in kWh for debug/backend use |
+| `pe_start` | PZEM cumulative energy captured as the current day's AC baseline |
+| `tsrc` | Master time source: `NTP`, `RTC`, `SOFT`, `ESTIMATED`, or `NONE` |
 | `d_on` | Digital Board online |
 | `p_on` | PZEM board online |
 | `p_health` | PZEM sensor health |
@@ -384,9 +399,9 @@ Logging rules:
 | `digital_energy_kwh` | Integrated digital board energy |
 | `r1_on_s` to `r7_on_s` | Relay ON runtime counters in seconds |
 | `record_id` | Monotonic SD record id used by MQTT history sync |
-| `ac_current`, `ac_power_w`, `ac_energy_kwh` | PZEM air-conditioner current, power, and energy |
+| `ac_current`, `ac_power_w`, `ac_energy_kwh` | PZEM air-conditioner current, power, and daily AC energy. Daily AC energy is calculated from the raw cumulative PZEM register; the firmware does not reset the PZEM register automatically at day change |
 
-Master updates energy every second and writes SD snapshots every 10 seconds when there is measured current or accumulated energy. PZEM voltage is used as the common voltage reference.
+Master updates energy every second and writes SD snapshots every 10 seconds when there is measured main, digital, or AC usage, or accumulated daily energy. PZEM voltage is used as the common voltage reference. On local day change, Master queues a final previous-day row to SD before clearing daily main/digital energy, relay runtimes, and moving the AC day-start baseline to the latest raw PZEM cumulative value.
 
 ## SmartNest Serial Monitor Commands
 
@@ -419,10 +434,10 @@ Serial baud: `115200`.
 | `MQTT ENABLE OFF` | Disable MQTT |
 | `MQTT SET BROKER <host>` | Set MQTT broker hostname/IP |
 | `MQTT SET PORT <port>` | Set MQTT broker port |
-| `MQTT SET CLIENT <clientId>` | Set MQTT client ID |
+| `MQTT SET CLIENT <clientId>` | Rejected: MQTT client ID is fixed/read-only |
 | `MQTT SET USER <username>` | Set MQTT username |
 | `MQTT SET PASS <password>` | Set MQTT password |
-| `MQTT SET TOPIC <baseTopic>` | Set MQTT base topic |
+| `MQTT SET TOPIC <baseTopic>` | Rejected: MQTT base topic is fixed/read-only |
 | `MQTT SET KEEPALIVE <seconds>` | Set MQTT keepalive |
 | `MQTT RESET` | Reset MQTT config to defaults |
 
@@ -472,6 +487,9 @@ Dashboard login uses a short-lived session token stored in browser `sessionStora
   "ac_current": 0.123,
   "ac_power": 28.3,
   "ac_energy": 1.235,
+  "pzem_energy_cumulative": 101.235,
+  "ac_day_start_energy": 100.000,
+  "time_source": "NTP",
   "main_energy": 0.120,
   "digital_energy": 0.040,
   "relay_runtime": [12, 0, 44, 0, 0, 0, 18],
@@ -518,7 +536,24 @@ Default connection:
 | Username | empty |
 | Password | empty |
 | Keepalive | `60` seconds |
-| Base topic | `smartnest` |
+| Base topic | `smartnest/SmartNest_001` |
+
+Client ID and base topic are read-only firmware identity fields.
+
+Readonly topic map:
+
+Publish:
+
+- `<base>/live/sensors`
+- `<base>/live/relays`
+- `<base>/live/status`
+- `<base>/history/batch`
+- `<base>/cmd/ack`
+
+Subscribe:
+
+- `<base>/cmd/request`
+- `<base>/history/ack`
 
 ### MQTT Topics Published By SmartNest
 
@@ -537,6 +572,47 @@ Older relay/sensor/slave compatibility topics are removed. Use only the JSON liv
 | `<base>/live/status` | JSON | no | Uptime, WiFi, MQTT, SD, slave, and sensor health |
 | `<base>/live/sensors` | JSON | no | Voltage, currents, power, energy, temperature, humidity |
 | `<base>/live/relays` | JSON | no | Relay states, locks, master lock, digital switch, runtimes |
+
+`<base>/live/sensors` payload:
+
+```json
+{
+  "voltage": 230.1,
+  "energy_voltage": 230.1,
+  "main_current": 1.25,
+  "digital_current": 0.52,
+  "ac_current": 1.234,
+  "ac_power": 287.5,
+  "ac_energy_kwh": 18.905,
+  "pzem_cumulative_energy_kwh": 101.235,
+  "ac_day_start_kwh": 100.000,
+  "main_energy_kwh": 0.120,
+  "digital_energy_kwh": 0.040,
+  "temperature_c": 28.4,
+  "humidity_pct": 61.0
+}
+```
+
+`<base>/live/status` payload:
+
+```json
+{
+  "uptime": 123456,
+  "ssid": "WiFiName",
+  "rssi": -55,
+  "mqtt_status": 2,
+  "sd_ok": true,
+  "sd_total": 3965190144,
+  "sd_used": 1048576,
+  "digital_online": true,
+  "pzem_online": true,
+  "pzem_health": true,
+  "dht_ok": true,
+  "voltage_estimated": false,
+  "time_source": "NTP",
+  "reset_reason": "POWERON"
+}
+```
 
 #### Command Topics
 
