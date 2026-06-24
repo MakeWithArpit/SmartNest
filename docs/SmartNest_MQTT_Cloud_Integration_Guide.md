@@ -335,7 +335,6 @@ Reboots a slave board.
 Allowed targets:
 
 - `digital`
-- `d1`
 - `pzem`
 
 Invalid targets return `invalid_target`.
