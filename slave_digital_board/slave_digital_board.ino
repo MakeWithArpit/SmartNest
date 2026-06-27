@@ -440,16 +440,7 @@ void loop() {
         delay(100);
         ESP.restart();
         break;
-      case 0x08:
-        Serial.println("[DigitalBoard] CMD: legacy masterLock ON -> relay_lock");
-        setRelayLock(true);
-        sendCommandAck(cmdType, true, 0);
-        break;
-      case 0x09:
-        Serial.println("[DigitalBoard] CMD: legacy masterLock OFF -> relay_unlock");
-        setRelayLock(false);
-        sendCommandAck(cmdType, true, 0);
-        break;
+
       }
     }
   }

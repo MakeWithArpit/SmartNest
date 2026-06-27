@@ -202,17 +202,7 @@ void handleIncomingPackets() {
       rebootRequested = true;
       rebootTime = millis() + 1000;
       break;
-    case 0x07: // Energy reset
-      Serial.println("[CMD] Resetting energy accumulation register...");
-      if (pzem.resetEnergy()) {
-        Serial.println("[CMD] PZEM Energy reset successfully completed");
-        pzemHealthy = true;
-        sendPzemPacket(0x20);
-      } else {
-        Serial.println("[ERROR] PZEM Energy reset operation failed");
-        pzemHealthy = false;
-      }
-      break;
+
     }
   }
 }
