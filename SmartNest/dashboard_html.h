@@ -1,6 +1,4 @@
 #pragma once
-#include <Arduino.h>
-#include <pgmspace.h>
 
 static const char DASHBOARD_HTML[] PROGMEM = R"=====(
 <!DOCTYPE html>
