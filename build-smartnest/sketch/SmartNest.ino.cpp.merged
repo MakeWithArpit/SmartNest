@@ -1,3 +1,4 @@
+#line 1 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
@@ -2973,3 +2974,4 @@ void loop() {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+

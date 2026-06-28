@@ -273,6 +273,7 @@ To dispatch a command, publish a JSON object to this topic matching the generic 
 - `all_relays_off`: Switch off all relays (1–7).
 - `unlock_all_relays`: Unlock lock constraints for all relays (1–7).
 - `system_reboot`: Trigger an ESP32 hardware restart command sequence.
+- `ac_set`: Control the air conditioner — power, exact temperature, temperature step, or fan speed.
 
 ---
 
@@ -442,6 +443,67 @@ Dispatches a reboot command to restart Master, Digital Board, PZEM Board, and In
 
 ---
 
+### `ac_set`
+Controls the air conditioner via IR — power, exact temperature, temperature step, or fan speed. Exactly one control field must be present per request.
+- **Publish Topic**: `smartnest/SmartNest_001/cmd/request`
+
+#### Example Payload (Power ON)
+```json
+{
+  "cmd_id": "ac-power-001",
+  "command": "ac_set",
+  "power": true
+}
+```
+
+#### Example Payload (Set Exact Temperature)
+```json
+{
+  "cmd_id": "ac-temp-001",
+  "command": "ac_set",
+  "temp": 22
+}
+```
+
+#### Example Payload (Temperature Step)
+```json
+{
+  "cmd_id": "ac-temp-step-001",
+  "command": "ac_set",
+  "temp_step": "up"
+}
+```
+
+#### Example Payload (Fan Speed)
+```json
+{
+  "cmd_id": "ac-fan-001",
+  "command": "ac_set",
+  "fan": "high"
+}
+```
+
+#### Expected Success ACK
+```json
+{
+  "cmd_id": "ac-temp-001",
+  "command": "ac_set",
+  "ok": true,
+  "message": "ac temperature set to 22",
+  "timestamp": 1780000000
+}
+```
+
+#### Validation Rules
+- Exactly one of `power`, `temp`, `temp_step`, `fan` must be present per request. A request with none or more than one of these fields fails validation.
+- `power` must be boolean (`true` or `false`).
+- `temp` must be an integer within range `16` to `30`.
+- `temp_step` must be a string, either `"up"` or `"down"`.
+- `fan` must be a string, one of `auto`, `min`, `low`, `med`, `high`, `max`.
+- Operating mode is fixed internally and cannot be changed through this interface.
+
+---
+
 ## 11. Invalid MQTT Command Examples
 
 ### Example 1: Missing `command` Field
@@ -498,6 +560,28 @@ If the published request payload is malformed or invalid JSON:
   "ok": false,
   "message": "invalid JSON payload",
   "timestamp": 0
+}
+```
+
+### Example 4: AC Command With No Control Field
+`ac_set` requires exactly one of `power`, `temp`, `temp_step`, or `fan`. Sending none (or more than one) fails validation.
+
+#### Request
+```json
+{
+  "cmd_id": "ac-empty-001",
+  "command": "ac_set"
+}
+```
+
+#### Expected ACK Response
+```json
+{
+  "cmd_id": "ac-empty-001",
+  "command": "ac_set",
+  "ok": false,
+  "message": "exactly one of power, temp, temp_step, fan must be provided",
+  "timestamp": 1780000000
 }
 ```
 

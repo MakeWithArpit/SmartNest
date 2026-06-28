@@ -13,6 +13,9 @@
 #include <freertos/semphr.h>
 #include <math.h>
 #include <ctype.h>
+#include <IRremoteESP8266.h>
+#include <IRac.h>
+#include <IRutils.h>
 
 // Configuration & Constants
 const uint8_t MASTER_MAC[] = {0x88, 0x57, 0x21, 0xB1, 0xD3, 0x74};
@@ -20,6 +23,7 @@ const uint8_t SLAVE1_MAC[] = {0x14, 0x08, 0x08, 0xA4, 0x94, 0x1C}; // Digital Sl
 const uint8_t SLAVE2_MAC[] = {0x78, 0x21, 0x84, 0x9C, 0x98, 0x4C}; // PZEM Slave
 
 const int SWITCH_PINS[6] = {33, 32, 26, 27, 14, 13};
+const uint16_t IR_LED_PIN = 25;
 
 // SD SPI Pins
 #define SD_CS   5
@@ -146,6 +150,7 @@ struct SystemData {
 
 SemaphoreHandle_t g_stateMutex = NULL;
 SystemData        g_systemState;
+IRac              ac(IR_LED_PIN);
 
 // Queue definitions
 struct EspNowPacket {
@@ -1215,6 +1220,24 @@ void espNowTask(void* pvParameters) {
     }
 }
 
+const char* acFanSpeedToString(stdAc::fanspeed_t fanSpeed) {
+    switch (fanSpeed) {
+        case stdAc::fanspeed_t::kMin:
+            return "min";
+        case stdAc::fanspeed_t::kLow:
+            return "low";
+        case stdAc::fanspeed_t::kMedium:
+            return "med";
+        case stdAc::fanspeed_t::kHigh:
+            return "high";
+        case stdAc::fanspeed_t::kMax:
+            return "max";
+        case stdAc::fanspeed_t::kAuto:
+        default:
+            return "auto";
+    }
+}
+
 void uartTask(void* pvParameters) {
     char rxLine[256];
     int rxIndex = 0;
@@ -1238,6 +1261,7 @@ void uartTask(void* pvParameters) {
                 
                 // Parse commands
                 char* pCmd = strstr(rxLine, "\"t\":\"cmd\"");
+                char* pAcCmd = strstr(rxLine, "\"t\":\"ac_cmd\"");
                 char* pNtp = strstr(rxLine, "\"t\":\"ntp\"");
                 char* pAcs = strstr(rxLine, "\"t\":\"acs\"");
                 char* pRel = strstr(rxLine, "\"t\":\"rel\"");
@@ -1285,6 +1309,99 @@ void uartTask(void* pvParameters) {
                             Serial.printf("[Master] CMD -> tgt=%s cmd=%s type=0x%02X\n", tgt, cmd, typeVal);
                         }
                     }
+                }
+                else if (pAcCmd) {
+                    char cmd[24] = {0};
+                    char val[16] = {0};
+                    bool ok = false;
+                    const char* msg = "invalid command";
+                    char* cPtr = strstr(rxLine, "\"cmd\":\"");
+                    char* valStrPtr = strstr(rxLine, "\"val\":\"");
+                    if (cPtr) {
+                        sscanf(cPtr + 7, "%[^\"]", cmd);
+                    }
+                    if (valStrPtr) {
+                        sscanf(valStrPtr + 7, "%[^\"]", val);
+                    }
+
+                    if (strcmp(cmd, "power") == 0) {
+                        if (strcmp(val, "on") == 0 || strcmp(val, "off") == 0) {
+                            ac.next.power = (strcmp(val, "on") == 0);
+                            ok = true;
+                        } else {
+                            msg = "power must be on/off";
+                        }
+                    }
+                    else if (strcmp(cmd, "temp") == 0) {
+                        char* valPtr = strstr(rxLine, "\"val\":");
+                        if (valPtr) {
+                            char* endPtr = NULL;
+                            long degrees = strtol(valPtr + 6, &endPtr, 10);
+                            if (endPtr != valPtr + 6 && degrees >= 16 && degrees <= 30) {
+                                ac.next.degrees = degrees;
+                                ok = true;
+                            } else {
+                                msg = "temp must be 16-30";
+                            }
+                        } else {
+                            msg = "missing temp";
+                        }
+                    }
+                    else if (strcmp(cmd, "temp_step") == 0) {
+                        if (strcmp(val, "up") == 0) {
+                            ac.next.degrees++;
+                            if (ac.next.degrees > 30) ac.next.degrees = 30;
+                            ok = true;
+                        } else if (strcmp(val, "down") == 0) {
+                            ac.next.degrees--;
+                            if (ac.next.degrees < 16) ac.next.degrees = 16;
+                            ok = true;
+                        } else {
+                            msg = "temp_step up/down";
+                        }
+                    }
+                    else if (strcmp(cmd, "fan") == 0) {
+                        if (strcmp(val, "auto") == 0) {
+                            ac.next.fanspeed = stdAc::fanspeed_t::kAuto;
+                            ok = true;
+                        } else if (strcmp(val, "min") == 0) {
+                            ac.next.fanspeed = stdAc::fanspeed_t::kMin;
+                            ok = true;
+                        } else if (strcmp(val, "low") == 0) {
+                            ac.next.fanspeed = stdAc::fanspeed_t::kLow;
+                            ok = true;
+                        } else if (strcmp(val, "med") == 0) {
+                            ac.next.fanspeed = stdAc::fanspeed_t::kMedium;
+                            ok = true;
+                        } else if (strcmp(val, "high") == 0) {
+                            ac.next.fanspeed = stdAc::fanspeed_t::kHigh;
+                            ok = true;
+                        } else if (strcmp(val, "max") == 0) {
+                            ac.next.fanspeed = stdAc::fanspeed_t::kMax;
+                            ok = true;
+                        } else {
+                            msg = "invalid fan";
+                        }
+                    }
+
+                    char ackBuf[160];
+                    if (ok) {
+                        ac.sendAc();
+                        snprintf(ackBuf, sizeof(ackBuf),
+                                 "{\"t\":\"ac_ack\",\"ok\":true,\"cmd\":\"%s\",\"power\":%s,\"degrees\":%d,\"fan\":\"%s\"}",
+                                 cmd, ac.next.power ? "true" : "false", (int)ac.next.degrees,
+                                 acFanSpeedToString(ac.next.fanspeed));
+                        Serial.printf("[AC] cmd=%s sent power=%s temp=%d fan=%s\n",
+                                      cmd, ac.next.power ? "ON" : "OFF", (int)ac.next.degrees,
+                                      acFanSpeedToString(ac.next.fanspeed));
+                    } else {
+                        const char* ackCmd = cmd[0] ? cmd : "unknown";
+                        snprintf(ackBuf, sizeof(ackBuf),
+                                 "{\"t\":\"ac_ack\",\"ok\":false,\"cmd\":\"%s\",\"msg\":\"%s\"}",
+                                 ackCmd, msg);
+                        Serial.printf("[AC] rejected cmd=%s reason=%s\n", ackCmd, msg);
+                    }
+                    enqueueUartTx(ackBuf);
                 }
                 else if (pNtp) {
                     char* epochPtr = strstr(rxLine, "\"epoch\":");
@@ -2290,6 +2407,25 @@ void setup() {
     if (esp_now_add_peer(&peer2) != ESP_OK) {
         Serial.println("[ERROR] Failed to add PZEM Board peer");
     }
+
+    ac.next.protocol = decode_type_t::LG2;
+    ac.next.model    = 2;              // AKB75215403
+    ac.next.power    = false;
+    ac.next.mode     = stdAc::opmode_t::kCool;
+    ac.next.celsius  = true;
+    ac.next.degrees  = 24;
+    ac.next.fanspeed = stdAc::fanspeed_t::kAuto;
+    ac.next.swingv   = stdAc::swingv_t::kOff;
+    ac.next.swingh   = stdAc::swingh_t::kOff;
+    ac.next.light    = true;
+    ac.next.beep     = false;
+    ac.next.clean    = false;
+    ac.next.quiet    = false;
+    ac.next.turbo    = false;
+    ac.next.econo    = false;
+    ac.next.filter   = false;
+    ac.next.sleep    = -1;
+    ac.next.clock    = -1;
     
     // Launch FreeRTOS Tasks
     // Core 0
@@ -2308,4 +2444,3 @@ void setup() {
 void loop() {
     vTaskDelay(portMAX_DELAY);
 }
-

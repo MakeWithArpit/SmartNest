@@ -1,3 +1,4 @@
+#line 1 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
@@ -114,6 +115,77 @@ static uint32_t g_lastSlaveStatusRxMs = 0;
 static uint32_t g_lastDigitalAgeSec = 0;
 static uint32_t g_lastPzemAgeSec = 0;
 
+#line 117 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void saveMqttConfig();
+#line 130 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void loadMqttConfig();
+#line 163 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void resetMqttConfigToDefault();
+#line 301 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void enqueueUartCmd(const String &cmd);
+#line 420 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void clearLocalControlState();
+#line 461 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static uint8_t currentRelayMaskSnapshot();
+#line 473 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void sendRelayMaskIfChanged(bool force);
+#line 684 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static String scanNetworks();
+#line 699 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static String formatSdInfoText();
+#line 734 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void wifiConnectAttemptTask(void *pvParams);
+#line 762 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void setupProvisioningRoutes();
+#line 956 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static String mqttBool(bool value);
+#line 958 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void publishAck(const String &cmdId, const String &command, bool ok, const String &message);
+#line 977 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static bool getLocalRelaySnapshot(int relay, bool &stateVal, bool &lockedVal);
+#line 988 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void startSystemRebootTask(void *pvParameters);
+#line 1222 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void mqttCallback(char *topic, byte *payload, unsigned int length);
+#line 1938 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+String getFormattedTime();
+#line 2074 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static bool parseBoolValue(const String &value, bool &out);
+#line 2086 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void printSdInfo();
+#line 2119 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void printHelp();
+#line 2148 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void resetWifiAndRestart();
+#line 2158 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void handleRelayCommand(int relayIdx, const String &action);
+#line 2188 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void handleLockCommand(int relayIdx, const String &value);
+#line 2212 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static bool isValidAcFanValue(const String &fan);
+#line 2217 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static bool parseAcTempValue(const String &value, int &temp);
+#line 2230 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void printMqttConfig();
+#line 2240 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void handleMqttCommand(const String &cmdRaw, const String &cmdUpper);
+#line 2410 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void loadDashCredentials(String& user, String& pass);
+#line 2418 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void saveDashCredentials(const String& user, const String& pass);
+#line 2426 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static String generateToken();
+#line 2433 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static bool isAuthenticated(AsyncWebServerRequest* request);
+#line 2454 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void checkHttpPendingTimeouts();
+#line 2477 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+static void dashboardInit();
+#line 2911 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void setup();
+#line 2965 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
+void loop();
+#line 117 "C:\\Users\\PC\\Desktop\\Arpit\\Arpit\\SmartNest\\SmartNest\\SmartNest.ino"
 void saveMqttConfig() {
   Preferences prefs;
   prefs.begin("mqtt_cfg", false);
@@ -2973,3 +3045,4 @@ void loop() {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
+
