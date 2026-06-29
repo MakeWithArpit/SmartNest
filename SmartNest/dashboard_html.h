@@ -425,7 +425,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
 
         <div class="grid grid-4">
           <div class="card metric"><div class="lbl">Voltage</div><div class="val"><span id="mVolt">--</span><span class="unit">V</span></div></div>
-          <div class="card metric"><div class="lbl">Main Current</div><div class="val"><span id="mCurr">--</span><span class="unit">A</span></div></div>
+          <div class="card metric"><div class="lbl">Main Board Current</div><div class="val"><span id="mCurr">--</span><span class="unit">A</span></div></div>
           <div class="card metric"><div class="lbl">Temperature</div><div class="val"><span id="mTemp">--</span><span class="unit">C</span></div></div>
           <div class="card metric"><div class="lbl">Humidity</div><div class="val"><span id="mHum">--</span><span class="unit">%</span></div></div>
         </div>
@@ -438,7 +438,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
             <span class="badge b-off" id="dbStatus">OFFLINE</span>
           </div>
           <div class="card slave-card">
-            <div><div class="name">PZEM Sensor</div><div class="info" id="pzInfo">Health: --</div></div>
+            <div><div class="name">AC Board</div><div class="info" id="pzInfo">Health: --</div></div>
             <span class="badge b-off" id="pzStatus">OFFLINE</span>
           </div>
         </div>
@@ -521,13 +521,14 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
         <div class="sub">Live energy consumption and environmental data</div>
         <h3 style="font-size:14px;font-weight:700;margin-bottom:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px">Energy</h3>
         <div class="grid grid-3">
-          <div class="card metric"><div class="lbl">Main Energy</div><div class="val"><span id="eMain">--</span><span class="unit">kWh</span></div></div>
-          <div class="card metric"><div class="lbl">AC Energy Today</div><div class="val"><span id="eAcToday">--</span><span class="unit">kWh</span></div></div>
-          <div class="card metric"><div class="lbl">Digital Energy</div><div class="val"><span id="eDigital">--</span><span class="unit">kWh</span></div></div>
-          <div class="card metric"><div class="lbl">AC Cumulative Energy</div><div class="val"><span id="eAcCum">--</span><span class="unit">kWh</span></div></div>
-          <div class="card metric"><div class="lbl">AC Power</div><div class="val"><span id="eAcPower">--</span><span class="unit">W</span></div></div>
+          <div class="card metric"><div class="lbl">Main Board Current</div><div class="val"><span id="eMainCurr">--</span><span class="unit">A</span></div></div>
+          <div class="card metric"><div class="lbl">Main Board Energy</div><div class="val"><span id="eMain">--</span><span class="unit">kWh</span></div></div>
+          <div class="card metric"><div class="lbl">Digital Board Current</div><div class="val"><span id="eDigitalCurr">--</span><span class="unit">A</span></div></div>
+          <div class="card metric"><div class="lbl">Digital Board Energy</div><div class="val"><span id="eDigital">--</span><span class="unit">kWh</span></div></div>
           <div class="card metric"><div class="lbl">AC Current</div><div class="val"><span id="eAcCurr">--</span><span class="unit">A</span></div></div>
-          <div class="card metric"><div class="lbl">Energy Voltage</div><div class="val"><span id="eVolt">--</span><span class="unit">V</span></div></div>
+          <div class="card metric"><div class="lbl">AC Power</div><div class="val"><span id="eAcPower">--</span><span class="unit">W</span></div></div>
+          <div class="card metric"><div class="lbl">AC Energy Today</div><div class="val"><span id="eAcToday">--</span><span class="unit">kWh</span></div></div>
+          <div class="card metric"><div class="lbl">AC Cumulative Energy</div><div class="val"><span id="eAcCum">--</span><span class="unit">kWh</span></div></div>
         </div>
         <div style="height:20px"></div>
         <h3 style="font-size:14px;font-weight:700;margin-bottom:10px;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px">Sensors</h3>
@@ -537,7 +538,6 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
             <div class="val"><span id="sTemp">--</span><span class="unit">C</span></div>
           </div>
           <div class="card metric"><div class="lbl">Humidity</div><div class="val"><span id="sHum">--</span><span class="unit">%</span></div></div>
-          <div class="card metric"><div class="lbl">ACS Current</div><div class="val"><span id="sAcs">--</span><span class="unit">A</span></div><div class="note" style="margin-top:6px">Main Load Current</div></div>
         </div>
       </section>
 
@@ -545,7 +545,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
       <section class="section" id="sec-sd">
         <h2>SD Card</h2>
         <div class="sub">Storage status and energy log management</div>
-        <div class="card" style="max-width:640px">
+        <div class="card" style="max-width:640px;margin:0 auto">
           <div class="sd-row"><span class="lbl">SD Status</span><span class="val" id="sdStat">--</span></div>
           <div class="sd-row"><span class="lbl">Total Storage</span><span class="val"><span id="sdTotal">--</span> MB</span></div>
           <div class="sd-row"><span class="lbl">Used Storage</span><span class="val"><span id="sdUsed">--</span> MB</span></div>
@@ -555,22 +555,13 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
             <div class="bar-pct" id="sdPct">0%</div>
           </div>
         </div>
-        <div style="height:18px"></div>
-        <div class="action-bar">
-          <button class="btn btn-navy" id="sdLastBtn">Get Last Record</button>
-          <button class="btn btn-danger" id="sdClearBtn">Clear Energy Logs</button>
-        </div>
-        <div class="mono-box" id="sdLastOut" style="display:none"></div>
       </section>
 
       <!-- ===== MQTT ===== -->
       <section class="section" id="sec-mqtt">
         <h2>MQTT Settings</h2>
         <div class="sub">Configure MQTT broker connection</div>
-        <div style="margin-bottom:14px;font-size:13px">
-          <strong>Status:</strong> <span id="mqttStatusTxt">--</span>
-        </div>
-        <div class="card" style="max-width:640px">
+        <div class="card" style="max-width:640px; margin: 0 auto;">
           <div class="form-row tg">
             <label>MQTT Enabled</label>
             <label class="toggle"><input type="checkbox" id="mqttEnabled"/><span class="track"></span></label>
@@ -587,8 +578,6 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
           <div class="form-row"><label>Keepalive (seconds)</label><input type="number" id="mqttKeep" placeholder="60"/></div>
           <button class="btn btn-primary btn-full" id="mqttSave">Save Settings</button>
           <div style="height:10px"></div>
-          <button class="btn btn-navy btn-full" id="mqttShowBtn">View Current Config</button>
-          <div class="mono-box" id="mqttShowOut" style="display:none"></div>
         </div>
       </section>
 
@@ -596,7 +585,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
       <section class="section" id="sec-system">
         <h2>System</h2>
         <div class="sub">Device information and maintenance</div>
-        <div class="card" style="max-width:640px">
+        <div class="card" style="max-width:640px;margin:0 auto">
           <div class="sd-row"><span class="lbl">Uptime</span><span class="val" id="sysUptime">--</span></div>
           <div class="sd-row"><span class="lbl">WiFi SSID</span><span class="val" id="sysSsid">--</span></div>
           <div class="sd-row"><span class="lbl">WiFi Signal</span><span class="val" id="sysRssi">--</span></div>
@@ -606,7 +595,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"=====(
           <div class="sd-row"><span class="lbl">MQTT Status</span><span class="val" id="sysMqtt">--</span></div>
         </div>
         <div style="height:18px"></div>
-        <div class="action-bar">
+        <div class="action-bar" style="max-width:640px;margin:0 auto">
           <button class="btn btn-navy" id="sysRefresh">Refresh Status</button>
           <div class="spacer"></div>
           <button class="btn btn-danger" id="sysReboot">Reboot System</button>
@@ -929,24 +918,24 @@ function renderStatus(d){
   // Dashboard metrics
   $("#mVolt").textContent = num(d.voltage,1);
   $("#mCurr").textContent = num(d.current,2);
-  $("#mTemp").textContent = num(d.temperature,1);
+  $("#mTemp").textContent = num(d.temp_c,1);
   $("#mHum").textContent  = num(d.humidity,1);
 
   // Slaves
-  const dbOn = !!d.digital_online;
+  const dbOn = !!d.d_on;
   $("#dbStatus").textContent = dbOn?"ONLINE":"OFFLINE";
   $("#dbStatus").className = "badge "+(dbOn?"b-ok":"b-off");
-  $("#dbInfo").textContent = "RSSI: "+(d.digital_rssi!==undefined?d.digital_rssi+" dBm":"-- dBm");
+  $("#dbInfo").textContent = "RSSI: "+(d.d_rssi!==undefined?d.d_rssi+" dBm":"-- dBm");
 
-  const pzOn = !!d.pzem_online;
+  const pzOn = !!d.p_on;
   $("#pzStatus").textContent = pzOn?"ONLINE":"OFFLINE";
   $("#pzStatus").className = "badge "+(pzOn?"b-ok":"b-off");
-  $("#pzInfo").textContent = "Health: "+(d.pzem_ok?"OK":"FAIL");
+  $("#pzInfo").textContent = "RSSI: "+(d.p_rssi !== undefined ? d.p_rssi+" dBm" : "-- dBm");
 
   // Relays + pills + locks
   const relays = d.relays || [];
   const locks = d.locks || [];
-  const runtimes = d.runtimes || [];
+  const runtimes = d.relay_runtime || [];
   for(let i=0;i<7;i++){
     const on = !!relays[i], lk = !!locks[i], rt = runtimes[i]||0;
     // Pills
@@ -964,38 +953,41 @@ function renderStatus(d){
   }
 
   // Energy
-  $("#eMain").textContent = num(d.energy_main,3);
-  $("#eAcToday").textContent = num(d.ac_energy_today,3);
-  $("#eDigital").textContent = num(d.energy_digital,3);
-  $("#eAcCum").textContent = num(d.ac_energy_cum,3);
+  $("#eMain").textContent = num(d.main_energy,3);
+  $("#eAcToday").textContent = num(d.ac_energy,3);
+  $("#eDigital").textContent = num(d.digital_energy,3);
+  $("#eAcCum").textContent = num(d.pzem_energy_cumulative,3);
   $("#eAcPower").textContent = num(d.ac_power,0);
   $("#eAcCurr").textContent = num(d.ac_current,2);
-  $("#eVolt").textContent = num(d.voltage,1);
-  $("#sTemp").textContent = num(d.temperature,1);
+  $("#eMainCurr").textContent = num(d.current, 2);
+  $("#eDigitalCurr").textContent = num(d.acs, 2);
+  $("#sTemp").textContent = num(d.temp_c,1);
   $("#sHum").textContent = num(d.humidity,1);
-  $("#sAcs").textContent = num(d.acs_current,2);
   const dhtOk = d.dht_ok !== false;
   const db = $("#dhtBadge"); db.textContent = dhtOk?"OK":"ERROR"; db.className = "badge "+(dhtOk?"b-ok":"b-err");
 
   // SD
-  if(d.sd){
-    $("#sdStat").textContent = d.sd.ok?"OK":"ERROR";
-    $("#sdStat").style.color = d.sd.ok?"var(--success)":"var(--danger)";
-    $("#sdTotal").textContent = num(d.sd.total_mb,0);
-    $("#sdUsed").textContent  = num(d.sd.used_mb,0);
-    $("#sdFree").textContent  = num(d.sd.free_mb,0);
-    const pct = d.sd.total_mb>0 ? Math.min(100, Math.round(d.sd.used_mb/d.sd.total_mb*100)) : 0;
-    $("#sdBar").style.width = pct+"%";
-    $("#sdPct").textContent = pct+"%";
-  }
+  const sdTotalMB = (d.sd_total || 0) / 1048576;
+  const sdUsedMB = (d.sd_used || 0) / 1048576;
+  const sdFreeMB = sdTotalMB - sdUsedMB;
+  $("#sdStat").textContent = d.sd_ok?"OK":"ERROR";
+  $("#sdStat").style.color = d.sd_ok?"var(--success)":"var(--danger)";
+  $("#sdTotal").textContent = num(sdTotalMB,0);
+  $("#sdUsed").textContent  = num(sdUsedMB,0);
+  $("#sdFree").textContent  = num(sdFreeMB,0);
+  const rawPct = sdTotalMB > 0 ? sdUsedMB/sdTotalMB*100 : 0;
+  const pct = Math.min(100, Math.round(rawPct));
+  const show = rawPct > 0 && pct === 0 ? "<1" : String(pct);
+  $("#sdBar").style.width = (rawPct > 0 && pct === 0 ? 1 : pct)+"%";
+  $("#sdPct").textContent = show+"%";
 
   // AC
   if(d.ac){
-    const acOn = !!d.ac.power;
+    const acOn = !!(d.ac && d.ac.power);
     const acT = $("#acPower"); if(acT && document.activeElement!==acT) acT.checked = acOn;
     $("#acPwrTxt").textContent = acOn?"ON":"OFF";
     $("#acPwrTxt").className = "relay-state "+(acOn?"on":"off");
-    $("#acTempVal").textContent = d.ac.temp!==undefined?d.ac.temp:"--";
+    $("#acTempVal").textContent = d.ac && d.ac.temp!==undefined?d.ac.temp:"--";
     $$("#fanSeg button").forEach(b=>{
       b.classList.toggle("active", b.dataset.val===(d.ac.fan||"").toLowerCase());
     });
@@ -1005,20 +997,19 @@ function renderStatus(d){
   const mst = d.mqtt_status;
   const mTxt = mst===2?"Connected":mst===1?"Connecting":mst===3?"Failed":"Disabled";
   const mColor = mst===2?"var(--success)":mst===3?"var(--danger)":"var(--muted)";
-  const mEl = $("#mqttStatusTxt"); mEl.textContent = mTxt; mEl.style.color = mColor; mEl.style.fontWeight="700";
   $("#sysMqtt").textContent = `${mst}  (${mTxt})`;
 
   // System
   $("#sysUptime").textContent = fmtUptime(d.uptime_ms||d.uptime||0);
-  $("#sysSsid").textContent = d.wifi_ssid||"--";
-  const rssi = d.wifi_rssi;
+  $("#sysSsid").textContent = d.ssid||"--";
+  const rssi = d.rssi;
   let sigDesc = "--";
   if(rssi!==undefined){
     if(rssi > -60) sigDesc = "Excellent";
     else if(rssi >= -70) sigDesc = "Good";
     else sigDesc = "Weak";
     $("#sysRssi").textContent = `${rssi} dBm (${sigDesc})`;
-    $("#sbWifi").textContent = `WiFi: ${d.wifi_ssid||"--"}  |  ${rssi} dBm`;
+    $("#sbWifi").textContent = `WiFi: ${d.ssid||"--"}  |  ${rssi} dBm`;
   }
   $("#sysTime").textContent = d.time||"--";
   $("#sysTimeSrc").textContent = d.time_source||"--";
@@ -1112,29 +1103,6 @@ $$("#fanSeg button").forEach(b=>{
   });
 });
 
-// =================== SD ===================
-$("#sdLastBtn").addEventListener("click", async e=>{
-  await withLoading(e.target, async ()=>{
-    try{
-      const r = await api("/api/sd-last-record");
-      if(r && r.ok){
-        const out = $("#sdLastOut");
-        out.style.display="block";
-        out.textContent = `Record ID: ${r.record_id}\nDate:      ${r.date}`;
-      }else toast((r&&r.message)||"No record found","error");
-    }catch(_){ toast("Connection error","error"); }
-  });
-});
-$("#sdClearBtn").addEventListener("click", async ()=>{
-  const ok = await confirmDialog("This will permanently delete all stored energy logs from the SD card. Type CONFIRM to proceed.","CONFIRM");
-  if(!ok) return;
-  try{
-    const r = await api("/api/clear-logs",{method:"POST",body:JSON.stringify({confirm:"CONFIRM"})});
-    if(r&&r.ok) toast("Energy logs cleared","success");
-    else toast((r&&r.message)||"Clear failed","error");
-  }catch(_){ toast("Connection error","error"); }
-});
-
 // =================== MQTT ===================
 async function loadMqtt(){
   try{
@@ -1162,24 +1130,6 @@ $("#mqttSave").addEventListener("click", async e=>{
       const r = await api("/api/mqtt",{method:"POST",body:JSON.stringify(body)});
       if(r&&r.ok) toast("MQTT settings saved","success");
       else toast((r&&r.message)||"Save failed","error");
-    }catch(_){ toast("Connection error","error"); }
-  });
-});
-$("#mqttShowBtn").addEventListener("click", async e=>{
-  await withLoading(e.target, async ()=>{
-    try{
-      const r = await api("/api/mqtt-show");
-      const out = $("#mqttShowOut");
-      if(r){
-        out.style.display="block";
-        out.textContent =
-`Enabled:   ${r.enabled}
-Broker:    ${r.broker||"--"}
-Port:      ${r.port||"--"}
-Username:  ${r.username||"--"}
-Topic:     ${r.topic||"--"}
-Keepalive: ${r.keepalive||"--"} s`;
-      }
     }catch(_){ toast("Connection error","error"); }
   });
 });

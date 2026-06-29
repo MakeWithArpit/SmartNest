@@ -58,7 +58,7 @@ static float acs712ZeroMv = 2500.0f;
 #define MQTT_HISTORY_BATCH_LIMIT 6
 #define MQTT_HISTORY_RETRY_MS 15000
 #define MQTT_HISTORY_MAX_PAYLOAD_BYTES 2800
-#define RESTORE_RELAYS_ON_BOOT false
+#define RESTORE_RELAYS_ON_BOOT true
 
 // Set to 1 to enable verbose debug output on Serial Monitor
 #define DEBUG_VERBOSE 0
@@ -221,6 +221,9 @@ struct SystemState {
   bool sdOk;
   uint64_t sdTotal;
   uint64_t sdUsed;
+  bool acPower;
+  int acTempC;
+  char acFan[8];
 
   bool pzemSensorHealthy;
   bool voltageEstimated;
@@ -428,20 +431,21 @@ void setRelayState(int index, bool state) {
   if (index < 0 || index >= NUM_RELAYS)
     return;
 
+  bool doUpdate = false;
   if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     if (state && sysState.lockedStates[index]) {
-      Serial.printf("[LOCK] setRelayState(%d, ON) blocked due to relay lock\n",index);
+      Serial.printf("[LOCK] Relay %d blocked\n", index + 1);
     } else {
       sysState.requestedRelayStates[index] = state;
-      xSemaphoreGive(stateMutex);
-      saveLocalControlState();
-      updateRelayHardware();
-      return;
+      doUpdate = true;
     }
     xSemaphoreGive(stateMutex);
   }
 
-  updateRelayHardware();
+  if (doUpdate) {
+    saveLocalControlState();
+    updateRelayHardware();
+  }
 }
 
 static void setLocalRelayLock(int index, bool locked) {
@@ -908,6 +912,8 @@ void wifiReconnectTask(void *pvParameters) {
       sysState.wifiConnected = connected;
       if (connected) {
         sysState.wifiRSSI = WiFi.RSSI();
+        strncpy(sysState.wifiSSID, WiFi.SSID().c_str(),
+                sizeof(sysState.wifiSSID) - 1);
       }
       xSemaphoreGive(stateMutex);
     }
@@ -928,6 +934,8 @@ void wifiReconnectTask(void *pvParameters) {
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           sysState.wifiConnected = true;
           sysState.wifiRSSI = WiFi.RSSI();
+          strncpy(sysState.wifiSSID, WiFi.SSID().c_str(),
+                  sizeof(sysState.wifiSSID) - 1);
           xSemaphoreGive(stateMutex);
         }
         Serial.printf("[WIFI] Reconnected! IP: %s\n", WiFi.localIP().toString().c_str());
@@ -1192,6 +1200,7 @@ static void handleCloudCommand(const String &payload, const String &legacyType,
     g_pendingD1CmdType = command;
     g_pendingD1CmdMs = millis();
     enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
+    enqueueUartCmd("{\"t\":\"ac_cmd\",\"cmd\":\"power\",\"val\":\"off\"}");
     publishLiveData();
   }
   else if (command == "unlock_all_relays") {
@@ -1624,6 +1633,19 @@ void uartCommTask(void *pvParameters) {
             } else if (type == "ac_ack") {
               bool ok = doc["ok"] | false;
               const char *cmd = doc["cmd"] | "";
+              if (ok && xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                if (strcmp(cmd, "power") == 0) {
+                  sysState.acPower = doc["power"] | false;
+                } else if (strcmp(cmd, "temp") == 0) {
+                  sysState.acTempC = doc["degrees"] | sysState.acTempC;
+                } else if (strcmp(cmd, "temp_step") == 0) {
+                  sysState.acTempC = doc["degrees"] | sysState.acTempC;
+                } else if (strcmp(cmd, "fan") == 0) {
+                  strncpy(sysState.acFan, doc["fan"] | "", 7);
+                  sysState.acFan[7] = '\0';
+                }
+                xSemaphoreGive(stateMutex);
+              }
 #if DEBUG_VERBOSE
               if (ok) {
                 bool power = doc["power"] | false;
@@ -1958,8 +1980,11 @@ static String buildStatusJSON() {
   int rssi = 0, dRssi = 0, pRssi = 0, mqttStatus = 0;
   char ssid[33] = "";
   char timeSource[12] = "";
+  char acFan[8] = "";
   float current = 0.0f, acs = 0.0f, voltage = 0.0f, energyVoltage = 0.0f, acCurrent = 0.0f;
   float acPower = 0.0f, tempC = 0.0f, humidity = 0.0f;
+  bool acPowerState = false;
+  int acTempC = 0;
   double acEnergy = 0.0, rawPzemEnergy = 0.0, acDayStart = 0.0;
   double mainEnergy = 0.0, digitalEnergy = 0.0;
   uint32_t runtime[7] = {0};
@@ -2005,6 +2030,9 @@ static String buildStatusJSON() {
     tempC = sysState.temperatureC;
     humidity = sysState.humidityPct;
     dhtOk = sysState.dhtHealthy;
+    acPowerState = sysState.acPower;
+    acTempC = sysState.acTempC;
+    strncpy(acFan, sysState.acFan, sizeof(acFan) - 1);
     mqttStatus = sysState.mqttStatus;
     strncpy(timeSource, sysState.timeSource, sizeof(timeSource) - 1);
     xSemaphoreGive(stateMutex);
@@ -2019,13 +2047,13 @@ static String buildStatusJSON() {
       json += ",";
     json += relays[i] ? "true" : "false";
   }
-  json += "],\"locks\":[";
+  json += "," + String(dRelay ? "true" : "false") + "],\"locks\":[";
   for (int i = 0; i < NUM_RELAYS; i++) {
     if (i > 0)
       json += ",";
     json += locks[i] ? "true" : "false";
   }
-  json += "],";
+  json += "," + String(dLock ? "true" : "false") + "],";
   json += "\"current\":" + String(current, 2) + ",";
   json += "\"rssi\":" + String(rssi) + ",";
   json += "\"ssid\":\"" + jsonEscape(ssid) + "\",";
@@ -2060,9 +2088,12 @@ static String buildStatusJSON() {
   json += "\"sd_total\":" + String((unsigned long long)sdTotal) + ",";
   json += "\"sd_used\":" + String((unsigned long long)sdUsed) + ",";
   json += "\"p_health\":" + String(pHealth ? "true" : "false") + ",";
-  json += "\"temp_c\":" + String(tempC, 1) + ",";
-  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"temp_c\":" + (dhtOk ? String(tempC, 1) : "null") + ",";
+  json += "\"humidity\":" + (dhtOk ? String(humidity, 1) : "null") + ",";
   json += "\"dht_ok\":" + String(dhtOk ? "true" : "false") + ",";
+  json += "\"ac\":{\"power\":" + String(acPowerState ? "true" : "false")
+          + ",\"temp\":" + String(acTempC)
+          + ",\"fan\":\"" + jsonEscape(acFan) + "\"},";
   json += "\"mqtt_status\":" + String(mqttStatus) + ",";
   json += "\"time_source\":\"" + jsonEscape(timeSource) + "\",";
   json += "\"reset_reason\":\"" + jsonEscape(g_resetReason) + "\"";
@@ -2379,6 +2410,7 @@ static void handleSerialCommand(String cmd) {
     for (int i = 0; i < NUM_RELAYS; i++) {
       setRelayState(i, false);
     }
+    enqueueUartCmd("{\"t\":\"ac_cmd\",\"cmd\":\"power\",\"val\":\"off\"}");
     enqueueUartCmd("{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
     Serial.println("OK");
   } else if (head == "MQTT") {
@@ -2454,7 +2486,7 @@ static void sendJson(AsyncWebServerRequest* request, int code,
 static void checkHttpPendingTimeouts() {
   uint32_t now = millis();
   if (g_sdLastRecordHttpPending &&
-      (now - g_sdLastRecordHttpStartMs) > 4000) {
+      (now - g_sdLastRecordHttpStartMs) > 8000) {
     if (g_sdLastRecordHttpReq != nullptr) {
       sendJson(g_sdLastRecordHttpReq, 504,
                "{\"ok\":false,\"message\":\"Timeout\"}");
@@ -2464,7 +2496,7 @@ static void checkHttpPendingTimeouts() {
   }
 
   if (g_clearLogsHttpPending &&
-      (now - g_clearLogsHttpStartMs) > 4000) {
+      (now - g_clearLogsHttpStartMs) > 8000) {
     if (g_clearLogsHttpReq != nullptr) {
       sendJson(g_clearLogsHttpReq, 504,
                "{\"ok\":false,\"message\":\"Timeout\"}");
@@ -2625,6 +2657,8 @@ static void dashboardInit() {
                       setRelayState(i, false);
                     }
                     enqueueUartCmd(
+                        "{\"t\":\"ac_cmd\",\"cmd\":\"power\",\"val\":\"off\"}");
+                    enqueueUartCmd(
                         "{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
                     sendJson(req, 200, "{\"ok\":true}");
                   });
@@ -2699,57 +2733,9 @@ static void dashboardInit() {
         sendJson(req, 200, "{\"ok\":true}");
       });
 
-  pDashServer->on("/api/sd-last-record", HTTP_GET,
-                  [](AsyncWebServerRequest* req) {
-                    if (!isAuthenticated(req)) {
-                      sendJson(req, 401,
-                               "{\"ok\":false,\"message\":\"Unauthorized\"}");
-                      return;
-                    }
-                    if (g_sdLastRecordHttpPending) {
-                      sendJson(req, 429,
-                               "{\"ok\":false,\"message\":\"Request in progress\"}");
-                      return;
-                    }
-                    g_sdLastRecordHttpPending = true;
-                    g_sdLastRecordHttpReq = req;
-                    g_sdLastRecordHttpStartMs = millis();
-                    enqueueUartCmd(
-                        "{\"t\":\"last_record_req\",\"file\":\"energy_log.csv\"}");
-                  });
 
-  pDashServer->on(
-      "/api/clear-logs", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<128> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid JSON\"}");
-          return;
-        }
-        const char* confirm = doc["confirm"] | "";
-        if (String(confirm) != "CONFIRM") {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid\"}");
-          return;
-        }
-        if (g_clearLogsHttpPending) {
-          sendJson(req, 429,
-                   "{\"ok\":false,\"message\":\"Request in progress\"}");
-          return;
-        }
-        g_clearLogsHttpPending = true;
-        g_clearLogsHttpReq = req;
-        g_clearLogsHttpStartMs = millis();
-        enqueueUartCmd(
-            "{\"t\":\"clear_energy_logs_req\",\"file\":\"energy_log.csv\"}");
-      });
+
+
 
   pDashServer->on("/api/wifi-status", HTTP_GET,
                   [](AsyncWebServerRequest* req) {
