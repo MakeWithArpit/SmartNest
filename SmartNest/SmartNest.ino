@@ -546,7 +546,8 @@ void currentSensorTask(void *pvParameters) {
   static uint32_t lastSentTime = 0;
   static bool prevRelayStates[NUM_RELAYS] = {false};
 
-  static double sqSum = 0.0;
+  static double sumMilliVolts = 0.0;
+  static double sumMilliVoltsSq = 0.0;
   static uint32_t sampleCount = 0;
 
   while (true) {
@@ -574,7 +575,8 @@ void currentSensorTask(void *pvParameters) {
         changed = (oldAmps != 0.0f);
         xSemaphoreGive(stateMutex);
       }
-      sqSum = 0.0;
+      sumMilliVolts = 0.0;
+      sumMilliVoltsSq = 0.0;
       sampleCount = 0;
 
       if (changed || relayStateChanged) {
@@ -588,20 +590,26 @@ void currentSensorTask(void *pvParameters) {
     }
 
     float milliVolts = analogReadMilliVolts(ACS712_PIN);
-    float deltaMv = (milliVolts - acs712ZeroMv);
-    float instCurrent = deltaMv / 66.0f;
 
-    sqSum += (double)(instCurrent * instCurrent);
+    sumMilliVolts += milliVolts;
+    sumMilliVoltsSq += (double)milliVolts * (double)milliVolts;
     sampleCount++;
 
     uint32_t now = millis();
     if (now - lastProcessTime >= 200) {
       lastProcessTime = now;
       if (sampleCount > 0) {
-        float meanSquare = (float)(sqSum / (double)sampleCount);
-        float rmsCurrent = sqrtf(meanSquare);
+        float meanMilliVolts = (float)(sumMilliVolts / (double)sampleCount);
+        float meanSquareMilliVolts =
+            (float)(sumMilliVoltsSq / (double)sampleCount);
+        float varianceMilliVolts =
+            meanSquareMilliVolts - (meanMilliVolts * meanMilliVolts);
+        if (varianceMilliVolts < 0.0f) {
+          varianceMilliVolts = 0.0f;
+        }
+        float rmsCurrent = sqrtf(varianceMilliVolts) / 66.0f;
         float finalAmps = 0.0f;
-        if (rmsCurrent >= 0.15f) {
+        if (rmsCurrent >= 0.30f) {
           finalAmps = rmsCurrent;
         }
 
@@ -613,7 +621,8 @@ void currentSensorTask(void *pvParameters) {
           xSemaphoreGive(stateMutex);
         }
 
-        sqSum = 0.0;
+        sumMilliVolts = 0.0;
+        sumMilliVoltsSq = 0.0;
         sampleCount = 0;
 
         bool forceSend = relayStateChanged || 
