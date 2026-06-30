@@ -24,7 +24,6 @@
 #define RELAY_6_PIN 15
 
 #define ACS712_PIN 34
-#define ACS712_DIVIDER_RATIO 1.5f
 static float acs712ZeroMv = 2500.0f;
 
 #define DHT_PIN 23
@@ -589,7 +588,7 @@ void currentSensorTask(void *pvParameters) {
     }
 
     float milliVolts = analogReadMilliVolts(ACS712_PIN);
-    float deltaMv = (milliVolts - acs712ZeroMv) * ACS712_DIVIDER_RATIO;
+    float deltaMv = (milliVolts - acs712ZeroMv);
     float instCurrent = deltaMv / 66.0f;
 
     sqSum += (double)(instCurrent * instCurrent);
