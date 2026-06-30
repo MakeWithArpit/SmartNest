@@ -663,6 +663,34 @@ When a batch is successfully saved to the cloud, the backend must acknowledge re
 3. **Execution**: On a valid ACK, the device instructs the Master to record progress and purge the verified database entries, freeing up space. The device then immediately requests the next historical block.
 4. **Reliability**: If no ACK arrives within the 15-second timeout window, the device drops the pending session status and retries uploading the block from the last verified index.
 
+### Batch ACK and SD Pruning Semantics
+
+The history ACK is not an ID-list acknowledgement. The backend must acknowledge a batch with one `last_id`, representing the highest continuous record ID that has been safely stored.
+
+Example batch payload contains records in ascending order:
+```text
+118, 119, 120, 121, 122, 123
+```
+
+If the full batch is stored successfully, publish:
+```json
+{
+  "batch_id": "SmartNest_001-123-456789",
+  "ok": true,
+  "last_id": 123
+}
+```
+
+On receipt of this ACK, SmartNest sends `{"t":"hist_ack","last":123}` to the Master ESP32. The Master records the sync cursor and rewrites `energy_log.csv`, keeping only rows where `record_id > 123`. Rows with `record_id <= 123` are removed from the SD card.
+
+Backend rule: `last_id` must only advance through a continuous successfully committed range. For example:
+- If records `118` through `123` are all stored, ACK `last_id: 123`.
+- If only `118`, `119`, and `120` are confirmed stored, ACK `last_id: 120`; records `121` through `123` will be retried.
+- If record `120` failed but later records were stored, do not ACK `last_id: 123`; doing so would cause the device to delete unsaved record `120` from the SD card.
+- If the batch failed entirely, do not publish a success ACK, or publish `ok: false`. The SD card log will not be pruned.
+
+`mqttClient.publish()` returning success only confirms that the firmware handed the batch to the MQTT stack/broker. It does not prove database persistence. SD-card deletion happens only after the backend publishes a valid `/history/ack` message.
+
 
 ---
 
