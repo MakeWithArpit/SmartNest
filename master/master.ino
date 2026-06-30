@@ -43,6 +43,7 @@ const uint16_t IR_LED_PIN = 25;
 #define SD_RECORD_ID_BAK_FILE "record_id_state.bak"
 #define SD_HISTORY_MAX_BATCH 10
 #define ENERGY_DEFAULT_VOLTAGE 220.0f
+#define PZEM_RESET_DROP_THRESHOLD_KWH 0.05
 #define UART_TX_JSON_BYTES 4096
 #define SD_FILE_VIEW_LIMIT_BYTES 1024
 // Time source freshness affects reporting only. Time remains valid for daily
@@ -108,6 +109,7 @@ struct EnergyMeterState {
     double digitalEnergyWh;
     double acDayStartKWh;
     double acDailyEnergyKWh;
+    double acDailyCarryKWh;
     double pzemRawEnergyKWh;
     uint32_t relayRuntimeSec[7];
     uint32_t dayKey;
@@ -593,6 +595,10 @@ bool readEnergyStateFile(const char* path, EnergyMeterState &stateOut) {
             stateOut.acDailyEnergyKWh = strtod(val.c_str(), NULL);
             if (stateOut.acDailyEnergyKWh < 0.0) stateOut.acDailyEnergyKWh = 0.0;
             sawUsefulField = true;
+        } else if (key == "acDailyCarryKWh") {
+            stateOut.acDailyCarryKWh = strtod(val.c_str(), NULL);
+            if (stateOut.acDailyCarryKWh < 0.0) stateOut.acDailyCarryKWh = 0.0;
+            sawUsefulField = true;
         } else if (key == "pzemRawEnergyKWh") {
             stateOut.pzemRawEnergyKWh = strtod(val.c_str(), NULL);
             stateOut.pzemRawValid = stateOut.pzemRawEnergyKWh >= 0.0;
@@ -621,6 +627,14 @@ bool readEnergyStateFile(const char* path, EnergyMeterState &stateOut) {
         if (stateOut.acDayStartKWh < 0.0) stateOut.acDayStartKWh = stateOut.pzemRawEnergyKWh;
         stateOut.acBaselineValid = true;
     }
+    if (stateOut.acBaselineValid && stateOut.pzemRawValid) {
+        double segment = stateOut.pzemRawEnergyKWh - stateOut.acDayStartKWh;
+        if (segment < 0.0) segment = 0.0;
+        double rebuiltDaily = stateOut.acDailyCarryKWh + segment;
+        if (rebuiltDaily > stateOut.acDailyEnergyKWh) {
+            stateOut.acDailyEnergyKWh = rebuiltDaily;
+        }
+    }
     return sawUsefulField;
 }
 
@@ -647,6 +661,7 @@ void writeEnergyStateFile(const char* path) {
     f.printf("digitalEnergyWh=%.6f\n", snap.digitalEnergyWh);
     f.printf("acDayStartKWh=%.6f\n", snap.acDayStartKWh);
     f.printf("acDailyEnergyKWh=%.6f\n", snap.acDailyEnergyKWh);
+    f.printf("acDailyCarryKWh=%.6f\n", snap.acDailyCarryKWh);
     f.printf("pzemRawEnergyKWh=%.6f\n", snap.pzemRawEnergyKWh);
     f.printf("lastEpoch=%u\n", snap.lastEpoch);
     f.printf("tzHours=%d\n", snap.tzHours);
@@ -1748,6 +1763,21 @@ void energyTimeTask(void* pvParameters) {
             voltageEstimatedVal = !voltageValid;
             bool pzemRawValid = pzemOnlineVal && pzemHealthyVal && !isnan(pzemEnergyVal) && pzemEnergyVal >= 0.0f;
             if (pzemRawValid) {
+                double newRawKWh = pzemEnergyVal;
+                if (g_systemState.energy.pzemRawValid &&
+                    g_systemState.energy.acBaselineValid &&
+                    newRawKWh + PZEM_RESET_DROP_THRESHOLD_KWH < g_systemState.energy.pzemRawEnergyKWh) {
+                    double completedSegment =
+                        g_systemState.energy.pzemRawEnergyKWh - g_systemState.energy.acDayStartKWh;
+                    if (completedSegment > 0.0) {
+                        g_systemState.energy.acDailyCarryKWh += completedSegment;
+                    }
+                    g_systemState.energy.acDayStartKWh = newRawKWh;
+                    g_systemState.energyStateSaveRequest = true;
+                    Serial.printf("[ENERGY] PZEM cumulative reset detected oldRaw=%.3f newRaw=%.3f carry=%.3f\n",
+                                  g_systemState.energy.pzemRawEnergyKWh, newRawKWh,
+                                  g_systemState.energy.acDailyCarryKWh);
+                }
                 g_systemState.energy.pzemRawEnergyKWh = pzemEnergyVal;
                 g_systemState.energy.pzemRawValid = true;
                 if (!g_systemState.energy.acBaselineValid) {
@@ -1757,7 +1787,8 @@ void energyTimeTask(void* pvParameters) {
             }
             if (g_systemState.energy.acBaselineValid && g_systemState.energy.pzemRawValid) {
                 double delta = g_systemState.energy.pzemRawEnergyKWh - g_systemState.energy.acDayStartKWh;
-                g_systemState.energy.acDailyEnergyKWh = delta > 0.0 ? delta : 0.0;
+                if (delta < 0.0) delta = 0.0;
+                g_systemState.energy.acDailyEnergyKWh = g_systemState.energy.acDailyCarryKWh + delta;
             }
             if (deltaSeconds > 0.0f) {
                 g_systemState.energy.mainEnergyWh += ((double)voltageForEnergy * (double)smartNestLoadCurrent * (double)deltaSeconds) / 3600.0;
