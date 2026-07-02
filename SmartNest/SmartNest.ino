@@ -8,11 +8,11 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
-#include "dashboard_html.h"
 
 #define NUM_RELAYS 6
 
@@ -44,9 +44,11 @@ static float acs712ZeroMv = 2500.0f;
 #define NVS_PASS_KEY "wifi_pass"
 #define NVS_PROV_KEY "provisioned"
 #define CTRL_NVS_NAMESPACE "relay_ctrl"
+#define SERIAL_AUTH_NAMESPACE "serial_auth"
 #define UART_RX_BUFFER_MAX 6144
 
 #define MQTT_ENABLED true
+#define MQTT_TLS_ENABLED false
 #define MQTT_BROKER_HOST "broker.hivemq.com"
 #define MQTT_BROKER_PORT 1883
 #define MQTT_CLIENT_ID "SmartNest_001"
@@ -54,16 +56,27 @@ static float acs712ZeroMv = 2500.0f;
 #define MQTT_PASSWORD ""
 #define MQTT_KEEPALIVE_S 60
 #define MQTT_BASE_TOPIC "smartnest/SmartNest_001"
+#define MQTT_RECONNECT_MS 5000
+#define MQTT_TLS_RECONNECT_MS 30000
+#define MQTT_SOCKET_TIMEOUT_S 5
+#define MQTT_TLS_HANDSHAKE_TIMEOUT_S 3
+#define MQTT_MIN_FREE_HEAP 70000
+#define MQTT_CONNECT_SETTLE_MS 15000
+#define MQTT_LIVE_PUBLISH_MS 30000
+#define MQTT_HISTORY_SYNC_ENABLED true
+#define MQTT_NOTIFY_SLAVES false
 #define MQTT_HISTORY_BATCH_LIMIT 6
 #define MQTT_HISTORY_RETRY_MS 15000
 #define MQTT_HISTORY_MAX_PAYLOAD_BYTES 2800
 #define RESTORE_RELAYS_ON_BOOT true
+#define SERIAL_SESSION_TIMEOUT_MS 300000UL
 
 // Set to 1 to enable verbose debug output on Serial Monitor
 #define DEBUG_VERBOSE 0
 
 struct MqttConfig {
   bool enabled;
+  bool tls;
   char broker[64];
   int port;
   char clientId[64];
@@ -83,27 +96,30 @@ static String g_historyPendingBatchId = "";
 static uint32_t g_historyPendingLastId = 0;
 static uint32_t g_historyLastAckedId = 0;
 static uint32_t g_historyLastRequestMs = 0;
+static uint32_t g_mqttConnectedAtMs = 0;
 static uint8_t g_historyBatchLimit = MQTT_HISTORY_BATCH_LIMIT;
+static uint32_t g_historyPublishCount = 0;
+static uint32_t g_historyAckCount = 0;
+static uint32_t g_historyPruneCount = 0;
+static uint32_t g_historyLastPublishedId = 0;
+static uint32_t g_historyLastPublishedRows = 0;
+static uint32_t g_historyLastPublishedBytes = 0;
+static uint32_t g_historyLastPublishedMs = 0;
+static uint32_t g_historyLastAckedMs = 0;
+static uint32_t g_historyLastPrunedId = 0;
+static uint32_t g_historyLastPrunedRemoved = 0;
+static uint32_t g_historyLastPrunedKept = 0;
+static uint32_t g_historyLastPrunedMs = 0;
+static String g_historyLastPublishedBatchId = "";
+static String g_historyLastAckedBatchId = "";
 static String g_resetReason = "";
 
 // CLEAR ENERGY LOGS command tracking (Serial Monitor only)
 static volatile bool g_clearEnergyLogsSerialPending = false;
 
-// ===== Dashboard globals =====
-static AsyncWebServer* pDashServer = nullptr;
-static String g_dashSessionToken = "";
-
-// Credentials stored in NVS under namespace "dash_auth"
-// keys: "dash_user" (default "admin"), "dash_pass" (default "smartnest")
-
-// HTTP pending flags for async UART responses
-static volatile bool g_sdLastRecordHttpPending = false;
-static AsyncWebServerRequest* g_sdLastRecordHttpReq = nullptr;
-static uint32_t g_sdLastRecordHttpStartMs = 0;
-
-static volatile bool g_clearLogsHttpPending = false;
-static AsyncWebServerRequest* g_clearLogsHttpReq = nullptr;
-static uint32_t g_clearLogsHttpStartMs = 0;
+// Serial console authentication
+static bool g_serialAuthenticated = false;
+static uint32_t g_serialLastActivityMs = 0;
 
 // Slave status tracking for change-only serial and periodic MQTT
 static bool g_prevDigitalOnline = false;
@@ -117,6 +133,7 @@ void saveMqttConfig() {
   Preferences prefs;
   prefs.begin("mqtt_cfg", false);
   prefs.putBool("enabled", g_mqttConfig.enabled);
+  prefs.putBool("tls", g_mqttConfig.tls);
   prefs.putString("broker", String(g_mqttConfig.broker));
   prefs.putInt("port", g_mqttConfig.port);
   prefs.putString("username", String(g_mqttConfig.username));
@@ -130,6 +147,7 @@ void loadMqttConfig() {
   Preferences prefs;
   prefs.begin("mqtt_cfg", true);
   g_mqttConfig.enabled = prefs.getBool("enabled", MQTT_ENABLED);
+  g_mqttConfig.tls = prefs.getBool("tls", MQTT_TLS_ENABLED);
 
   String broker = prefs.getString("broker", MQTT_BROKER_HOST);
   strncpy(g_mqttConfig.broker, broker.c_str(), sizeof(g_mqttConfig.broker) - 1);
@@ -161,6 +179,7 @@ void loadMqttConfig() {
 
 void resetMqttConfigToDefault() {
   g_mqttConfig.enabled = MQTT_ENABLED;
+  g_mqttConfig.tls = MQTT_TLS_ENABLED;
   strncpy(g_mqttConfig.broker, MQTT_BROKER_HOST,
           sizeof(g_mqttConfig.broker) - 1);
   g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
@@ -258,8 +277,9 @@ static TaskHandle_t hMqttTask = NULL;
 static volatile bool g_sdLastRecordSerialPending = false;
 
 #if MQTT_ENABLED
-WiFiClient mqttWifiClient;
-PubSubClient mqttClient(mqttWifiClient);
+WiFiClient mqttPlainClient;
+WiFiClientSecure mqttSecureClient;
+PubSubClient mqttClient(mqttPlainClient);
 #endif
 
 DHT dht(DHT_PIN, DHT_TYPE);
@@ -279,8 +299,6 @@ void serialCommandInit();
 void serialCommandLoop();
 static void handleSerialCommand(String cmd);
 static String buildStatusJSON();
-static void sendJson(AsyncWebServerRequest* request, int code,
-                     const String& json);
 
 void relaySwitchTask(void *pvParameters);
 void currentSensorTask(void *pvParameters);
@@ -1262,13 +1280,14 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
         }
         enqueueUartCmd("{\"t\":\"hist_ack\",\"last\":" + String(lastId) + "}");
         g_historyLastAckedId = lastId;
+        g_historyAckCount++;
+        g_historyLastAckedMs = millis();
+        g_historyLastAckedBatchId = batchId;
         g_historyPending = false;
         g_historyPendingBatchId = "";
         g_historyPendingLastId = 0;
-#if DEBUG_VERBOSE
-        Serial.printf("[HISTORY] ACK received batch_id=%s last_id=%u\n",
+        Serial.printf("[HISTORY] Cloud ACK received batch_id=%s last_id=%u\n",
                       batchId.c_str(), lastId);
-#endif
         requestHistoryBatch(true);
       }
     }
@@ -1276,6 +1295,13 @@ void mqttCallback(char *topic, byte *payload, unsigned int length) {
 }
 
 void publishTelemetry() {
+  static uint32_t lastPublishMs = 0;
+  uint32_t now = millis();
+  if (g_mqttConnectedAtMs > 0 && now - g_mqttConnectedAtMs < MQTT_CONNECT_SETTLE_MS)
+    return;
+  if (now - lastPublishMs < MQTT_LIVE_PUBLISH_MS)
+    return;
+  lastPublishMs = now;
   publishLiveData();
 }
 
@@ -1400,6 +1426,8 @@ void publishSlavesStatus() {
 }
 
 void requestHistoryBatch(bool force) {
+  if (!MQTT_HISTORY_SYNC_ENABLED)
+    return;
   if (!mqttClient.connected() || g_historyPending)
     return;
   uint32_t now = millis();
@@ -1415,14 +1443,32 @@ void requestHistoryBatch(bool force) {
                  String(g_historyBatchLimit) + "}");
 }
 
-void mqttTask(void *pvParameters) {
+#if MQTT_ENABLED
+static void configureMqttTransport() {
+  if (g_mqttConfig.tls) {
+    mqttSecureClient.setInsecure();
+    mqttSecureClient.setHandshakeTimeout(MQTT_TLS_HANDSHAKE_TIMEOUT_S);
+    mqttSecureClient.setTimeout(MQTT_SOCKET_TIMEOUT_S * 1000);
+    mqttClient.setClient(mqttSecureClient);
+  } else {
+    mqttPlainClient.setTimeout(MQTT_SOCKET_TIMEOUT_S * 1000);
+    mqttClient.setClient(mqttPlainClient);
+  }
   mqttClient.setServer(g_mqttConfig.broker, g_mqttConfig.port);
-  mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(g_mqttConfig.keepAlive);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
   mqttClient.setBufferSize(3072);
+}
+#endif
+
+void mqttTask(void *pvParameters) {
+  configureMqttTransport();
+  mqttClient.setCallback(mqttCallback);
+  vTaskDelay(pdMS_TO_TICKS(8000));
 
   uint32_t lastReconnectAttempt = 0;
   uint32_t lastHeartbeat = 0;
+  uint8_t failedConnects = 0;
   bool wasMqttConnected = false;
 
   while (true) {
@@ -1432,17 +1478,22 @@ void mqttTask(void *pvParameters) {
       if (mqttClient.connected()) {
         mqttClient.disconnect();
       }
-      mqttClient.setServer(g_mqttConfig.broker, g_mqttConfig.port);
-      mqttClient.setKeepAlive(g_mqttConfig.keepAlive);
-      mqttClient.setBufferSize(3072);
+      mqttPlainClient.stop();
+      mqttSecureClient.stop();
+      configureMqttTransport();
       wasMqttConnected = false;
-      lastReconnectAttempt = 0;
+      g_mqttConnectedAtMs = 0;
+      failedConnects = 0;
+      lastReconnectAttempt = millis();
     }
     if (!g_mqttConfig.enabled) {
       if (wasMqttConnected) {
         mqttClient.disconnect();
+#if MQTT_NOTIFY_SLAVES
         enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
+#endif
         wasMqttConnected = false;
+        g_mqttConnectedAtMs = 0;
       }
       if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         sysState.mqttStatus = 0;
@@ -1455,15 +1506,36 @@ void mqttTask(void *pvParameters) {
     if (WiFi.status() == WL_CONNECTED) {
       if (!mqttClient.connected()) {
         if (wasMqttConnected) {
+#if MQTT_NOTIFY_SLAVES
           enqueueUartCmd("{\"t\":\"cloud\",\"up\":false}");
+#endif
           wasMqttConnected = false;
+          g_mqttConnectedAtMs = 0;
         }
         if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           sysState.mqttStatus = 1;
           xSemaphoreGive(stateMutex);
         }
-        if (millis() - lastReconnectAttempt > 5000) {
+        uint8_t backoffSteps = failedConnects;
+        if (backoffSteps > 3)
+          backoffSteps = 3;
+        const uint32_t reconnectMs =
+            (g_mqttConfig.tls ? MQTT_TLS_RECONNECT_MS : MQTT_RECONNECT_MS) *
+            (1UL << backoffSteps);
+        if (millis() - lastReconnectAttempt > reconnectMs) {
           lastReconnectAttempt = millis();
+          if (g_mqttConfig.tls && ESP.getFreeHeap() < MQTT_MIN_FREE_HEAP) {
+            Serial.printf("[MQTT] TLS connect skipped, low heap=%u\n",
+                          ESP.getFreeHeap());
+            if (failedConnects < 8)
+              failedConnects++;
+            if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+              sysState.mqttStatus = 3;
+              xSemaphoreGive(stateMutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+          }
           bool ok;
           if (strlen(g_mqttConfig.username) > 0)
             ok =
@@ -1472,22 +1544,33 @@ void mqttTask(void *pvParameters) {
           else
             ok = mqttClient.connect(g_mqttConfig.clientId);
           if (ok) {
+            failedConnects = 0;
+            g_mqttConnectedAtMs = millis();
             String base = String(g_mqttConfig.baseTopic);
             mqttClient.subscribe((base + "/cmd/request").c_str());
             mqttClient.subscribe((base + "/history/ack").c_str());
 
-            publishLiveData();
-            requestHistoryBatch(true);
+#if MQTT_NOTIFY_SLAVES
             enqueueUartCmd("{\"t\":\"cloud\",\"up\":true}");
+#endif
             wasMqttConnected = true;
-            Serial.printf("[MQTT] Connected to %s:%d (topic: %s)\n",
+            Serial.printf("[MQTT] Connected to %s:%d via %s (topic: %s)\n",
                           g_mqttConfig.broker, g_mqttConfig.port,
+                          g_mqttConfig.tls ? "TLS" : "plain MQTT",
                           g_mqttConfig.baseTopic);
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
               sysState.mqttStatus = 2;
               xSemaphoreGive(stateMutex);
             }
           } else {
+            Serial.printf("[MQTT] Connect failed to %s:%d via %s (state=%d, heap=%u)\n",
+                          g_mqttConfig.broker, g_mqttConfig.port,
+                          g_mqttConfig.tls ? "TLS" : "plain MQTT",
+                          mqttClient.state(), ESP.getFreeHeap());
+            mqttPlainClient.stop();
+            mqttSecureClient.stop();
+            if (failedConnects < 8)
+              failedConnects++;
             if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
               sysState.mqttStatus = 3;
               xSemaphoreGive(stateMutex);
@@ -1513,17 +1596,18 @@ void mqttTask(void *pvParameters) {
                         g_historyLastAckedId);
 #endif
         }
-        if (millis() - lastHeartbeat > HEARTBEAT_MS) {
+        if (millis() - lastHeartbeat > MQTT_LIVE_PUBLISH_MS) {
           lastHeartbeat = millis();
           publishTelemetry();
         }
         if (millis() - g_lastSlavesMqttPublishMs >= 60000) {
           publishSlavesStatus();
         }
-        requestHistoryBatch(false);
+        if (MQTT_HISTORY_SYNC_ENABLED)
+          requestHistoryBatch(false);
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS((g_mqttConfig.tls && mqttClient.connected()) ? 200 : 50));
   }
 }
 #endif
@@ -1742,7 +1826,7 @@ void uartCommTask(void *pvParameters) {
               }
             } else if (type == "hist_res") {
 #if MQTT_ENABLED
-              if (mqttClient.connected() && !g_historyPending) {
+              if (MQTT_HISTORY_SYNC_ENABLED && mqttClient.connected() && !g_historyPending) {
                 JsonArray records = doc["records"].as<JsonArray>();
                 uint32_t lastId = doc["last"] | 0;
                 if (records.size() > 0 && lastId > 0) {
@@ -1777,51 +1861,60 @@ void uartCommTask(void *pvParameters) {
                     g_historyPendingLastId = lastId;
                     g_historyLastRequestMs = millis();
                     g_historyBatchLimit = MQTT_HISTORY_BATCH_LIMIT;
-#if DEBUG_VERBOSE
+                    g_historyPublishCount++;
+                    g_historyLastPublishedBatchId = batchId;
+                    g_historyLastPublishedId = lastId;
+                    g_historyLastPublishedRows = records.size();
+                    g_historyLastPublishedBytes = payload.length();
+                    g_historyLastPublishedMs = millis();
                     Serial.printf("[HISTORY] Published batch_id=%s count=%u last_id=%u bytes=%u\n",
                                   batchId.c_str(), records.size(), lastId, payload.length());
-#endif
                   } else {
-#if DEBUG_VERBOSE
                     Serial.printf("[HISTORY] Publish failed batch_id=%s count=%u last_id=%u bytes=%u\n",
                                   batchId.c_str(), records.size(), lastId, payload.length());
-#endif
                   }
                 }
               }
 #endif
+            } else if (type == "hist_ack_res") {
+              bool ok = doc["ok"] | false;
+              uint32_t lastId = doc["last"] | 0;
+              if (ok) {
+                uint32_t removed = doc["removed"] | 0;
+                uint32_t kept = doc["kept"] | 0;
+                g_historyPruneCount++;
+                g_historyLastPrunedId = lastId;
+                g_historyLastPrunedRemoved = removed;
+                g_historyLastPrunedKept = kept;
+                g_historyLastPrunedMs = millis();
+                Serial.printf("[HISTORY] SD prune confirmed last_id=%u removed=%u kept=%u\n",
+                              lastId, removed, kept);
+              } else {
+                const char *msg = doc["message"] | "SD prune failed";
+                Serial.printf("[HISTORY] SD prune failed last_id=%u message=%s\n",
+                              lastId, msg);
+              }
             } else if (type == "last_record_res") {
               if (g_sdLastRecordSerialPending) {
                 g_sdLastRecordSerialPending = false;
                 bool ok = doc["ok"] | false;
                 if (ok) {
                   uint32_t recordId = doc["record_id"] | 0;
+                  uint32_t rowCount = doc["row_count"] | 0;
                   const char *date = doc["date"] | "";
                   Serial.println();
-                  Serial.println("--- SD Last Record ---");
+                  Serial.println("--- SD CSV Summary ---");
+                  Serial.printf("File:      %s\n", doc["file"] | "energy_log.csv");
+                  Serial.printf("Rows:      %u\n", rowCount);
                   Serial.printf("Record ID: %u\n", recordId);
-                  Serial.printf("Date:      %s\n", date);
+                  if (date && strlen(date) > 0) {
+                    Serial.printf("Date:      %s\n", date);
+                  }
                   Serial.println("----------------------");
                 } else {
                   const char *msg = doc["message"] | "Unknown error";
                   Serial.printf("\nERR: %s\n", msg);
                 }
-              }
-              if (g_sdLastRecordHttpPending && g_sdLastRecordHttpReq != nullptr) {
-                g_sdLastRecordHttpPending = false;
-                bool ok = doc["ok"] | false;
-                String resp;
-                if (ok) {
-                  uint32_t recId = doc["record_id"] | 0;
-                  const char* date = doc["date"] | "";
-                  resp = "{\"ok\":true,\"record_id\":" + String(recId) +
-                         ",\"date\":\"" + String(date) + "\"}";
-                } else {
-                  const char* msg = doc["message"] | "Unknown error";
-                  resp = "{\"ok\":false,\"message\":\"" + String(msg) + "\"}";
-                }
-                sendJson(g_sdLastRecordHttpReq, ok ? 200 : 500, resp);
-                g_sdLastRecordHttpReq = nullptr;
               }
             } else if (type == "clear_energy_logs_res") {
               bool ok = doc["ok"] | false;
@@ -1829,19 +1922,16 @@ void uartCommTask(void *pvParameters) {
               if (g_clearEnergyLogsSerialPending) {
                 g_clearEnergyLogsSerialPending = false;
                 if (ok) {
+                  uint32_t preservedId = doc["preserved_record_id"] | 0;
+                  uint32_t nextId = doc["next_record_id"] | 0;
                   Serial.printf("\nOK: %s\n", msg);
+                  if (nextId > 0) {
+                    Serial.printf("Preserved record ID: %u\n", preservedId);
+                    Serial.printf("Next record ID:      %u\n", nextId);
+                  }
                 } else {
                   Serial.printf("\nERR: %s\n", msg);
                 }
-              }
-              if (g_clearLogsHttpPending && g_clearLogsHttpReq != nullptr) {
-                g_clearLogsHttpPending = false;
-                bool ok = doc["ok"] | false;
-                const char* msg = doc["message"] | "";
-                sendJson(g_clearLogsHttpReq, ok ? 200 : 500,
-                         "{\"ok\":" + String(ok ? "true" : "false") +
-                         ",\"message\":\"" + String(msg) + "\"}");
-                g_clearLogsHttpReq = nullptr;
               }
 
             } else if (type == "slave_status") {
@@ -2155,33 +2245,199 @@ static bool setMasterLock(bool state) {
   return true;
 }
 
+static void loadSerialCredentials(String &user, String &pass) {
+  Preferences prefs;
+  prefs.begin(SERIAL_AUTH_NAMESPACE, true);
+  user = prefs.getString("user", "admin");
+  pass = prefs.getString("pass", "smartnest");
+  prefs.end();
+}
+
+static void saveSerialCredentials(const String &user, const String &pass) {
+  Preferences prefs;
+  prefs.begin(SERIAL_AUTH_NAMESPACE, false);
+  prefs.putString("user", user);
+  prefs.putString("pass", pass);
+  prefs.end();
+}
+
+static void printSerialLoginHelp() {
+  Serial.println();
+  Serial.println("==================================================");
+  Serial.println(" SmartNest Secure Serial Console");
+  Serial.println("==================================================");
+  Serial.println(" Login required before device commands are enabled.");
+  Serial.println();
+  Serial.println(" Public commands:");
+  Serial.println("  LOGIN <username> <password>");
+  Serial.println("  AUTH STATUS");
+  Serial.println("  HELP");
+  Serial.println();
+  Serial.printf(" Session timeout: %lu seconds\n",
+                SERIAL_SESSION_TIMEOUT_MS / 1000UL);
+  Serial.println("==================================================");
+}
+
 static void printHelp() {
   Serial.println();
-  Serial.println("SmartNest serial commands:");
-  Serial.println("HELP");
-  Serial.println("STATUS");
-  Serial.println("RELAY <1-7> ON|OFF");
-  Serial.println("LOCK <1-7> ON|OFF");
-  Serial.println("AC ON|OFF");
-  Serial.println("AC TEMP <16-30>");
-  Serial.println("AC TEMP+|TEMP-");
-  Serial.println("AC FAN auto|min|low|med|high|max");
-  Serial.println("LIGHTS ON|OFF");
-  Serial.println("SHUTDOWN ON");
-  Serial.println("UNLOCK-ALL");
-  Serial.println("SD INFO");
-  Serial.println("SD LAST-RECORD");
-  Serial.println("CLEAR ENERGY LOGS");
-  Serial.println("WIFI STATUS");
-  Serial.println("REBOOT");
-  Serial.println("MQTT SHOW");
-  Serial.println("MQTT ENABLE ON|OFF");
-  Serial.println("MQTT SET BROKER <host>");
-  Serial.println("MQTT SET PORT <port>");
-  Serial.println("MQTT SET USER <username>");
-  Serial.println("MQTT SET PASS <password>");
-  Serial.println("MQTT SET KEEPALIVE <seconds>");
+  Serial.println("==================================================");
+  Serial.println(" SmartNest Authenticated Commands");
+  Serial.println("==================================================");
+  Serial.println(" Session:");
+  Serial.println("  AUTH STATUS");
+  Serial.println("  AUTH SET <current_pass> <new_user> <new_pass>");
+  Serial.println("  LOGOUT");
   Serial.println();
+  Serial.println(" System:");
+  Serial.println("  STATUS");
+  Serial.println("  WIFI STATUS");
+  Serial.println("  REBOOT");
+  Serial.println();
+  Serial.println(" Relays:");
+  Serial.println("  RELAY <1-7> ON|OFF");
+  Serial.println("  LOCK <1-7> ON|OFF");
+  Serial.println("  LIGHTS ON|OFF");
+  Serial.println("  SHUTDOWN ON");
+  Serial.println("  UNLOCK-ALL");
+  Serial.println();
+  Serial.println(" AC:");
+  Serial.println("  AC ON|OFF");
+  Serial.println("  AC TEMP <16-30>");
+  Serial.println("  AC TEMP+|TEMP-");
+  Serial.println("  AC FAN auto|min|low|med|high|max");
+  Serial.println();
+  Serial.println(" SD Card:");
+  Serial.println("  SD INFO");
+  Serial.println("  SD LAST-RECORD  (CSV rows + last record)");
+  Serial.println("  CLEAR ENERGY LOGS");
+  Serial.println();
+  Serial.println(" MQTT:");
+  Serial.println("  MQTT SHOW");
+  Serial.println("  MQTT HISTORY");
+  Serial.println("  MQTT ENABLE ON|OFF");
+  Serial.println("  MQTT TLS ON|OFF");
+  Serial.println("  MQTT SET BROKER <host>");
+  Serial.println("  MQTT SET PORT <port>");
+  Serial.println("  MQTT SET USER <username>");
+  Serial.println("  MQTT SET PASS <password>");
+  Serial.println("  MQTT SET KEEPALIVE <seconds>");
+  Serial.println("==================================================");
+  Serial.println();
+}
+
+static bool splitTwoArgs(const String &text, String &first, String &second) {
+  String s = text;
+  s.trim();
+  int p = s.indexOf(' ');
+  if (p < 0)
+    return false;
+  first = s.substring(0, p);
+  second = s.substring(p + 1);
+  first.trim();
+  second.trim();
+  return first.length() > 0 && second.length() > 0;
+}
+
+static bool splitThreeArgs(const String &text, String &first, String &second,
+                           String &third) {
+  String tail;
+  if (!splitTwoArgs(text, first, tail))
+    return false;
+  return splitTwoArgs(tail, second, third);
+}
+
+static bool handleAuthCommand(const String &raw, const String &upper) {
+  if (upper == "HELP") {
+    if (g_serialAuthenticated)
+      g_serialLastActivityMs = millis();
+    if (g_serialAuthenticated)
+      printHelp();
+    else
+      printSerialLoginHelp();
+    return true;
+  }
+
+  if (upper == "AUTH STATUS") {
+    Serial.println();
+    Serial.printf("Serial session: %s\n",
+                  g_serialAuthenticated ? "AUTHENTICATED" : "LOCKED");
+    if (g_serialAuthenticated) {
+      uint32_t elapsed = millis() - g_serialLastActivityMs;
+      uint32_t remaining =
+          elapsed >= SERIAL_SESSION_TIMEOUT_MS
+              ? 0
+              : (SERIAL_SESSION_TIMEOUT_MS - elapsed) / 1000UL;
+      Serial.printf("Timeout in:     %lu seconds\n", remaining);
+      g_serialLastActivityMs = millis();
+    }
+    return true;
+  }
+
+  if (upper.startsWith("LOGIN ")) {
+    String user;
+    String pass;
+    if (!splitTwoArgs(raw.substring(6), user, pass)) {
+      Serial.println("ERR: use LOGIN <username> <password>");
+      return true;
+    }
+
+    String savedUser;
+    String savedPass;
+    loadSerialCredentials(savedUser, savedPass);
+    if (user == savedUser && pass == savedPass) {
+      g_serialAuthenticated = true;
+      g_serialLastActivityMs = millis();
+      Serial.println();
+      Serial.println("OK: serial session unlocked");
+      printHelp();
+    } else {
+      g_serialAuthenticated = false;
+      Serial.println("ERR: invalid username or password");
+    }
+    return true;
+  }
+
+  if (upper == "LOGOUT") {
+    g_serialAuthenticated = false;
+    g_serialLastActivityMs = 0;
+    Serial.println("OK: serial session locked");
+    return true;
+  }
+
+  if (upper.startsWith("AUTH SET ")) {
+    if (!g_serialAuthenticated) {
+      Serial.println("ERR: login required. Use LOGIN <username> <password>");
+      return true;
+    }
+    g_serialLastActivityMs = millis();
+
+    String currentPass;
+    String newUser;
+    String newPass;
+    if (!splitThreeArgs(raw.substring(9), currentPass, newUser, newPass)) {
+      Serial.println("ERR: use AUTH SET <current_pass> <new_user> <new_pass>");
+      return true;
+    }
+
+    String savedUser;
+    String savedPass;
+    loadSerialCredentials(savedUser, savedPass);
+    if (currentPass != savedPass) {
+      Serial.println("ERR: current password is wrong");
+      return true;
+    }
+    if (newUser.length() == 0 || newPass.length() < 4) {
+      Serial.println("ERR: new user required and password must be >= 4 chars");
+      return true;
+    }
+    saveSerialCredentials(newUser, newPass);
+    g_serialAuthenticated = false;
+    g_serialLastActivityMs = 0;
+    Serial.println("OK: credentials updated. Please login again.");
+    return true;
+  }
+
+  return false;
 }
 
 static void resetWifiAndRestart() {
@@ -2268,6 +2524,7 @@ static bool parseAcTempValue(const String &value, int &temp) {
 
 static void printMqttConfig() {
   Serial.printf("enabled=%s\n", g_mqttConfig.enabled ? "ON" : "OFF");
+  Serial.printf("tls=%s\n", g_mqttConfig.tls ? "ON" : "OFF");
   Serial.printf("broker=%s\n", g_mqttConfig.broker);
   Serial.printf("port=%d\n", g_mqttConfig.port);
   Serial.printf("client=%s\n", g_mqttConfig.clientId);
@@ -2276,9 +2533,63 @@ static void printMqttConfig() {
   Serial.printf("keepalive=%d\n", g_mqttConfig.keepAlive);
 }
 
+static void printAgeSeconds(const char *label, uint32_t eventMs) {
+  if (eventMs == 0) {
+    Serial.printf("%s: never\n", label);
+  } else {
+    Serial.printf("%s: %lu seconds ago\n", label,
+                  (millis() - eventMs) / 1000UL);
+  }
+}
+
+static void printMqttHistoryStatus() {
+  Serial.println();
+  Serial.println("--- MQTT History Sync ---");
+  Serial.printf("enabled:       %s\n", MQTT_HISTORY_SYNC_ENABLED ? "YES" : "NO");
+#if MQTT_ENABLED
+  Serial.printf("mqtt:          %s\n", mqttClient.connected() ? "CONNECTED" : "DISCONNECTED");
+#else
+  Serial.println("mqtt:          COMPILED OUT");
+#endif
+  Serial.printf("pending:       %s\n", g_historyPending ? "YES" : "NO");
+  if (g_historyPending) {
+    Serial.printf("pending_batch: %s\n", g_historyPendingBatchId.c_str());
+    Serial.printf("pending_last:  %u\n", g_historyPendingLastId);
+  }
+  Serial.printf("last_acked_id: %u\n", g_historyLastAckedId);
+  Serial.printf("batch_limit:   %u\n", MQTT_HISTORY_BATCH_LIMIT);
+  Serial.printf("max_payload:   %u bytes\n", MQTT_HISTORY_MAX_PAYLOAD_BYTES);
+  Serial.printf("published:     %u batches\n", g_historyPublishCount);
+  Serial.printf("acked:         %u batches\n", g_historyAckCount);
+  Serial.printf("pruned:        %u confirmations\n", g_historyPruneCount);
+  if (g_historyLastPublishedMs > 0) {
+    Serial.printf("last_publish:  id=%u rows=%u bytes=%u batch=%s\n",
+                  g_historyLastPublishedId, g_historyLastPublishedRows,
+                  g_historyLastPublishedBytes,
+                  g_historyLastPublishedBatchId.c_str());
+  }
+  if (g_historyLastAckedMs > 0) {
+    Serial.printf("last_ack:      id=%u batch=%s\n", g_historyLastAckedId,
+                  g_historyLastAckedBatchId.c_str());
+  }
+  if (g_historyLastPrunedMs > 0) {
+    Serial.printf("last_prune:    id=%u removed=%u kept=%u\n",
+                  g_historyLastPrunedId, g_historyLastPrunedRemoved,
+                  g_historyLastPrunedKept);
+  }
+  printAgeSeconds("publish_age", g_historyLastPublishedMs);
+  printAgeSeconds("ack_age", g_historyLastAckedMs);
+  printAgeSeconds("prune_age", g_historyLastPrunedMs);
+  Serial.println("-------------------------");
+}
+
 static void handleMqttCommand(const String &cmdRaw, const String &cmdUpper) {
   if (cmdUpper == "MQTT SHOW") {
     printMqttConfig();
+    return;
+  }
+  if (cmdUpper == "MQTT HISTORY") {
+    printMqttHistoryStatus();
     return;
   }
   if (cmdUpper.startsWith("MQTT ENABLE ")) {
@@ -2288,6 +2599,13 @@ static void handleMqttCommand(const String &cmdRaw, const String &cmdUpper) {
       return;
     }
     g_mqttConfig.enabled = enabled;
+  } else if (cmdUpper.startsWith("MQTT TLS ")) {
+    bool tls = false;
+    if (!parseBoolValue(cmdUpper.substring(9), tls)) {
+      Serial.println("ERR: use MQTT TLS ON|OFF");
+      return;
+    }
+    g_mqttConfig.tls = tls;
   } else if (cmdUpper.startsWith("MQTT SET BROKER ")) {
     strncpy(g_mqttConfig.broker, cmdRaw.substring(16).c_str(), sizeof(g_mqttConfig.broker) - 1);
     g_mqttConfig.broker[sizeof(g_mqttConfig.broker) - 1] = '\0';
@@ -2317,6 +2635,16 @@ static void handleSerialCommand(String cmd) {
   String raw = cmd;
   String upper = cmd;
   upper.toUpperCase();
+
+  if (handleAuthCommand(raw, upper))
+    return;
+
+  if (!g_serialAuthenticated) {
+    Serial.println("ERR: login required. Use LOGIN <username> <password>");
+    return;
+  }
+
+  g_serialLastActivityMs = millis();
 
   int p1 = upper.indexOf(' ');
   String head = p1 < 0 ? upper : upper.substring(0, p1);
@@ -2429,11 +2757,21 @@ static void handleSerialCommand(String cmd) {
 }
 
 void serialCommandInit() {
-  printHelp();
+  printSerialLoginHelp();
 }
 
 void serialCommandLoop() {
   static String line;
+
+  if (g_serialAuthenticated &&
+      millis() - g_serialLastActivityMs >= SERIAL_SESSION_TIMEOUT_MS) {
+    g_serialAuthenticated = false;
+    g_serialLastActivityMs = 0;
+    Serial.println();
+    Serial.println("SESSION TIMEOUT: serial console locked");
+    printSerialLoginHelp();
+  }
+
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '\n') {
@@ -2445,461 +2783,6 @@ void serialCommandLoop() {
         line = "";
     }
   }
-}
-
-static void loadDashCredentials(String& user, String& pass) {
-  Preferences prefs;
-  prefs.begin("dash_auth", true);
-  user = prefs.getString("dash_user", "admin");
-  pass = prefs.getString("dash_pass", "smartnest");
-  prefs.end();
-}
-
-static void saveDashCredentials(const String& user, const String& pass) {
-  Preferences prefs;
-  prefs.begin("dash_auth", false);
-  prefs.putString("dash_user", user);
-  prefs.putString("dash_pass", pass);
-  prefs.end();
-}
-
-static String generateToken() {
-  char token[17];
-  snprintf(token, sizeof(token), "%08lx%08lx",
-           (unsigned long)esp_random(), (unsigned long)esp_random());
-  return String(token);
-}
-
-static bool isAuthenticated(AsyncWebServerRequest* request) {
-  if (g_dashSessionToken.length() == 0 || !request->hasHeader("Cookie"))
-    return false;
-
-  String cookie = request->getHeader("Cookie")->value();
-  String needle = "sn_session=" + g_dashSessionToken;
-  int pos = cookie.indexOf(needle);
-  if (pos < 0)
-    return false;
-  bool startsOk = pos == 0 || cookie.charAt(pos - 1) == ' ' ||
-                  cookie.charAt(pos - 1) == ';';
-  int end = pos + needle.length();
-  bool endsOk = end >= cookie.length() || cookie.charAt(end) == ';';
-  return startsOk && endsOk;
-}
-
-static void sendJson(AsyncWebServerRequest* request, int code,
-                     const String& json) {
-  request->send(code, "application/json", json);
-}
-
-static void checkHttpPendingTimeouts() {
-  uint32_t now = millis();
-  if (g_sdLastRecordHttpPending &&
-      (now - g_sdLastRecordHttpStartMs) > 8000) {
-    if (g_sdLastRecordHttpReq != nullptr) {
-      sendJson(g_sdLastRecordHttpReq, 504,
-               "{\"ok\":false,\"message\":\"Timeout\"}");
-    }
-    g_sdLastRecordHttpPending = false;
-    g_sdLastRecordHttpReq = nullptr;
-  }
-
-  if (g_clearLogsHttpPending &&
-      (now - g_clearLogsHttpStartMs) > 8000) {
-    if (g_clearLogsHttpReq != nullptr) {
-      sendJson(g_clearLogsHttpReq, 504,
-               "{\"ok\":false,\"message\":\"Timeout\"}");
-    }
-    g_clearLogsHttpPending = false;
-    g_clearLogsHttpReq = nullptr;
-  }
-}
-
-static void dashboardInit() {
-  pDashServer = new AsyncWebServer(80);
-
-  pDashServer->on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!isAuthenticated(req)) {
-      req->redirect("/login");
-      return;
-    }
-    req->send_P(200, "text/html", DASHBOARD_HTML);
-  });
-
-  pDashServer->on("/login", HTTP_GET, [](AsyncWebServerRequest* req) {
-    req->send_P(200, "text/html", DASHBOARD_HTML);
-  });
-
-  pDashServer->on(
-      "/api/login", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-
-        StaticJsonDocument<256> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid JSON\"}");
-          return;
-        }
-
-        String savedUser, savedPass;
-        loadDashCredentials(savedUser, savedPass);
-        const char* username = doc["username"] | "";
-        const char* password = doc["password"] | "";
-        if (savedUser == username && savedPass == password) {
-          g_dashSessionToken = generateToken();
-          AsyncWebServerResponse* response =
-              req->beginResponse(200, "application/json", "{\"ok\":true}");
-          response->addHeader("Set-Cookie",
-                              "sn_session=" + g_dashSessionToken +
-                                  "; Path=/; HttpOnly; SameSite=Strict");
-          req->send(response);
-        } else {
-          sendJson(req, 401,
-                   "{\"ok\":false,\"message\":\"Invalid credentials\"}");
-        }
-      });
-
-  pDashServer->on("/api/logout", HTTP_POST, [](AsyncWebServerRequest* req) {
-    g_dashSessionToken = "";
-    AsyncWebServerResponse* response =
-        req->beginResponse(200, "application/json", "{\"ok\":true}");
-    response->addHeader(
-        "Set-Cookie",
-        "sn_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
-    req->send(response);
-  });
-
-  pDashServer->on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req) {
-    if (!isAuthenticated(req)) {
-      sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-      return;
-    }
-    sendJson(req, 200, buildStatusJSON());
-  });
-
-  pDashServer->on(
-      "/api/relay", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<128> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid JSON\"}");
-          return;
-        }
-        int relay = doc["relay"] | 0;
-        if (relay < 1 || relay > 7 || !doc["state"].is<bool>()) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid\"}");
-          return;
-        }
-        bool state = doc["state"];
-        handleRelayCommand(relay, state ? "ON" : "OFF");
-        sendJson(req, 200, "{\"ok\":true}");
-      });
-
-  pDashServer->on(
-      "/api/lock", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<128> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid JSON\"}");
-          return;
-        }
-        int relay = doc["relay"] | 0;
-        if (relay < 1 || relay > 7 || !doc["locked"].is<bool>()) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid\"}");
-          return;
-        }
-        bool locked = doc["locked"];
-        handleLockCommand(relay, locked ? "ON" : "OFF");
-        sendJson(req, 200, "{\"ok\":true}");
-      });
-
-  pDashServer->on(
-      "/api/lights", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<128> doc;
-        if (deserializeJson(doc, data, len) || !doc["state"].is<bool>()) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid\"}");
-          return;
-        }
-        bool state = doc["state"];
-        for (int i = 0; i < 5; i++) {
-          setRelayState(i, state);
-        }
-        sendJson(req, 200, "{\"ok\":true}");
-      });
-
-  pDashServer->on("/api/shutdown", HTTP_POST,
-                  [](AsyncWebServerRequest* req) {
-                    if (!isAuthenticated(req)) {
-                      sendJson(req, 401,
-                               "{\"ok\":false,\"message\":\"Unauthorized\"}");
-                      return;
-                    }
-                    for (int i = 0; i < NUM_RELAYS; i++) {
-                      setRelayState(i, false);
-                    }
-                    enqueueUartCmd(
-                        "{\"t\":\"ac_cmd\",\"cmd\":\"power\",\"val\":\"off\"}");
-                    enqueueUartCmd(
-                        "{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_off\"}");
-                    sendJson(req, 200, "{\"ok\":true}");
-                  });
-
-  pDashServer->on("/api/unlock-all", HTTP_POST,
-                  [](AsyncWebServerRequest* req) {
-                    if (!isAuthenticated(req)) {
-                      sendJson(req, 401,
-                               "{\"ok\":false,\"message\":\"Unauthorized\"}");
-                      return;
-                    }
-                    for (int i = 0; i < NUM_RELAYS; i++) {
-                      setLocalRelayLock(i, false);
-                    }
-                    saveLocalControlState();
-                    updateRelayHardware();
-                    enqueueUartCmd(
-                        "{\"t\":\"cmd\",\"tgt\":\"d1\",\"cmd\":\"relay_unlock\"}");
-                    sendJson(req, 200, "{\"ok\":true}");
-                  });
-
-  pDashServer->on(
-      "/api/ac", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<160> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid\"}");
-          return;
-        }
-
-        String cmd = doc["cmd"] | "";
-        cmd.toLowerCase();
-        String serialCmd = "";
-        if (cmd == "power") {
-          String val = doc["val"] | "";
-          val.toLowerCase();
-          if (val == "on")
-            serialCmd = "AC ON";
-          else if (val == "off")
-            serialCmd = "AC OFF";
-        } else if (cmd == "temp") {
-          int temp = doc["val"] | 0;
-          if (temp >= 16 && temp <= 30)
-            serialCmd = "AC TEMP " + String(temp);
-        } else if (cmd == "temp_step") {
-          String val = doc["val"] | "";
-          val.toLowerCase();
-          if (val == "up")
-            serialCmd = "AC TEMP+";
-          else if (val == "down")
-            serialCmd = "AC TEMP-";
-        } else if (cmd == "fan") {
-          String fan = doc["val"] | "";
-          fan.toLowerCase();
-          if (isValidAcFanValue(fan))
-            serialCmd = "AC FAN " + fan;
-        }
-
-        if (serialCmd.length() == 0) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid\"}");
-          return;
-        }
-        handleSerialCommand(serialCmd);
-        sendJson(req, 200, "{\"ok\":true}");
-      });
-
-
-
-
-
-  pDashServer->on("/api/wifi-status", HTTP_GET,
-                  [](AsyncWebServerRequest* req) {
-                    if (!isAuthenticated(req)) {
-                      sendJson(req, 401,
-                               "{\"ok\":false,\"message\":\"Unauthorized\"}");
-                      return;
-                    }
-                    String json = "{";
-                    json += "\"connected\":" +
-                            String(WiFi.status() == WL_CONNECTED ? "true"
-                                                                  : "false");
-                    json += ",\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\"";
-                    json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
-                    json += ",\"rssi\":" + String(WiFi.RSSI()) + "}";
-                    sendJson(req, 200, json);
-                  });
-
-  pDashServer->on("/api/reboot", HTTP_POST, [](AsyncWebServerRequest* req) {
-    if (!isAuthenticated(req)) {
-      sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-      return;
-    }
-    xTaskCreatePinnedToCore(startSystemRebootTask, "SysReboot", 2048, NULL, 1,
-                            NULL, 0);
-    sendJson(req, 200, "{\"ok\":true}");
-  });
-
-  pDashServer->on("/api/mqtt-show", HTTP_GET,
-                  [](AsyncWebServerRequest* req) {
-                    if (!isAuthenticated(req)) {
-                      sendJson(req, 401,
-                               "{\"ok\":false,\"message\":\"Unauthorized\"}");
-                      return;
-                    }
-                    String json = "{";
-                    json += "\"enabled\":" +
-                            String(g_mqttConfig.enabled ? "true" : "false");
-                    json += ",\"broker\":\"" + jsonEscape(g_mqttConfig.broker) +
-                            "\"";
-                    json += ",\"port\":" + String(g_mqttConfig.port);
-                    json += ",\"username\":\"" +
-                            jsonEscape(g_mqttConfig.username) + "\"";
-                    json += ",\"topic\":\"" +
-                            jsonEscape(g_mqttConfig.baseTopic) + "\"";
-                    json += ",\"keepalive\":" +
-                            String(g_mqttConfig.keepAlive) + "}";
-                    sendJson(req, 200, json);
-                  });
-
-  pDashServer->on(
-      "/api/mqtt", HTTP_POST, [](AsyncWebServerRequest* req) {},
-      NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<512> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid JSON\"}");
-          return;
-        }
-        if (doc.containsKey("enabled")) {
-          String raw = String("MQTT ENABLE ") +
-                       ((doc["enabled"] | false) ? "ON" : "OFF");
-          String upper = raw;
-          upper.toUpperCase();
-          handleMqttCommand(raw, upper);
-        }
-        if (doc.containsKey("broker")) {
-          String raw = String("MQTT SET BROKER ") +
-                       String((const char*)doc["broker"]);
-          String upper = raw;
-          upper.toUpperCase();
-          handleMqttCommand(raw, upper);
-        }
-        if (doc.containsKey("port")) {
-          String raw = "MQTT SET PORT " + String((int)(doc["port"] | 0));
-          String upper = raw;
-          upper.toUpperCase();
-          handleMqttCommand(raw, upper);
-        }
-        if (doc.containsKey("username")) {
-          String raw = String("MQTT SET USER ") +
-                       String((const char*)doc["username"]);
-          String upper = raw;
-          upper.toUpperCase();
-          handleMqttCommand(raw, upper);
-        }
-        if (doc.containsKey("password")) {
-          String raw = String("MQTT SET PASS ") +
-                       String((const char*)doc["password"]);
-          String upper = raw;
-          upper.toUpperCase();
-          handleMqttCommand(raw, upper);
-        }
-        if (doc.containsKey("keepalive")) {
-          String raw =
-              "MQTT SET KEEPALIVE " + String((int)(doc["keepalive"] | 0));
-          String upper = raw;
-          upper.toUpperCase();
-          handleMqttCommand(raw, upper);
-        }
-        sendJson(req, 200, "{\"ok\":true}");
-      });
-
-  pDashServer->on(
-      "/api/change-credentials", HTTP_POST,
-      [](AsyncWebServerRequest* req) {}, NULL,
-      [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index,
-         size_t total) {
-        if (index + len != total)
-          return;
-        if (!isAuthenticated(req)) {
-          sendJson(req, 401, "{\"ok\":false,\"message\":\"Unauthorized\"}");
-          return;
-        }
-        StaticJsonDocument<256> doc;
-        if (deserializeJson(doc, data, len)) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid JSON\"}");
-          return;
-        }
-        String currentUser, currentPass;
-        loadDashCredentials(currentUser, currentPass);
-        String currentPassInput = doc["current_pass"] | "";
-        String newUser = doc["new_user"] | "";
-        String newPass = doc["new_pass"] | "";
-        if (currentPassInput != currentPass) {
-          sendJson(req, 403, "{\"ok\":false,\"message\":\"Wrong password\"}");
-          return;
-        }
-        if (newUser.length() == 0 || newPass.length() < 4) {
-          sendJson(req, 400, "{\"ok\":false,\"message\":\"Invalid input\"}");
-          return;
-        }
-        saveDashCredentials(newUser, newPass);
-        g_dashSessionToken = "";
-        sendJson(req, 200,
-                 "{\"ok\":true,\"message\":\"Credentials updated\"}");
-      });
-
-  pDashServer->onNotFound([](AsyncWebServerRequest* req) {
-    if (!isAuthenticated(req)) {
-      req->redirect("/login");
-      return;
-    }
-    req->send(404, "text/plain", "Not found");
-  });
-
-  pDashServer->begin();
-  MDNS.addService("http", "tcp", 80);
-  Serial.println("[DASHBOARD] Server started at http://smart-nest.local");
 }
 
 void setup() {
@@ -2936,10 +2819,6 @@ void setup() {
 
   bool wifiConnected = wifiManagerInit();
 
-  if (wifiConnected && !isProvisioningMode) {
-    dashboardInit();
-  }
-
   xTaskCreatePinnedToCore(uartCommTask, "UartComm", 8192, NULL, 1, &hUartComm,
                           0);
 
@@ -2951,14 +2830,13 @@ void setup() {
                             0);
 
 #if MQTT_ENABLED
-    xTaskCreatePinnedToCore(mqttTask, "MqttTask", 8192, NULL, 1, &hMqttTask, 0);
+    xTaskCreatePinnedToCore(mqttTask, "MqttTask", 12288, NULL, 1, &hMqttTask, 1);
 #endif
   }
 }
 
 void loop() {
   serialCommandLoop();
-  checkHttpPendingTimeouts();
 
   if (isProvisioningMode) {
     wifiManagerLoop();

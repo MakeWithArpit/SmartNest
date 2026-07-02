@@ -781,6 +781,7 @@ void sendLastEnergyRecordSummaryResponse() {
     static char line[320];
     lastRow[0] = '\0';
     size_t idx = 0;
+    uint32_t dataRows = 0;
     bool firstLine = true;
     while (f.available()) {
         char c = f.read();
@@ -789,6 +790,7 @@ void sendLastEnergyRecordSummaryResponse() {
             if (firstLine) {
                 firstLine = false;
             } else if (idx > 0 && isdigit((unsigned char)line[0])) {
+                dataRows++;
                 strncpy(lastRow, line, sizeof(lastRow) - 1);
                 lastRow[sizeof(lastRow) - 1] = '\0';
             }
@@ -800,6 +802,7 @@ void sendLastEnergyRecordSummaryResponse() {
     if (idx > 0) {
         line[idx] = '\0';
         if (!firstLine && isdigit((unsigned char)line[0])) {
+            dataRows++;
             strncpy(lastRow, line, sizeof(lastRow) - 1);
             lastRow[sizeof(lastRow) - 1] = '\0';
         }
@@ -807,7 +810,7 @@ void sendLastEnergyRecordSummaryResponse() {
     f.close();
     
     if (lastRow[0] == '\0') {
-        enqueueUartTx("{\"t\":\"last_record_res\",\"file\":\"energy_log.csv\",\"ok\":false,\"message\":\"energy_log.csv has no data rows\"}");
+        enqueueUartTx("{\"t\":\"last_record_res\",\"file\":\"energy_log.csv\",\"ok\":true,\"record_id\":0,\"date\":\"\",\"row_count\":0,\"message\":\"energy_log.csv has no data rows\"}");
         return;
     }
     
@@ -833,8 +836,8 @@ void sendLastEnergyRecordSummaryResponse() {
     
     char json[384];
     snprintf(json, sizeof(json),
-             "{\"t\":\"last_record_res\",\"file\":\"energy_log.csv\",\"ok\":true,\"record_id\":%u,\"date\":\"%s\"}",
-             recordId, dateStr);
+             "{\"t\":\"last_record_res\",\"file\":\"energy_log.csv\",\"ok\":true,\"record_id\":%u,\"date\":\"%s\",\"row_count\":%u}",
+             recordId, dateStr, dataRows);
     enqueueUartTx(json);
 }
 
@@ -844,7 +847,18 @@ void clearEnergyLogsSafely() {
     buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
     buildLogFilePath(tmpPath, sizeof(tmpPath), SD_ENERGY_TMP_FILE);
 
-    // 1. Reset g_sdQueue
+    char syncPath[96];
+    buildSyncStatePath(syncPath, sizeof(syncPath));
+
+    uint32_t maxCsvId = scanMaxEnergyRecordId(energyLogPath);
+    uint32_t ackedId = readUintFile(syncPath, 0);
+    uint32_t highWaterId = recoverRecordIdStateFile();
+    uint32_t preservedRecordId = maxCsvId;
+    if (ackedId > preservedRecordId) preservedRecordId = ackedId;
+    if (highWaterId > preservedRecordId) preservedRecordId = highWaterId;
+    uint32_t nextRecordId = preservedRecordId + 1;
+
+    // 1. Reset queued rows that have not been flushed yet.
     if (g_sdQueue) {
         xQueueReset(g_sdQueue);
     }
@@ -868,31 +882,25 @@ void clearEnergyLogsSafely() {
     }
 
     if (ok) {
-        // 3. Reset record_id files
-        char recordIdPath[96], recordIdTmp[96], recordIdBak[96];
-        buildRecordIdStatePath(recordIdPath, sizeof(recordIdPath));
-        buildRecordIdTmpPath(recordIdTmp, sizeof(recordIdTmp));
-        buildRecordIdBakPath(recordIdBak, sizeof(recordIdBak));
-        SD.remove(recordIdPath);
-        SD.remove(recordIdTmp);
-        SD.remove(recordIdBak);
-        writeRecordIdStateAtomic(1);
+        // 3. Preserve the record ID high-water mark so future rows continue
+        // after the highest ID already known by device/cloud.
+        writeRecordIdStateAtomic(preservedRecordId);
+        writeUintFile(syncPath, preservedRecordId);
 
-        // 4. Reset sync file
-        char syncPath[96];
-        buildSyncStatePath(syncPath, sizeof(syncPath));
-        SD.remove(syncPath);
-        writeUintFile(syncPath, 0);
-
-        // 5. Update g_systemState
+        // 4. Update g_systemState
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            g_systemState.sd.lastAckedRecordId = 0;
-            g_systemState.sd.nextRecordId = 1;
+            g_systemState.sd.lastAckedRecordId = preservedRecordId;
+            g_systemState.sd.nextRecordId = nextRecordId;
             xSemaphoreGive(g_stateMutex);
         }
 
-        enqueueUartTx("{\"t\":\"clear_energy_logs_res\",\"file\":\"energy_log.csv\",\"ok\":true,\"message\":\"energy logs cleared\"}");
-        Serial.println("[SD] energy_log.csv cleared successfully");
+        char json[192];
+        snprintf(json, sizeof(json),
+                 "{\"t\":\"clear_energy_logs_res\",\"file\":\"energy_log.csv\",\"ok\":true,\"message\":\"energy logs cleared; record id preserved\",\"preserved_record_id\":%u,\"next_record_id\":%u}",
+                 preservedRecordId, nextRecordId);
+        enqueueUartTx(json);
+        Serial.printf("[SD] energy_log.csv cleared; preserved_record_id=%u next_record_id=%u\n",
+                      preservedRecordId, nextRecordId);
     } else {
         char errBuf[128];
         snprintf(errBuf, sizeof(errBuf), "{\"t\":\"clear_energy_logs_res\",\"file\":\"energy_log.csv\",\"ok\":false,\"message\":\"%s\"}", errorMsg);
@@ -924,7 +932,10 @@ const char *resetReasonToString(esp_reset_reason_t reason) {
     }
 }
 
-bool purgeAckedEnergyRows(uint32_t lastAckedId) {
+bool purgeAckedEnergyRows(uint32_t lastAckedId, uint32_t &removedOut,
+                          uint32_t &keptOut) {
+    removedOut = 0;
+    keptOut = 0;
     char energyLogPath[96];
     char tmpPath[96];
     char bakPath[96];
@@ -1008,6 +1019,8 @@ bool purgeAckedEnergyRows(uint32_t lastAckedId) {
     SD.remove(bakPath);
     Serial.printf("[SD] Purged acked rows <=%u removed=%u kept=%u\n",
                   lastAckedId, removed, kept);
+    removedOut = removed;
+    keptOut = kept;
     return true;
 }
 
@@ -2246,7 +2259,9 @@ void sdLoggingTask(void* pvParameters) {
             char syncPath[96];
             buildSyncStatePath(syncPath, sizeof(syncPath));
             writeUintFile(syncPath, historyAckLast);
-            if (purgeAckedEnergyRows(historyAckLast)) {
+            uint32_t removedRows = 0;
+            uint32_t keptRows = 0;
+            if (purgeAckedEnergyRows(historyAckLast, removedRows, keptRows)) {
                 char energyLogPath[96];
                 buildEnergyLogPath(energyLogPath, sizeof(energyLogPath));
                 uint32_t maxId = scanMaxEnergyRecordId(energyLogPath);
@@ -2257,7 +2272,30 @@ void sdLoggingTask(void* pvParameters) {
                     }
                     xSemaphoreGive(g_stateMutex);
                 }
+                char json[160];
+                snprintf(json, sizeof(json),
+                         "{\"t\":\"hist_ack_res\",\"ok\":true,\"last\":%u,\"removed\":%u,\"kept\":%u}",
+                         historyAckLast, removedRows, keptRows);
+                enqueueUartTx(json);
+            } else {
+                char json[128];
+                snprintf(json, sizeof(json),
+                         "{\"t\":\"hist_ack_res\",\"ok\":false,\"last\":%u,\"message\":\"SD purge failed\"}",
+                         historyAckLast);
+                enqueueUartTx(json);
             }
+        } else if (wantHistoryAck && !historyAckAdvanced) {
+            char json[128];
+            snprintf(json, sizeof(json),
+                     "{\"t\":\"hist_ack_res\",\"ok\":true,\"last\":%u,\"removed\":0,\"kept\":0,\"message\":\"ACK already applied\"}",
+                     historyAckLast);
+            enqueueUartTx(json);
+        } else if (wantHistoryAck && !sdOk) {
+            char json[128];
+            snprintf(json, sizeof(json),
+                     "{\"t\":\"hist_ack_res\",\"ok\":false,\"last\":%u,\"message\":\"SD card not ready\"}",
+                     historyAckLast);
+            enqueueUartTx(json);
         }
 
 

@@ -3,7 +3,7 @@
 This guide is prepared for cloud, backend, and MQTT integration developers. It details the MQTT protocol, message schemas, topic architecture, and communication workflows implemented in the SmartNest Internet ESP32 firmware.
 
 > [!IMPORTANT]
-> This document is strictly focused on MQTT interface interactions. It does not cover Serial Monitor, local provisioning menus, or internal UART/ESP-NOW communication channels.
+> This document is focused on the SmartNest MQTT interface and the serial-only configuration flow required to enable it. The runtime web dashboard has been removed from the Internet ESP32 firmware; only the Wi-Fi provisioning page remains available when the device is not provisioned.
 
 ---
 
@@ -28,6 +28,7 @@ The MQTT client configuration uses the following defaults in the firmware:
 | Setting | Default Value | Description |
 | :--- | :--- | :--- |
 | **MQTT Enabled** | `true` | Enables/disables the MQTT client task at boot. |
+| **TLS / Secure MQTT** | `false` | Uses `WiFiClientSecure` for encrypted MQTT, required for HiveMQ Cloud port `8883`. |
 | **Broker** | `broker.hivemq.com` | HiveMQ public broker used for testing/development. |
 | **Port** | `1883` | TCP port for non-encrypted MQTT communication. |
 | **Client ID** | `SmartNest_001` | Monotonic identifier for the client connection. |
@@ -35,9 +36,65 @@ The MQTT client configuration uses the following defaults in the firmware:
 | **Password** | *(empty)* | Optional password parameter for basic authentication. |
 | **Keepalive** | `60` seconds | Connection health timeout (ping heartbeat interval). |
 | **Base Topic** | `smartnest/SmartNest_001` | The parent namespace for all topics. |
+| **TLS Reconnect Delay** | `30000` ms | Slower reconnect pacing used when TLS is enabled. |
+| **Socket Timeout** | `5` seconds | MQTT socket read/write timeout. |
+| **TLS Handshake Timeout** | `3` seconds | TLS handshake timeout for secure broker connections. |
+| **Minimum Free Heap** | `70000` bytes | MQTT connects are skipped if free heap is below this guard. |
+| **Live Publish Interval** | `30000` ms | Heartbeat interval for live telemetry/status publishing. |
+| **History Sync** | `true` | Enables SD-card history upload to `/history/batch`. |
+| **History Batch Limit** | `4` records | Small default batch size to keep TLS MQTT payloads stable. |
+| **History Max Payload** | `2800` bytes | Maximum serialized history batch payload before retrying with a smaller batch. |
+| **History Retry / ACK Timeout** | `15000` ms | Retry window for requesting or re-publishing history batches. |
 
 > [!NOTE]
 > The keepalive setting (60 seconds) determines how frequently the client sends a ping to the broker to check connection viability. It is independent of the telemetry update intervals.
+
+MQTT is configured from the ESP32 Serial Monitor only. There is no MQTT configuration page in JavaScript, backend routes, or the runtime dashboard anymore.
+
+Serial Monitor commands require login first:
+
+```text
+LOGIN <username> <password>
+```
+
+Default credentials are `admin` / `smartnest`. The authenticated serial session automatically times out after 5 minutes of inactivity.
+
+Useful public/auth commands:
+
+```text
+AUTH STATUS
+AUTH SET <current_pass> <new_user> <new_pass>
+LOGOUT
+```
+
+MQTT commands available after login:
+
+```text
+MQTT SHOW
+MQTT HISTORY
+MQTT ENABLE ON|OFF
+MQTT TLS ON|OFF
+MQTT SET BROKER <host>
+MQTT SET PORT <port>
+MQTT SET USER <username>
+MQTT SET PASS <password>
+MQTT SET KEEPALIVE <seconds>
+```
+
+For HiveMQ Cloud, run `MQTT TLS ON`, set the broker host without `:8883`, and set the port to `8883`. The TLS MQTT URL shown by HiveMQ Cloud is only a combined display of `<host>:<port>`; in firmware configuration it is entered as broker host plus port, not as a separate field.
+
+Example HiveMQ Cloud serial setup:
+
+```text
+LOGIN admin smartnest
+MQTT ENABLE ON
+MQTT TLS ON
+MQTT SET BROKER d73b7adbc98343a986389bf359258d6a.s1.eu.hivemq.cloud
+MQTT SET PORT 8883
+MQTT SET USER smartnest
+MQTT SET PASS <your-password>
+MQTT SHOW
+```
 
 ---
 
@@ -591,6 +648,14 @@ If the published request payload is malformed or invalid JSON:
 
 **Topic Name**: `smartnest/SmartNest_001/history/batch`
 - **Purpose**: Uploads historical, SD-card-buffered log records when reconnecting or during offline catchups.
+- **Firmware Gate**: Controlled by `MQTT_HISTORY_SYNC_ENABLED`. Current firmware default is `true`.
+- **Batch Safety Limits**: Current firmware uses `MQTT_HISTORY_BATCH_LIMIT 4` and `MQTT_HISTORY_MAX_PAYLOAD_BYTES 2800` to avoid oversized MQTT payloads on ESP32 TLS connections.
+
+History upload is independent of live telemetry. If `/live/sensors`, `/live/status`, and `/cmd/ack` are working but no history appears in the cloud, check these points first:
+- The backend must subscribe to `smartnest/SmartNest_001/history/batch`.
+- The device must have SD history rows available on the Master ESP32.
+- The backend must publish a valid ACK to `smartnest/SmartNest_001/history/ack` after saving a batch.
+- If a serialized batch becomes larger than `2800` bytes, firmware skips that payload and retries with a smaller request limit.
 
 ### Example Payload
 ```json
@@ -639,6 +704,16 @@ If the published request payload is malformed or invalid JSON:
   - `runtimes_sec` *(number array)*: Relay runtimes index logged for this period.
   - `time_source` *(string)*: Timestamp status at the time of writing.
 
+### Device-Side History Flow
+
+1. Internet ESP32 connects to MQTT and waits for the startup settle period.
+2. Internet ESP32 requests rows from the Master ESP32 over UART using `hist_req`.
+3. Master ESP32 returns `hist_res` with up to `MQTT_HISTORY_BATCH_LIMIT` records.
+4. Internet ESP32 publishes the records to `/history/batch`.
+5. Internet ESP32 waits for backend ACK before requesting the next batch.
+
+If the backend does not ACK, the same records are retried later and the SD card is not pruned.
+
 ---
 
 ## 13. History ACK
@@ -662,6 +737,15 @@ When a batch is successfully saved to the cloud, the backend must acknowledge re
 2. **Advancing Cursor**: `last_id` defines the highest successfully committed record row ID. (If `0` is passed, the device automatically commits up to the last ID of the current batch).
 3. **Execution**: On a valid ACK, the device instructs the Master to record progress and purge the verified database entries, freeing up space. The device then immediately requests the next historical block.
 4. **Reliability**: If no ACK arrives within the 15-second timeout window, the device drops the pending session status and retries uploading the block from the last verified index.
+
+Minimum backend ACK behavior:
+
+```text
+Subscribe: smartnest/SmartNest_001/history/batch
+Save:      every record in the batch idempotently
+Publish:   smartnest/SmartNest_001/history/ack
+Payload:   {"batch_id":"<same-batch-id>","ok":true,"last_id":<highest-saved-record-id>}
+```
 
 ### Batch ACK and SD Pruning Semantics
 
@@ -694,16 +778,66 @@ Backend rule: `last_id` must only advance through a continuous successfully comm
 
 ---
 
-## 14. Backend Integration Notes
+## 14. Troubleshooting History Upload
+
+### Live MQTT Works, But History Does Not Reach Cloud
+
+This usually means MQTT connectivity is healthy and the issue is in the history path.
+
+Check in this order:
+1. Confirm firmware has `MQTT_HISTORY_SYNC_ENABLED true`.
+2. Confirm the backend is subscribed to `/history/batch`, not only live topics.
+3. Confirm the backend publishes `/history/ack` after writing the batch.
+4. Confirm ACK `batch_id` exactly matches the received batch.
+5. Confirm `last_id` only advances through records actually saved in the cloud database.
+6. Confirm the Master ESP32 has SD-card history rows available.
+
+If live telemetry, status, and remote commands are working, the broker, TLS credentials, and basic hardware network path are already valid. A missing history stream is normally caused by disabled history sync, no SD rows, oversized batch protection, or missing backend ACK handling.
+
+### Useful Serial Checks
+
+Login first, then run:
+
+```text
+MQTT SHOW
+MQTT HISTORY
+SD INFO
+SD LAST-RECORD
+CLEAR ENERGY LOGS
+```
+
+`MQTT SHOW` confirms broker, port, TLS, and enabled state. `MQTT HISTORY` prints the latest history publish, cloud ACK, and SD prune status. `SD INFO` confirms card health. `SD LAST-RECORD` prints an `energy_log.csv` summary including total data rows, latest `record_id`, and latest row date, so you can confirm whether the Master ESP32 has stored history data available for sync.
+
+When history sync is working, Serial Monitor shows this three-step proof:
+
+```text
+[HISTORY] Published batch_id=... count=... last_id=... bytes=...
+[HISTORY] Cloud ACK received batch_id=... last_id=...
+[HISTORY] SD prune confirmed last_id=... removed=... kept=...
+```
+
+Meaning:
+- `Published` means Internet ESP32 pushed historical rows to `/history/batch`.
+- `Cloud ACK received` means backend saved/accepted the batch and replied on `/history/ack`.
+- `SD prune confirmed` means Master ESP32 deleted ACKed old rows from `energy_log.csv`; `removed` is the number of rows deleted and `kept` is the remaining row count.
+
+`CLEAR ENERGY LOGS` removes stored CSV history rows, but it does not reset the record ID sequence. The Master ESP32 preserves the highest known ID from the CSV file, history ACK state, and `record_id_state.txt`; the next new CSV row continues from `preserved_record_id + 1`. This prevents cloud-side deduplication or ACK logic from seeing a reused `record_id` after manual log cleanup.
+
+---
+
+## 15. Backend Integration Notes
 
 When designing a backend interface to process telemetry:
 - **Separation of Telemetry**: Store real-time measurements (`/live/sensors`) in a volatile or short-retention cache (e.g. InfluxDB/Redis) and use historical batch records (`/history/batch`) for permanent database storage.
 - **Deduplication**: Implement database unique constraints on `(device_id, record_id)` to handle retries idempotently.
 - **Client IDs**: Ensure your backend service uses a unique client ID. Never reuse the device Client ID (`SmartNest_001`) as this will initiate broker connection drop loops.
+- **History ACK**: Treat `/history/ack` as part of the write transaction. Do not ACK a record until it has actually been committed to storage.
 
 ---
 
-## 15. Security Notes
+## 16. Security Notes
 
 - **Public Broker Danger**: The default broker (`broker.hivemq.com`) is public. Telemetry, status, and control packets are readable by any client on the internet.
 - **Production Checklist**: Production deployments must configure a private broker using SSL/TLS, port `8883`, strong client credential authentication, and restricted access control lists (ACLs).
+- **Serial Console**: MQTT credentials can only be changed after `LOGIN`. Change the default serial password during installation with `AUTH SET <current_pass> <new_user> <new_pass>`.
+- **Dashboard Scope**: The runtime dashboard is intentionally removed, so MQTT secrets are not configurable through browser JavaScript or local backend routes.
